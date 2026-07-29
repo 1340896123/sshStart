@@ -35,6 +35,59 @@ export interface RemoteFile {
   modified?: number;
 }
 
+export interface ProcessInfo {
+  pid: number;
+  user: string;
+  command: string;
+  memoryPercent: number;
+  cpuPercent: number;
+  elapsedSeconds: number;
+  arguments: string;
+}
+
+export interface NetworkConnection {
+  protocol: string;
+  state: string;
+  localAddress: string;
+  localPort?: number;
+  remoteAddress: string;
+  remotePort?: number;
+  pid?: number;
+  process?: string;
+}
+
+export interface NetworkInterface {
+  name: string;
+  family: string;
+  address: string;
+  prefixLength?: number;
+  state: string;
+  mac: string;
+  mtu: number;
+}
+
+export type TransferDirection = "upload" | "download";
+export type TransferStatus = "queued" | "running" | "completed" | "failed";
+
+export interface TransferRequest {
+  direction: TransferDirection;
+  fileName: string;
+  sourcePath: string;
+  destinationPath: string;
+}
+
+export interface TransferTask extends TransferRequest {
+  id: string;
+  sessionId: string;
+  sessionTitle: string;
+  serverName: string;
+  serverHost: string;
+  status: TransferStatus;
+  createdAt: number;
+  finishedAt?: number;
+  error?: string;
+}
+
 export type MessageRole = "user" | "assistant" | "tool";
 
 export interface AiMessage {

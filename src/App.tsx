@@ -21,8 +21,10 @@ import { FilePane } from "./components/FilePane";
 import { ServerDialog } from "./components/ServerDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalPane } from "./components/TerminalPane";
+import { TransferPanel } from "./components/TransferPanel";
+import { SystemDock } from "./components/SystemDock";
 import { DEMO_SERVER, connectionLabel, isTauri, uid } from "./lib";
-import type { AiConfig, ServerProfile, SessionState, WorkspaceView } from "./types";
+import type { AiConfig, ServerProfile, SessionState, TransferRequest, TransferTask, WorkspaceView } from "./types";
 
 const DEFAULT_AI_CONFIG: AiConfig = {
   endpoint: "https://api.openai.com/v1",
@@ -56,13 +58,15 @@ export default function App() {
   const [aiConfig, setAiConfig] = useStoredState<AiConfig>("portico.ai", DEFAULT_AI_CONFIG, ({ apiKey: _apiKey, ...config }) => config);
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
-  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("split");
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("terminal");
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarView, setSidebarView] = useState<"servers" | "transfers">("servers");
   const [aiOpen, setAiOpen] = useState(true);
   const [serverDialogOpen, setServerDialogOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ServerProfile>();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [search, setSearch] = useState("");
+  const [transfers, setTransfers] = useState<TransferTask[]>([]);
 
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const activeServer = servers.find((server) => server.id === activeSession?.serverId);
@@ -157,6 +161,43 @@ export default function App() {
     setAiConfig(next);
   };
 
+  const startTransfer = async (
+    session: SessionState,
+    server: ServerProfile,
+    request: TransferRequest,
+    operation: () => Promise<void>,
+  ) => {
+    const id = uid("transfer");
+    const task: TransferTask = {
+      ...request,
+      id,
+      sessionId: session.id,
+      sessionTitle: session.title,
+      serverName: server.name,
+      serverHost: server.host,
+      status: "queued",
+      createdAt: Date.now(),
+    };
+    setTransfers((current) => [task, ...current]);
+    await Promise.resolve();
+    setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "running" } : item));
+    try {
+      await operation();
+      setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "completed", finishedAt: Date.now() } : item));
+    } catch (reason) {
+      const error = String(reason);
+      setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "failed", error, finishedAt: Date.now() } : item));
+      throw reason;
+    }
+  };
+
+  const selectSidebar = (view: "servers" | "transfers") => {
+    setSidebarView(view);
+    setSidebarOpen(true);
+  };
+
+  const activeTransferCount = transfers.filter((task) => task.status === "queued" || task.status === "running").length;
+
   return (
     <div className="app-shell">
       <header className="titlebar" data-tauri-drag-region>
@@ -176,18 +217,21 @@ export default function App() {
       <div className="app-body">
         <nav className="activity-rail" aria-label="主导航">
           <div className="activity-main">
-            <button className="activity-button active" title="服务器"><SquareTerminal size={18} /></button>
-            <button className="activity-button" title="文件传输"><FolderSync size={18} /></button>
+            <button className={`activity-button ${sidebarView === "servers" ? "active" : ""}`} title="服务器" onClick={() => selectSidebar("servers")}><SquareTerminal size={18} /></button>
             <button className="activity-button" title="命令片段"><Braces size={18} /></button>
             <button className="activity-button" title="AI 助手" onClick={() => setAiOpen((open) => !open)}><Sparkles size={18} /></button>
           </div>
           <div className="activity-footer">
+            <button className={`activity-button transfer-activity ${sidebarView === "transfers" ? "active" : ""}`} title="文件传输" onClick={() => selectSidebar("transfers")}>
+              <FolderSync size={18} />
+              {activeTransferCount > 0 && <span className="activity-badge">{activeTransferCount > 9 ? "9+" : activeTransferCount}</span>}
+            </button>
             <button className="activity-button" title="帮助"><CircleHelp size={18} /></button>
             <button className="activity-button" title="设置" onClick={() => setSettingsOpen(true)}><Settings size={18} /></button>
           </div>
         </nav>
 
-        {sidebarOpen && (
+        {sidebarOpen && sidebarView === "servers" && (
           <aside className="server-sidebar">
             <div className="sidebar-heading">
               <div>
@@ -254,10 +298,18 @@ export default function App() {
             </button>
           </aside>
         )}
+        {sidebarOpen && sidebarView === "transfers" && (
+          <TransferPanel
+            transfers={transfers}
+            onActivateSession={setActiveSessionId}
+            onClearFinished={() => setTransfers((current) => current.filter((task) => task.status === "queued" || task.status === "running"))}
+            onDismiss={(id) => setTransfers((current) => current.filter((task) => task.id !== id))}
+          />
+        )}
 
         <main className="workspace">
           <div className="session-strip">
-            <button className="icon-button quiet" title={sidebarOpen ? "收起服务器列表" : "展开服务器列表"} onClick={() => setSidebarOpen((open) => !open)}>
+            <button className="icon-button quiet" title={sidebarOpen ? "收起侧边栏" : "展开侧边栏"} onClick={() => setSidebarOpen((open) => !open)}>
               <PanelLeftClose className={sidebarOpen ? "" : "flipped"} size={15} />
             </button>
             <div className="session-tabs">
@@ -311,8 +363,19 @@ export default function App() {
                       </div>
                       <div className={`operations-grid view-${workspaceView}`}>
                         <TerminalPane session={session} server={server} onUpdate={(patch) => updateSession(session.id, patch)} />
-                        <FilePane session={session} server={server} onUpdate={(patch) => updateSession(session.id, patch)} />
+                        <FilePane
+                          session={session}
+                          server={server}
+                          onUpdate={(patch) => updateSession(session.id, patch)}
+                          onTransfer={(request, operation) => startTransfer(session, server, request, operation)}
+                        />
                       </div>
+                      <SystemDock
+                        server={server}
+                        filesActive={workspaceView === "files"}
+                        onOpenSystem={() => setWorkspaceView("terminal")}
+                        onOpenFiles={() => setWorkspaceView("files")}
+                      />
                     </section>
                     {aiOpen && <AiPane session={session} server={server} config={aiConfig} onUpdate={(patch) => updateSession(session.id, patch)} onOpenSettings={() => setSettingsOpen(true)} />}
                     {!aiOpen && (

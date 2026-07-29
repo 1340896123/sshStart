@@ -45,6 +45,43 @@ struct CommandResult {
     exit_code: i32,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessInfo {
+    pid: u32,
+    user: String,
+    command: String,
+    memory_percent: f32,
+    cpu_percent: f32,
+    elapsed_seconds: u64,
+    arguments: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkConnection {
+    protocol: String,
+    state: String,
+    local_address: String,
+    local_port: Option<u16>,
+    remote_address: String,
+    remote_port: Option<u16>,
+    pid: Option<u32>,
+    process: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkInterface {
+    name: String,
+    family: String,
+    address: String,
+    prefix_length: Option<u8>,
+    state: String,
+    mac: String,
+    mtu: u32,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AiConfig {
@@ -292,6 +329,239 @@ fn run_command_sync(server: &ServerProfile, command: &str) -> Result<CommandResu
     })
 }
 
+fn successful_output(result: CommandResult, label: &str) -> Result<String, String> {
+    if result.exit_code == 0 {
+        return Ok(result.stdout);
+    }
+    let detail = result.stderr.trim();
+    Err(if detail.is_empty() {
+        format!("{label}失败，退出码 {}", result.exit_code)
+    } else {
+        format!("{label}失败: {detail}")
+    })
+}
+
+fn parse_processes(output: &str) -> Vec<ProcessInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let user = fields.next()?.to_string();
+            let command = fields.next()?.to_string();
+            let memory_percent = fields.next()?.parse().unwrap_or(0.0);
+            let cpu_percent = fields.next()?.parse().unwrap_or(0.0);
+            let elapsed_seconds = fields.next()?.parse().unwrap_or(0);
+            let arguments = fields.collect::<Vec<_>>().join(" ");
+            Some(ProcessInfo {
+                pid,
+                user,
+                command: command.clone(),
+                memory_percent,
+                cpu_percent,
+                elapsed_seconds,
+                arguments: if arguments.is_empty() {
+                    command
+                } else {
+                    arguments
+                },
+            })
+        })
+        .collect()
+}
+
+fn split_socket_endpoint(value: &str) -> (String, Option<u16>) {
+    if let Some(stripped) = value.strip_prefix('[') {
+        if let Some((address, port)) = stripped.rsplit_once("]:") {
+            return (address.to_string(), port.parse().ok());
+        }
+    }
+    value
+        .rsplit_once(':')
+        .map(|(address, port)| (address.to_string(), port.parse().ok()))
+        .unwrap_or_else(|| (value.to_string(), None))
+}
+
+fn parse_socket_owner(details: &str) -> (Option<u32>, Option<String>) {
+    let pid = details
+        .split("pid=")
+        .nth(1)
+        .and_then(|value| {
+            value
+                .split(|character: char| !character.is_ascii_digit())
+                .next()
+        })
+        .and_then(|value| value.parse().ok());
+    let process = details
+        .split('"')
+        .nth(1)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    (pid, process)
+}
+
+fn parse_network_connections(output: &str) -> Vec<NetworkConnection> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 6 {
+                return None;
+            }
+            let (local_address, local_port) = split_socket_endpoint(fields[4]);
+            let (remote_address, remote_port) = split_socket_endpoint(fields[5]);
+            let (pid, process) = parse_socket_owner(&fields[6..].join(" "));
+            Some(NetworkConnection {
+                protocol: fields[0].to_uppercase(),
+                state: fields[1].to_uppercase(),
+                local_address,
+                local_port,
+                remote_address,
+                remote_port,
+                pid,
+                process,
+            })
+        })
+        .collect()
+}
+
+fn parse_network_interfaces(output: &str) -> Vec<NetworkInterface> {
+    let (links_output, addresses_output) = output.split_once("--ADDR--").unwrap_or((output, ""));
+    let links = links_output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let raw_name = fields.get(1)?.trim_end_matches(':');
+            let name = raw_name.split('@').next()?.to_string();
+            let value_after = |key: &str| {
+                fields
+                    .iter()
+                    .position(|field| *field == key)
+                    .and_then(|index| fields.get(index + 1))
+                    .copied()
+            };
+            let state = value_after("state").unwrap_or("UNKNOWN").to_string();
+            let mtu = value_after("mtu")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let mac = fields
+                .iter()
+                .position(|field| field.starts_with("link/"))
+                .and_then(|index| fields.get(index + 1))
+                .copied()
+                .unwrap_or("-")
+                .to_string();
+            Some((name, state, mac, mtu))
+        })
+        .collect::<Vec<_>>();
+
+    let mut addresses: HashMap<String, Vec<(String, String, Option<u8>)>> = HashMap::new();
+    for line in addresses_output.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 || !matches!(fields[2], "inet" | "inet6") {
+            continue;
+        }
+        let name = fields[1].split('@').next().unwrap_or(fields[1]).to_string();
+        let (address, prefix_length) = fields[3]
+            .rsplit_once('/')
+            .map(|(address, prefix)| (address.to_string(), prefix.parse().ok()))
+            .unwrap_or_else(|| (fields[3].to_string(), None));
+        addresses
+            .entry(name)
+            .or_default()
+            .push((fields[2].to_uppercase(), address, prefix_length));
+    }
+
+    let mut result = Vec::new();
+    for (name, state, mac, mtu) in links {
+        match addresses.remove(&name) {
+            Some(items) if !items.is_empty() => {
+                result.extend(items.into_iter().map(|(family, address, prefix_length)| {
+                    NetworkInterface {
+                        name: name.clone(),
+                        family,
+                        address,
+                        prefix_length,
+                        state: state.clone(),
+                        mac: mac.clone(),
+                        mtu,
+                    }
+                }));
+            }
+            _ => result.push(NetworkInterface {
+                name,
+                family: "-".to_string(),
+                address: "-".to_string(),
+                prefix_length: None,
+                state,
+                mac,
+                mtu,
+            }),
+        }
+    }
+    result
+}
+
+#[tauri::command]
+async fn list_processes(server: ServerProfile) -> Result<Vec<ProcessInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_command_sync(
+            &server,
+            "LC_ALL=C ps -eo pid=,user=,comm=,%mem=,%cpu=,etimes=,args= --sort=-%cpu",
+        )?;
+        Ok(parse_processes(&successful_output(result, "读取进程列表")?))
+    })
+    .await
+    .map_err(|error| format!("进程查询任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn signal_process(server: ServerProfile, pid: u32, signal: String) -> Result<(), String> {
+    if pid <= 1 {
+        return Err("禁止结束 PID 0 或 1".to_string());
+    }
+    let signal = match signal.as_str() {
+        "TERM" => "TERM",
+        "KILL" => "KILL",
+        _ => return Err("仅支持 TERM 或 KILL 信号".to_string()),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_command_sync(&server, &format!("kill -{signal} {pid}"))?;
+        successful_output(result, "发送进程信号").map(|_| ())
+    })
+    .await
+    .map_err(|error| format!("进程信号任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn list_network_connections(server: ServerProfile) -> Result<Vec<NetworkConnection>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_command_sync(&server, "LC_ALL=C ss -H -tunap")?;
+        Ok(parse_network_connections(&successful_output(
+            result,
+            "读取网络连接",
+        )?))
+    })
+    .await
+    .map_err(|error| format!("网络查询任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn list_network_interfaces(server: ServerProfile) -> Result<Vec<NetworkInterface>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_command_sync(
+            &server,
+            "LC_ALL=C ip -o link show; printf '\\n--ADDR--\\n'; LC_ALL=C ip -o addr show",
+        )?;
+        Ok(parse_network_interfaces(&successful_output(
+            result,
+            "读取网卡信息",
+        )?))
+    })
+    .await
+    .map_err(|error| format!("网卡查询任务失败: {error}"))?
+}
+
 #[tauri::command]
 async fn start_terminal(
     app: tauri::AppHandle,
@@ -523,6 +793,86 @@ async fn delete_remote_path(server: ServerProfile, path: String, is_dir: bool) -
 }
 
 #[tauri::command]
+async fn rename_remote_path(
+    server: ServerProfile,
+    source_path: String,
+    target_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = connect_ssh(&server)?;
+        session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?
+            .rename(Path::new(&source_path), Path::new(&target_path), None)
+            .map_err(|error| format!("重命名失败: {error}"))
+    })
+    .await
+    .map_err(|error| format!("重命名任务失败: {error}"))?
+}
+
+fn remote_parent_and_name(path: &str) -> Result<(&str, &str), String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("根目录不能执行此操作".to_string());
+    }
+    let separator = trimmed
+        .rfind('/')
+        .ok_or_else(|| "远程路径必须是绝对路径".to_string())?;
+    let parent = if separator == 0 {
+        "/"
+    } else {
+        &trimmed[..separator]
+    };
+    let name = &trimmed[separator + 1..];
+    if name.is_empty() || name == "." || name == ".." {
+        return Err("远程路径无效".to_string());
+    }
+    Ok((parent, name))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[tauri::command]
+async fn compress_remote_path(
+    server: ServerProfile,
+    source_path: String,
+    archive_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (source_parent, source_name) = remote_parent_and_name(&source_path)?;
+        let (archive_parent, archive_name) = remote_parent_and_name(&archive_path)?;
+        if source_parent != archive_parent {
+            return Err("压缩文件必须保存在源文件所在目录".to_string());
+        }
+        if source_name == archive_name {
+            return Err("压缩文件不能覆盖源文件".to_string());
+        }
+
+        let command = format!(
+            "cd -- {} && tar -czf {} -- {}",
+            shell_quote(source_parent),
+            shell_quote(archive_name),
+            shell_quote(source_name),
+        );
+        let result = run_command_sync(&server, &command)?;
+        if result.exit_code == 0 {
+            Ok(())
+        } else {
+            let detail = result.stderr.trim();
+            Err(if detail.is_empty() {
+                format!("压缩失败，远程 tar 退出码为 {}", result.exit_code)
+            } else {
+                format!("压缩失败: {detail}")
+            })
+        }
+    })
+    .await
+    .map_err(|error| format!("压缩任务失败: {error}"))?
+}
+
+#[tauri::command]
 async fn run_ssh_command(server: ServerProfile, command: String) -> Result<CommandResult, String> {
     tauri::async_runtime::spawn_blocking(move || run_command_sync(&server, &command))
         .await
@@ -725,11 +1075,17 @@ pub fn run() {
             terminal_input,
             terminal_resize,
             stop_terminal,
+            list_processes,
+            signal_process,
+            list_network_connections,
+            list_network_interfaces,
             list_directory,
             upload_file,
             download_file,
             create_directory,
             delete_remote_path,
+            rename_remote_path,
+            compress_remote_path,
             run_ssh_command,
             ai_chat
         ])
@@ -739,12 +1095,25 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_reasoning_summary, is_high_risk_command, mode_string};
+    use super::{
+        extract_reasoning_summary, is_high_risk_command, mode_string, parse_network_connections,
+        parse_network_interfaces, parse_processes, remote_parent_and_name, shell_quote,
+    };
 
     #[test]
     fn formats_unix_permissions() {
         assert_eq!(mode_string(Some(0o100755), false), "-rwxr-xr-x");
         assert_eq!(mode_string(Some(0o040750), true), "drwxr-x---");
+    }
+
+    #[test]
+    fn quotes_remote_paths_for_compression() {
+        assert_eq!(shell_quote("release's files"), "'release'\"'\"'s files'");
+        assert_eq!(
+            remote_parent_and_name("/srv/releases/app").unwrap(),
+            ("/srv/releases", "app")
+        );
+        assert!(remote_parent_and_name("/").is_err());
     }
 
     #[test]
@@ -761,5 +1130,40 @@ mod tests {
         );
         assert_eq!(content, "Disk usage is normal.");
         assert_eq!(reasoning.as_deref(), Some("Check disk pressure first."));
+    }
+
+    #[test]
+    fn parses_process_rows() {
+        let rows = parse_processes(
+            " 4123 root java 4.7 3.0 117659 java -agentlib:jdwp=transport=dt_socket\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pid, 4123);
+        assert_eq!(rows[0].arguments, "java -agentlib:jdwp=transport=dt_socket");
+    }
+
+    #[test]
+    fn parses_ipv4_and_ipv6_socket_rows() {
+        let rows = parse_network_connections(
+            "tcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=3091128,fd=3))\n\
+             tcp ESTAB 0 0 [2001:db8::2]:22 [2001:db8::3]:51002 users:((\"sshd\",pid=889,fd=4))\n",
+        );
+        assert_eq!(rows[0].local_port, Some(22));
+        assert_eq!(rows[0].process.as_deref(), Some("sshd"));
+        assert_eq!(rows[1].local_address, "2001:db8::2");
+        assert_eq!(rows[1].remote_port, Some(51002));
+    }
+
+    #[test]
+    fn merges_link_and_address_information() {
+        let rows = parse_network_interfaces(
+            "2: eth0@if3: <BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state UP mode DEFAULT link/ether 02:42:ac:11:00:02 brd ff:ff:ff:ff:ff:ff\n\
+             --ADDR--\n\
+             2: eth0 inet 172.17.0.2/16 brd 172.17.255.255 scope global eth0\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "eth0");
+        assert_eq!(rows[0].address, "172.17.0.2");
+        assert_eq!(rows[0].prefix_length, Some(16));
     }
 }

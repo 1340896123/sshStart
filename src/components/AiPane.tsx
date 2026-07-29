@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Bot,
@@ -8,6 +8,8 @@ import {
   ChevronRight,
   CircleStop,
   Copy,
+  History,
+  MessageSquarePlus,
   Play,
   Send,
   Settings2,
@@ -16,8 +18,19 @@ import {
   User,
   X,
 } from "lucide-react";
+import {
+  AI_HISTORY_STORAGE_KEY,
+  AI_HISTORY_UPDATED_EVENT,
+  publishAiConversations,
+  readAiConversations,
+  upsertAiConversation,
+  type AiConversation,
+} from "../aiHistory";
 import { isTauri, uid } from "../lib";
 import type { AiConfig, AiMessage, AiResponse, ServerProfile, SessionState } from "../types";
+import { AiHistoryPopover } from "./AiHistoryPopover";
+
+const MarkdownMessage = lazy(() => import("./MarkdownMessage").then((module) => ({ default: module.MarkdownMessage })));
 
 interface Props {
   session: SessionState;
@@ -34,11 +47,97 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   const [loading, setLoading] = useState(false);
   const [autoExecute, setAutoExecute] = useState(true);
   const [thinkingOpen, setThinkingOpen] = useState<Record<string, boolean>>({});
-  const abortRef = useRef(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [conversations, setConversations] = useState<AiConversation[]>(readAiConversations);
+  const [activeConversationId, setActiveConversationId] = useState<string>();
+  const requestVersionRef = useRef(0);
+  const activeConversationIdRef = useRef<string>();
+  const conversationsRef = useRef(conversations);
+  const historyControlRef = useRef<HTMLDivElement>(null);
 
   const contextLabel = useMemo(() => `${server.name} · ${session.cwd}`, [server.name, session.cwd]);
+  const serverConversations = useMemo(
+    () => conversations.filter((conversation) => conversation.serverId === server.id),
+    [conversations, server.id],
+  );
 
-  const setMessages = (messages: AiMessage[]) => onUpdate({ aiMessages: messages });
+  useEffect(() => {
+    const syncHistory = (event: Event) => {
+      const detail = (event as CustomEvent<AiConversation[]>).detail;
+      const next = detail ?? readAiConversations();
+      conversationsRef.current = next;
+      setConversations(next);
+    };
+    const syncStorage = (event: StorageEvent) => {
+      if (event.key === AI_HISTORY_STORAGE_KEY) syncHistory(event);
+    };
+    window.addEventListener(AI_HISTORY_UPDATED_EVENT, syncHistory);
+    window.addEventListener("storage", syncStorage);
+    return () => {
+      window.removeEventListener(AI_HISTORY_UPDATED_EVENT, syncHistory);
+      window.removeEventListener("storage", syncStorage);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!historyOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !historyControlRef.current?.contains(event.target)) setHistoryOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setHistoryOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [historyOpen]);
+
+  const replaceConversations = (next: AiConversation[]) => {
+    const published = publishAiConversations(next);
+    conversationsRef.current = published;
+    setConversations(published);
+  };
+
+  const setMessages = (messages: AiMessage[]) => {
+    onUpdate({ aiMessages: messages });
+    if (messages.length === 0) return;
+    const conversationId = activeConversationIdRef.current ?? uid("ai-conversation");
+    if (!activeConversationIdRef.current) {
+      activeConversationIdRef.current = conversationId;
+      setActiveConversationId(conversationId);
+    }
+    replaceConversations(upsertAiConversation(conversationsRef.current, conversationId, server, messages));
+  };
+
+  const startNewConversation = () => {
+    requestVersionRef.current += 1;
+    activeConversationIdRef.current = undefined;
+    setActiveConversationId(undefined);
+    setHistoryOpen(false);
+    setInput("");
+    setLoading(false);
+    setThinkingOpen({});
+    onUpdate({ aiMessages: [] });
+  };
+
+  const selectConversation = (conversation: AiConversation) => {
+    requestVersionRef.current += 1;
+    activeConversationIdRef.current = conversation.id;
+    setActiveConversationId(conversation.id);
+    setHistoryOpen(false);
+    setInput("");
+    setLoading(false);
+    setThinkingOpen({});
+    onUpdate({ aiMessages: conversation.messages });
+  };
+
+  const deleteConversation = (conversationId: string) => {
+    replaceConversations(conversationsRef.current.filter((conversation) => conversation.id !== conversationId));
+    if (activeConversationIdRef.current === conversationId) startNewConversation();
+  };
 
   const runDirectCommand = async (command: string) => {
     if (!isTauri()) return { stdout: `Preview command output\n$ ${command}\nService status: healthy`, stderr: "", exitCode: 0 };
@@ -48,8 +147,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   const send = async (content = input) => {
     const text = content.trim();
     if (!text || loading) return;
+    setHistoryOpen(false);
     setInput("");
-    abortRef.current = false;
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
     const userMessage: AiMessage = { id: uid("message"), role: "user", content: text, createdAt: Date.now() };
     const pendingMessages = [...session.aiMessages, userMessage];
     setMessages(pendingMessages);
@@ -59,7 +160,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
       if (text.startsWith("/run ")) {
         const command = text.slice(5).trim();
         const result = await runDirectCommand(command);
-        if (abortRef.current) return;
+        if (requestVersionRef.current !== requestVersion) return;
         setMessages([...pendingMessages, {
           id: uid("message"), role: "assistant", content: result.exitCode === 0 ? "命令已执行完成。" : "命令执行失败，请检查输出。",
           reasoning: "识别到显式 /run 指令，跳过模型推理并在当前 SSH 会话直接执行。",
@@ -67,7 +168,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         }]);
       } else if (!isTauri()) {
         await new Promise((resolve) => setTimeout(resolve, 850));
-        if (abortRef.current) return;
+        if (requestVersionRef.current !== requestVersion) return;
         setMessages([...pendingMessages, {
           id: uid("message"), role: "assistant",
           content: "当前服务器运行状态正常。磁盘根分区使用率 42%，内存仍有充足余量，没有发现需要立即处理的告警。建议继续检查最近 30 分钟的服务错误日志。",
@@ -83,7 +184,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           messages: pendingMessages.map(({ role, content }) => ({ role, content })),
           allowExecute: autoExecute,
         });
-        if (abortRef.current) return;
+        if (requestVersionRef.current !== requestVersion) return;
         const lastTool = response.toolCalls[response.toolCalls.length - 1];
         setMessages([...pendingMessages, {
           id: uid("message"), role: "assistant", content: response.content,
@@ -91,9 +192,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         }]);
       }
     } catch (reason) {
+      if (requestVersionRef.current !== requestVersion) return;
       setMessages([...pendingMessages, { id: uid("message"), role: "assistant", content: `请求失败：${String(reason)}`, createdAt: Date.now() }]);
     } finally {
-      setLoading(false);
+      if (requestVersionRef.current === requestVersion) setLoading(false);
     }
   };
 
@@ -102,6 +204,27 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
       <div className="ai-header">
         <div className="pane-title"><Sparkles size={14} /><span>AI 助手</span><small>{config.model}</small></div>
         <span className="header-spacer" />
+        <button className="icon-button quiet" title="新建会话" aria-label="新建会话" onClick={startNewConversation}><MessageSquarePlus size={14} /></button>
+        <div className="ai-history-control" ref={historyControlRef}>
+          <button
+            className={`icon-button quiet ${historyOpen ? "active" : ""}`}
+            title="历史会话"
+            aria-label="历史会话"
+            aria-haspopup="dialog"
+            aria-expanded={historyOpen}
+            onClick={() => setHistoryOpen((open) => !open)}
+          >
+            <History size={14} />
+          </button>
+          {historyOpen && (
+            <AiHistoryPopover
+              conversations={serverConversations}
+              activeConversationId={activeConversationId}
+              onSelect={selectConversation}
+              onDelete={deleteConversation}
+            />
+          )}
+        </div>
         <button className="icon-button quiet" title="AI 设置" onClick={onOpenSettings}><Settings2 size={14} /></button>
         <button className="icon-button quiet" title="关闭助手" onClick={() => document.querySelector<HTMLButtonElement>('.activity-button[title="AI 助手"]')?.click()}><X size={14} /></button>
       </div>
@@ -121,7 +244,9 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         {session.aiMessages.map((message) => (
           <article className={`ai-message ${message.role}`} key={message.id}>
             <div className="message-meta">{message.role === "user" ? <User size={12} /> : <Bot size={12} />}<span>{message.role === "user" ? "你" : "Portico AI"}</span></div>
-            <div className="message-copy">{message.content}</div>
+            {message.role === "assistant"
+              ? <Suspense fallback={<div className="message-copy plain-text">{message.content}</div>}><MarkdownMessage content={message.content} /></Suspense>
+              : <div className="message-copy plain-text">{message.content}</div>}
             {message.reasoning && (
               <div className="reasoning-block">
                 <button onClick={() => setThinkingOpen((current) => ({ ...current, [message.id]: !current[message.id] }))}>
@@ -164,7 +289,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             }}
             placeholder="描述任务，或输入 /run 执行命令"
           />
-          <div className="composer-footer"><span>当前目录 {session.cwd}</span>{loading ? <button className="send-button stop" title="停止" onClick={() => { abortRef.current = true; setLoading(false); }}><CircleStop size={15} /></button> : <button className="send-button" title="发送" disabled={!input.trim()} onClick={() => void send()}><Send size={15} /></button>}</div>
+          <div className="composer-footer"><span>当前目录 {session.cwd}</span>{loading ? <button className="send-button stop" title="停止" onClick={() => { requestVersionRef.current += 1; setLoading(false); }}><CircleStop size={15} /></button> : <button className="send-button" title="发送" disabled={!input.trim()} onClick={() => void send()}><Send size={15} /></button>}</div>
         </div>
       </div>
     </aside>
