@@ -24,12 +24,15 @@ import { TerminalPane } from "./components/TerminalPane";
 import { TransferPanel } from "./components/TransferPanel";
 import { SystemDock } from "./components/SystemDock";
 import { DEMO_SERVER, connectionLabel, isTauri, uid } from "./lib";
-import type { AiConfig, ServerProfile, SessionState, TransferRequest, TransferTask, WorkspaceView } from "./types";
+import type { AiConfig, ServerProfile, SessionState, TransferRequest, TransferTask } from "./types";
 
 const DEFAULT_AI_CONFIG: AiConfig = {
   endpoint: "https://api.openai.com/v1",
   apiKey: "",
   model: "gpt-4.1-mini",
+  contextWindow: 128000,
+  supportsImages: true,
+  temperature: 0.2,
   systemPrompt:
     "你是一名谨慎的 Linux 运维助手。优先解释风险；需要时使用 run_ssh_command 工具，并在执行破坏性命令前请求确认。",
 };
@@ -38,7 +41,11 @@ function useStoredState<T>(key: string, initialValue: T, serialize: (value: T) =
   const [value, setValue] = useState<T>(() => {
     try {
       const stored = localStorage.getItem(key);
-      return stored ? (JSON.parse(stored) as T) : initialValue;
+      if (!stored) return initialValue;
+      const parsed = JSON.parse(stored) as T;
+      return typeof initialValue === "object" && initialValue !== null && !Array.isArray(initialValue)
+        ? { ...initialValue, ...parsed }
+        : parsed;
     } catch {
       return initialValue;
     }
@@ -58,7 +65,6 @@ export default function App() {
   const [aiConfig, setAiConfig] = useStoredState<AiConfig>("portico.ai", DEFAULT_AI_CONFIG, ({ apiKey: _apiKey, ...config }) => config);
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
-  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("terminal");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarView, setSidebarView] = useState<"servers" | "transfers">("servers");
   const [aiOpen, setAiOpen] = useState(true);
@@ -356,25 +362,17 @@ export default function App() {
                 return (
                   <div className={`workspace-session ${session.id === activeSessionId ? "active" : ""}`} key={session.id}>
                     <section className="operations-column">
-                      <div className="view-switcher" role="tablist" aria-label="工作视图">
-                        <button className={workspaceView === "terminal" ? "active" : ""} onClick={() => setWorkspaceView("terminal")}><SquareTerminal size={13} /> 终端</button>
-                        <button className={workspaceView === "split" ? "active" : ""} onClick={() => setWorkspaceView("split")}>双栏</button>
-                        <button className={workspaceView === "files" ? "active" : ""} onClick={() => setWorkspaceView("files")}><FolderSync size={13} /> 文件</button>
-                      </div>
-                      <div className={`operations-grid view-${workspaceView}`}>
-                        <TerminalPane session={session} server={server} onUpdate={(patch) => updateSession(session.id, patch)} />
-                        <FilePane
-                          session={session}
-                          server={server}
-                          onUpdate={(patch) => updateSession(session.id, patch)}
-                          onTransfer={(request, operation) => startTransfer(session, server, request, operation)}
-                        />
-                      </div>
+                      <TerminalPane session={session} server={server} onUpdate={(patch) => updateSession(session.id, patch)} />
                       <SystemDock
                         server={server}
-                        filesActive={workspaceView === "files"}
-                        onOpenSystem={() => setWorkspaceView("terminal")}
-                        onOpenFiles={() => setWorkspaceView("files")}
+                        filePane={(
+                          <FilePane
+                            session={session}
+                            server={server}
+                            onUpdate={(patch) => updateSession(session.id, patch)}
+                            onTransfer={(request, operation) => startTransfer(session, server, request, operation)}
+                          />
+                        )}
                       />
                     </section>
                     {aiOpen && <AiPane session={session} server={server} config={aiConfig} onUpdate={(patch) => updateSession(session.id, patch)} onOpenSettings={() => setSettingsOpen(true)} />}

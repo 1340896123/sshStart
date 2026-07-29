@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
@@ -15,15 +24,14 @@ import {
 import { isTauri } from "../lib";
 import type { NetworkConnection, NetworkInterface, ProcessInfo, ServerProfile } from "../types";
 
-type DockView = "processes" | "network";
+type DockView = "processes" | "network" | "files";
 type NetworkView = "listening" | "active" | "interfaces";
 type ProcessSort = "pid" | "user" | "command" | "memoryPercent" | "cpuPercent" | "elapsedSeconds";
+const DOCK_TAB_HEIGHT = 35;
 
 interface Props {
   server: ServerProfile;
-  filesActive: boolean;
-  onOpenSystem: () => void;
-  onOpenFiles: () => void;
+  filePane: ReactNode;
 }
 
 const DEMO_PROCESSES: ProcessInfo[] = [
@@ -63,7 +71,27 @@ function endpoint(address: string, port?: number) {
   return port === undefined ? host : `${host}:${port}`;
 }
 
-export function SystemDock({ server, filesActive, onOpenSystem, onOpenFiles }: Props) {
+function dockGeometry(splitter: HTMLElement) {
+  const column = splitter.parentElement;
+  if (!column) return undefined;
+  const style = window.getComputedStyle(column);
+  const bounds = column.getBoundingClientRect();
+  const paddingTop = Number.parseFloat(style.paddingTop) || 0;
+  const paddingBottom = Number.parseFloat(style.paddingBottom) || 0;
+  const splitterHeight = splitter.getBoundingClientRect().height;
+  const contentTop = bounds.top + paddingTop;
+  const contentBottom = bounds.bottom - paddingBottom;
+  const maxDockHeight = Math.max(0, contentBottom - contentTop - splitterHeight);
+  return {
+    contentTop,
+    contentBottom,
+    splitterHeight,
+    minDockHeight: Math.min(DOCK_TAB_HEIGHT, maxDockHeight),
+    maxDockHeight,
+  };
+}
+
+export function SystemDock({ server, filePane }: Props) {
   const [active, setActive] = useState<DockView | undefined>("processes");
   const [networkView, setNetworkView] = useState<NetworkView>("listening");
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
@@ -76,6 +104,8 @@ export function SystemDock({ server, filesActive, onOpenSystem, onOpenFiles }: P
   const [selectedPid, setSelectedPid] = useState<number>();
   const [signaling, setSignaling] = useState(false);
   const [sort, setSort] = useState<{ key: ProcessSort; direction: "asc" | "desc" }>({ key: "cpuPercent", direction: "desc" });
+  const [dockHeight, setDockHeight] = useState<number>();
+  const resizeCleanupRef = useRef<() => void>();
 
   const loadProcesses = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -117,14 +147,16 @@ export function SystemDock({ server, filesActive, onOpenSystem, onOpenFiles }: P
   }, [active, loadNetwork, loadProcesses]);
 
   useEffect(() => {
-    if (active) void refresh();
+    if (active === "processes" || active === "network") void refresh();
   }, [active, refresh]);
 
   useEffect(() => {
-    if (!autoRefresh || !active) return;
+    if (!autoRefresh || (active !== "processes" && active !== "network")) return;
     const timer = window.setInterval(() => void refresh(true), 5000);
     return () => window.clearInterval(timer);
   }, [active, autoRefresh, refresh]);
+
+  useEffect(() => () => resizeCleanupRef.current?.(), []);
 
   const visibleProcesses = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -180,9 +212,59 @@ export function SystemDock({ server, filesActive, onOpenSystem, onOpenFiles }: P
 
   const switchView = (view: DockView) => {
     setQuery("");
-    const next = active === view ? undefined : view;
-    setActive(next);
-    if (next) onOpenSystem();
+    setActive((current) => current === view ? undefined : view);
+  };
+
+  const beginDockResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!active || event.button !== 0) return;
+    const splitter = event.currentTarget;
+    const geometry = dockGeometry(splitter);
+    if (!geometry) return;
+    event.preventDefault();
+    splitter.focus();
+    splitter.setPointerCapture(event.pointerId);
+    const grabOffset = event.clientY - splitter.getBoundingClientRect().top;
+
+    const onMove = (moveEvent: PointerEvent) => {
+      const nextGeometry = dockGeometry(splitter);
+      if (!nextGeometry) return;
+      const splitterTop = Math.min(
+        Math.max(moveEvent.clientY - grabOffset, nextGeometry.contentTop),
+        nextGeometry.contentBottom - nextGeometry.splitterHeight - nextGeometry.minDockHeight,
+      );
+      setDockHeight(nextGeometry.contentBottom - splitterTop - nextGeometry.splitterHeight);
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      window.removeEventListener("blur", stop);
+      document.body.classList.remove("is-resizing-rows");
+      resizeCleanupRef.current = undefined;
+    };
+
+    resizeCleanupRef.current?.();
+    resizeCleanupRef.current = stop;
+    document.body.classList.add("is-resizing-rows");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    window.addEventListener("blur", stop);
+  };
+
+  const resizeDockWithKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!active || !["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    const geometry = dockGeometry(event.currentTarget);
+    const dock = event.currentTarget.nextElementSibling;
+    if (!geometry || !(dock instanceof HTMLElement)) return;
+    event.preventDefault();
+    const currentHeight = dock.getBoundingClientRect().height;
+    const nextHeight = event.key === "Home"
+      ? geometry.maxDockHeight
+      : event.key === "End"
+        ? geometry.minDockHeight
+        : currentHeight + (event.key === "ArrowUp" ? 16 : -16);
+    setDockHeight(Math.min(Math.max(geometry.minDockHeight, nextHeight), geometry.maxDockHeight));
   };
 
   const sortGlyph = (key: ProcessSort) => sort.key === key
@@ -190,9 +272,26 @@ export function SystemDock({ server, filesActive, onOpenSystem, onOpenFiles }: P
     : null;
 
   return (
-    <section className={`system-dock ${active ? "expanded" : "collapsed"}`} aria-label="系统工具">
-      {active && (
-        <div className="system-dock-content">
+    <>
+      <div
+        className={`operations-splitter ${active ? "" : "disabled"}`}
+        role="separator"
+        aria-label="调整终端和工具区高度"
+        aria-orientation="horizontal"
+        aria-disabled={!active}
+        tabIndex={active ? 0 : -1}
+        onPointerDown={beginDockResize}
+        onKeyDown={resizeDockWithKeyboard}
+      />
+      <section
+        className={`system-dock ${active ? "expanded" : "collapsed"}`}
+        aria-label="系统工具"
+        style={active && dockHeight !== undefined ? { height: dockHeight } : undefined}
+      >
+        <div className={`system-dock-content ${active === "files" ? "files-view" : ""} ${active ? "" : "is-hidden"}`}>
+          <div className="file-pane-slot" hidden={active !== "files"}>{filePane}</div>
+          {active && active !== "files" && (
+            <>
           <div className="system-toolbar">
             <label className="system-search">
               <Search size={13} />
@@ -289,14 +388,16 @@ export function SystemDock({ server, filesActive, onOpenSystem, onOpenFiles }: P
               {!loading && visibleConnections.length === 0 && <div className="system-state">没有匹配的网络连接</div>}
             </div>
           )}
+            </>
+          )}
         </div>
-      )}
 
-      <div className="system-dock-tabs" role="tablist" aria-label="终端工具">
-        <button className={active === "processes" ? "active" : ""} onClick={() => switchView("processes")}><Activity size={13} />进程管理</button>
-        <button className={active === "network" ? "active" : ""} onClick={() => switchView("network")}><Network size={13} />网络</button>
-        <button className={!active && filesActive ? "active" : ""} onClick={() => { setActive(undefined); onOpenFiles(); }}><Folder size={13} />文件管理</button>
-      </div>
-    </section>
+        <div className="system-dock-tabs" role="tablist" aria-label="终端工具">
+          <button className={active === "processes" ? "active" : ""} onClick={() => switchView("processes")}><Activity size={13} />进程管理</button>
+          <button className={active === "network" ? "active" : ""} onClick={() => switchView("network")}><Network size={13} />网络</button>
+          <button className={active === "files" ? "active" : ""} onClick={() => switchView("files")}><Folder size={13} />文件管理</button>
+        </div>
+      </section>
+    </>
   );
 }

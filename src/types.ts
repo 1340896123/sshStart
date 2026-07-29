@@ -104,6 +104,9 @@ export interface AiConfig {
   endpoint: string;
   apiKey: string;
   model: string;
+  contextWindow: number;
+  supportsImages: boolean;
+  temperature: number;
   systemPrompt: string;
 }
 

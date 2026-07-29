@@ -294,6 +294,15 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
     <div className="pane file-pane">
       <div className="pane-header">
         <div className="pane-title"><Folder size={14} /><span>文件</span></div>
+        <label className="file-search file-header-search">
+          <Search size={12} />
+          <input
+            aria-label="筛选文件"
+            value={filter}
+            onChange={(event) => setFilter(event.target.value)}
+            placeholder="筛选"
+          />
+        </label>
         <span className="header-spacer" />
         <button className="icon-button quiet" title="上传文件" onClick={() => void upload()}><ArrowUpToLine size={13} /></button>
         <button className="icon-button quiet" title="下载选中文件" disabled={!selected || files.find((file) => file.path === selected)?.isDir} onClick={() => void download()}><ArrowDownToLine size={13} /></button>
@@ -317,7 +326,6 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
             }}
           />
         </label>
-        <label className="file-search"><Search size={12} /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="筛选" /></label>
       </div>
       {error ? <div className="pane-error">无法完成操作：{error}<button onClick={() => setError("")}>关闭</button></div> : (
         <div className="file-table-wrap" onContextMenu={(event) => openMenu(event)}>

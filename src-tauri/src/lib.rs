@@ -88,6 +88,12 @@ struct AiConfig {
     endpoint: String,
     api_key: String,
     model: String,
+    #[serde(default = "default_context_window")]
+    context_window: u32,
+    #[serde(default)]
+    supports_images: bool,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
     system_prompt: String,
 }
 
@@ -141,7 +147,12 @@ fn hydrate_server_secrets(server: &ServerProfile) -> ServerProfile {
     if hydrated.password.as_deref().unwrap_or_default().is_empty() {
         hydrated.password = read_secret(&format!("server:{}:password", server.id));
     }
-    if hydrated.passphrase.as_deref().unwrap_or_default().is_empty() {
+    if hydrated
+        .passphrase
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
         hydrated.passphrase = read_secret(&format!("server:{}:passphrase", server.id));
     }
     hydrated
@@ -233,7 +244,10 @@ fn connect_ssh(server: &ServerProfile) -> Result<Session, String> {
                     &server.username,
                     None,
                     Path::new(key_path),
-                    server.passphrase.as_deref().filter(|value| !value.is_empty()),
+                    server
+                        .passphrase
+                        .as_deref()
+                        .filter(|value| !value.is_empty()),
                 )
                 .map_err(|error| format!("私钥认证失败: {error}"))?;
         }
@@ -696,7 +710,9 @@ fn stop_terminal(manager: State<'_, TerminalManager>, session_id: String) -> Res
 async fn list_directory(server: ServerProfile, path: String) -> Result<Vec<RemoteFile>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let session = connect_ssh(&server)?;
-        let sftp = session.sftp().map_err(|error| format!("SFTP 初始化失败: {error}"))?;
+        let sftp = session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
         let mut entries = sftp
             .readdir(Path::new(&path))
             .map_err(|error| format!("读取目录失败: {error}"))?
@@ -730,11 +746,18 @@ async fn list_directory(server: ServerProfile, path: String) -> Result<Vec<Remot
 }
 
 #[tauri::command]
-async fn upload_file(server: ServerProfile, local_path: String, remote_path: String) -> Result<(), String> {
+async fn upload_file(
+    server: ServerProfile,
+    local_path: String,
+    remote_path: String,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let session = connect_ssh(&server)?;
-        let sftp = session.sftp().map_err(|error| format!("SFTP 初始化失败: {error}"))?;
-        let mut source = File::open(&local_path).map_err(|error| format!("打开本地文件失败: {error}"))?;
+        let sftp = session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
+        let mut source =
+            File::open(&local_path).map_err(|error| format!("打开本地文件失败: {error}"))?;
         let mut target = sftp
             .create(Path::new(&remote_path))
             .map_err(|error| format!("创建远程文件失败: {error}"))?;
@@ -746,14 +769,21 @@ async fn upload_file(server: ServerProfile, local_path: String, remote_path: Str
 }
 
 #[tauri::command]
-async fn download_file(server: ServerProfile, remote_path: String, local_path: String) -> Result<(), String> {
+async fn download_file(
+    server: ServerProfile,
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let session = connect_ssh(&server)?;
-        let sftp = session.sftp().map_err(|error| format!("SFTP 初始化失败: {error}"))?;
+        let sftp = session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
         let mut source = sftp
             .open(Path::new(&remote_path))
             .map_err(|error| format!("打开远程文件失败: {error}"))?;
-        let mut target = File::create(&local_path).map_err(|error| format!("创建本地文件失败: {error}"))?;
+        let mut target =
+            File::create(&local_path).map_err(|error| format!("创建本地文件失败: {error}"))?;
         std::io::copy(&mut source, &mut target).map_err(|error| format!("下载失败: {error}"))?;
         Ok(())
     })
@@ -776,10 +806,16 @@ async fn create_directory(server: ServerProfile, path: String) -> Result<(), Str
 }
 
 #[tauri::command]
-async fn delete_remote_path(server: ServerProfile, path: String, is_dir: bool) -> Result<(), String> {
+async fn delete_remote_path(
+    server: ServerProfile,
+    path: String,
+    is_dir: bool,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let session = connect_ssh(&server)?;
-        let sftp = session.sftp().map_err(|error| format!("SFTP 初始化失败: {error}"))?;
+        let sftp = session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
         if is_dir {
             sftp.rmdir(Path::new(&path))
                 .map_err(|error| format!("删除目录失败（目录必须为空）: {error}"))
@@ -883,9 +919,11 @@ fn is_high_risk_command(command: &str) -> bool {
     let normalized = command.to_lowercase().replace("  ", " ");
     let root_delete = normalized.split([';', '&', '|']).any(|part| {
         let part = part.trim().strip_prefix("sudo ").unwrap_or(part.trim());
-        ["rm -rf /", "rm -fr /"]
-            .iter()
-            .any(|prefix| part == *prefix || part.starts_with(&format!("{prefix} ")) || part.starts_with(&format!("{prefix}*")))
+        ["rm -rf /", "rm -fr /"].iter().any(|prefix| {
+            part == *prefix
+                || part.starts_with(&format!("{prefix} "))
+                || part.starts_with(&format!("{prefix}*"))
+        })
     });
     root_delete
         || [
@@ -919,6 +957,237 @@ fn extract_reasoning_summary(content: &str) -> (String, Option<String>) {
     (cleaned.trim().to_string(), Some(reasoning))
 }
 
+fn default_context_window() -> u32 {
+    128_000
+}
+
+fn default_temperature() -> f32 {
+    0.2
+}
+
+fn ai_endpoint(endpoint: &str, path: &str) -> String {
+    let base = endpoint.trim().trim_end_matches('/');
+    let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+    format!("{base}/{path}")
+}
+
+fn estimate_tokens(value: &str) -> usize {
+    let (ascii, non_ascii) =
+        value
+            .chars()
+            .fold((0usize, 0usize), |(ascii, non_ascii), character| {
+                if character.is_ascii() {
+                    (ascii + 1, non_ascii)
+                } else {
+                    (ascii, non_ascii + 1)
+                }
+            });
+    ascii.div_ceil(4) + non_ascii
+}
+
+fn input_token_budget(context_window: u32) -> usize {
+    let context_window = context_window as usize;
+    context_window.saturating_sub((context_window / 4).max(256))
+}
+
+fn trim_messages_for_context(
+    messages: Vec<AiInputMessage>,
+    context_window: u32,
+    system_prompt: &str,
+) -> Result<Vec<AiInputMessage>, String> {
+    let system_cost = estimate_tokens(system_prompt) + 8;
+    let mut remaining = input_token_budget(context_window)
+        .checked_sub(system_cost)
+        .ok_or_else(|| "系统提示词超过可用上下文，请缩短提示词或增大上下文大小".to_string())?;
+    let mut retained = Vec::new();
+
+    for message in messages.into_iter().rev() {
+        let cost = estimate_tokens(&message.content) + 4;
+        if cost > remaining {
+            if retained.is_empty() {
+                return Err("最新消息超过可用上下文，请缩短内容或增大上下文大小".to_string());
+            }
+            break;
+        }
+        remaining -= cost;
+        retained.push(message);
+    }
+    retained.reverse();
+    Ok(retained)
+}
+
+fn api_message_cost(message: &Value) -> usize {
+    let mut cost = 4;
+    for key in ["role", "content", "tool_call_id"] {
+        if let Some(value) = message.get(key).and_then(Value::as_str) {
+            cost += estimate_tokens(value);
+        }
+    }
+    if let Some(tool_calls) = message.get("tool_calls") {
+        cost += estimate_tokens(&tool_calls.to_string());
+    }
+    cost
+}
+
+fn trim_api_messages_for_context(
+    messages: &mut Vec<Value>,
+    context_window: u32,
+) -> Result<(), String> {
+    let Some(system) = messages.first().cloned() else {
+        return Ok(());
+    };
+    let system_cost = api_message_cost(&system);
+    let mut remaining = input_token_budget(context_window)
+        .checked_sub(system_cost)
+        .ok_or_else(|| "系统提示词超过可用上下文，请缩短提示词或增大上下文大小".to_string())?;
+    let mut groups: Vec<Vec<Value>> = Vec::new();
+
+    for message in messages.iter().skip(1).cloned() {
+        let starts_turn = message.get("role").and_then(Value::as_str) == Some("user");
+        if groups.is_empty() || starts_turn && groups.last().is_some_and(|group| !group.is_empty())
+        {
+            groups.push(Vec::new());
+        }
+        groups
+            .last_mut()
+            .expect("message group exists")
+            .push(message);
+    }
+
+    let mut retained = Vec::new();
+    for group in groups.into_iter().rev() {
+        let cost = group.iter().map(api_message_cost).sum::<usize>();
+        if cost > remaining {
+            if retained.is_empty() {
+                return Err("最近一轮消息超过可用上下文，请缩短内容或增大上下文大小".to_string());
+            }
+            break;
+        }
+        remaining -= cost;
+        retained.push(group);
+    }
+
+    retained.reverse();
+    messages.clear();
+    messages.push(system);
+    messages.extend(retained.into_iter().flatten());
+    Ok(())
+}
+
+fn truncate_to_token_budget(value: &str, budget: usize) -> String {
+    if estimate_tokens(value) <= budget {
+        return value.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let suffix = "\n...[tool output truncated]";
+    let suffix = if estimate_tokens(suffix) <= budget {
+        suffix
+    } else {
+        "..."
+    };
+    let content_budget = budget.saturating_sub(estimate_tokens(suffix));
+    let mut result = String::new();
+    let (mut ascii, mut non_ascii) = (0usize, 0usize);
+    for character in value.chars() {
+        let (next_ascii, next_non_ascii) = if character.is_ascii() {
+            (ascii + 1, non_ascii)
+        } else {
+            (ascii, non_ascii + 1)
+        };
+        if next_ascii.div_ceil(4) + next_non_ascii > content_budget {
+            break;
+        }
+        ascii = next_ascii;
+        non_ascii = next_non_ascii;
+        result.push(character);
+    }
+    result.push_str(suffix);
+    result
+}
+
+fn tool_output_budget(
+    messages: &[Value],
+    context_window: u32,
+    tool_call_id: &str,
+    future_tool_call_ids: &[String],
+) -> Result<usize, String> {
+    let latest_turn_start = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(1);
+    let system_cost = messages.first().map(api_message_cost).unwrap_or_default();
+    let current_turn_cost = messages
+        .iter()
+        .skip(latest_turn_start)
+        .map(api_message_cost)
+        .sum::<usize>();
+    let tool_envelope_cost = |id: &str| {
+        4 + estimate_tokens("tool")
+            + estimate_tokens(id)
+            + estimate_tokens("exit_code=-2147483648\n")
+    };
+    let fixed_cost = system_cost
+        + current_turn_cost
+        + tool_envelope_cost(tool_call_id)
+        + future_tool_call_ids
+            .iter()
+            .map(|id| tool_envelope_cost(id))
+            .sum::<usize>();
+    let available = input_token_budget(context_window)
+        .checked_sub(fixed_cost)
+        .ok_or_else(|| "AI 工具调用超过可用上下文，请增大上下文大小".to_string())?;
+    Ok(available / (future_tool_call_ids.len() + 1))
+}
+
+#[tauri::command]
+async fn list_ai_models(config: AiConfig) -> Result<Vec<String>, String> {
+    let api_key = if config.api_key.trim().is_empty() {
+        read_secret("ai:api-key").unwrap_or_default()
+    } else {
+        config.api_key.clone()
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("AI 客户端初始化失败: {error}"))?;
+    let mut request = client.get(ai_endpoint(&config.endpoint, "models"));
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("模型列表请求失败: {error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("模型列表解析失败: {error}"))?;
+    if !status.is_success() {
+        let detail = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("未知接口错误");
+        return Err(format!("模型接口返回 {status}: {detail}"));
+    }
+    let mut models = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect::<Vec<_>>();
+    models.sort_unstable();
+    models.dedup();
+    if models.is_empty() {
+        return Err("接口未返回可用模型".to_string());
+    }
+    Ok(models)
+}
+
 #[tauri::command]
 async fn ai_chat(
     config: AiConfig,
@@ -926,33 +1195,46 @@ async fn ai_chat(
     messages: Vec<AiInputMessage>,
     allow_execute: bool,
 ) -> Result<AiResponse, String> {
+    if !(1_024..=2_000_000).contains(&config.context_window) {
+        return Err("上下文大小需在 1,024–2,000,000 之间".to_string());
+    }
+    if !config.temperature.is_finite() || !(0.0..=2.0).contains(&config.temperature) {
+        return Err("温度需在 0–2 之间".to_string());
+    }
     let api_key = if config.api_key.trim().is_empty() {
-        read_secret("ai:api-key").ok_or_else(|| "未配置 AI API Key，请先打开助手设置".to_string())?
+        read_secret("ai:api-key")
+            .ok_or_else(|| "未配置 AI API Key，请先打开助手设置".to_string())?
     } else {
         config.api_key.clone()
     };
-    let endpoint = if config.endpoint.trim_end_matches('/').ends_with("chat/completions") {
-        config.endpoint.clone()
-    } else {
-        format!("{}/chat/completions", config.endpoint.trim_end_matches('/'))
-    };
+    let endpoint = ai_endpoint(&config.endpoint, "chat/completions");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|error| format!("AI 客户端初始化失败: {error}"))?;
+    let image_capability = if config.supports_images {
+        "支持"
+    } else {
+        "不支持"
+    };
     let system = format!(
-        "{}\n当前 SSH 目标为 {}@{}:{}。最终回答开头必须使用 <reasoning_summary>...</reasoning_summary> 给出简明的判断依据与执行计划；不要披露隐藏思维链。",
-        config.system_prompt, server.username, server.host, server.port
+        "{}\n当前 SSH 目标为 {}@{}:{}。当前模型配置为{image_capability}图片输入。最终回答开头必须使用 <reasoning_summary>...</reasoning_summary> 给出简明的判断依据与执行计划；不要披露隐藏思维链。",
+        config.system_prompt, server.username, server.host, server.port,
     );
     let mut api_messages = vec![json!({ "role": "system", "content": system })];
-    api_messages.extend(messages.into_iter().map(|message| json!(message)));
+    api_messages.extend(
+        trim_messages_for_context(messages, config.context_window, &system)?
+            .into_iter()
+            .map(|message| json!(message)),
+    );
     let mut executed_tools = Vec::new();
 
     for _ in 0..4 {
+        trim_api_messages_for_context(&mut api_messages, config.context_window)?;
         let mut body = json!({
             "model": config.model,
             "messages": api_messages,
-            "temperature": 0.2
+            "temperature": config.temperature
         });
         if allow_execute {
             body["tools"] = json!([{
@@ -1002,7 +1284,10 @@ async fn ai_chat(
             .unwrap_or_default();
 
         if tool_calls.is_empty() {
-            let raw_content = message.get("content").and_then(Value::as_str).unwrap_or_default();
+            let raw_content = message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let provider_reasoning = message
                 .get("reasoning_content")
                 .and_then(Value::as_str)
@@ -1016,8 +1301,27 @@ async fn ai_chat(
         }
 
         api_messages.push(message.clone());
-        for tool_call in tool_calls {
-            let id = tool_call.get("id").and_then(Value::as_str).unwrap_or("tool-call");
+        let tool_call_ids = tool_calls
+            .iter()
+            .map(|tool_call| {
+                tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool-call")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        for (index, tool_call) in tool_calls.into_iter().enumerate() {
+            let id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("tool-call");
+            let output_budget = tool_output_budget(
+                &api_messages,
+                config.context_window,
+                id,
+                &tool_call_ids[index + 1..],
+            )?;
             let arguments = tool_call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
@@ -1045,7 +1349,10 @@ async fn ai_chat(
                 .await
                 .map_err(|error| format!("AI 工具任务失败: {error}"))??
             };
-            let output = format!("{}{}", result.stdout, result.stderr);
+            let output = truncate_to_token_budget(
+                &format!("{}{}", result.stdout, result.stderr),
+                output_budget,
+            );
             executed_tools.push(AiToolResult {
                 command: command.clone(),
                 output: output.clone(),
@@ -1087,6 +1394,7 @@ pub fn run() {
             rename_remote_path,
             compress_remote_path,
             run_ssh_command,
+            list_ai_models,
             ai_chat
         ])
         .run(tauri::generate_context!())
@@ -1096,9 +1404,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_reasoning_summary, is_high_risk_command, mode_string, parse_network_connections,
+        ai_endpoint, api_message_cost, estimate_tokens, extract_reasoning_summary,
+        input_token_budget, is_high_risk_command, mode_string, parse_network_connections,
         parse_network_interfaces, parse_processes, remote_parent_and_name, shell_quote,
+        tool_output_budget, trim_api_messages_for_context, trim_messages_for_context,
+        truncate_to_token_budget, AiInputMessage,
     };
+    use serde_json::json;
 
     #[test]
     fn formats_unix_permissions() {
@@ -1130,6 +1442,73 @@ mod tests {
         );
         assert_eq!(content, "Disk usage is normal.");
         assert_eq!(reasoning.as_deref(), Some("Check disk pressure first."));
+    }
+
+    #[test]
+    fn builds_ai_endpoints_from_base_or_chat_url() {
+        assert_eq!(
+            ai_endpoint("https://api.example.com/v1", "models"),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(
+            ai_endpoint("https://api.example.com/v1/chat/completions", "models"),
+            "https://api.example.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn estimates_and_trims_ai_context_from_the_oldest_message() {
+        assert_eq!(estimate_tokens("abcd你好"), 3);
+        let messages = vec![
+            AiInputMessage {
+                role: "user".into(),
+                content: "a".repeat(4_000),
+            },
+            AiInputMessage {
+                role: "assistant".into(),
+                content: "recent".into(),
+            },
+        ];
+        let retained = trim_messages_for_context(messages, 1_024, "system").unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].content, "recent");
+    }
+
+    #[test]
+    fn rejects_a_latest_message_that_exceeds_the_input_budget() {
+        let messages = vec![AiInputMessage {
+            role: "user".into(),
+            content: "a".repeat(4_000),
+        }];
+        let error = trim_messages_for_context(messages, 1_024, "system").unwrap_err();
+        assert!(error.contains("最新消息超过可用上下文"));
+    }
+
+    #[test]
+    fn bounds_tool_output_and_keeps_the_latest_tool_turn() {
+        let mut messages = vec![
+            json!({ "role": "system", "content": "system" }),
+            json!({ "role": "user", "content": "old" }),
+            json!({ "role": "assistant", "content": "old response" }),
+            json!({ "role": "user", "content": "inspect logs" }),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{ "id": "call-1", "type": "function" }]
+            }),
+        ];
+        let budget = tool_output_budget(&messages, 1_024, "call-1", &[]).unwrap();
+        let output = truncate_to_token_budget(&"x".repeat(8_000), budget);
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": format!("exit_code=0\n{output}")
+        }));
+        trim_api_messages_for_context(&mut messages, 1_024).unwrap();
+
+        assert!(messages.iter().map(api_message_cost).sum::<usize>() <= input_token_budget(1_024));
+        assert_eq!(messages[1]["content"], "inspect logs");
+        assert!(output.ends_with("...[tool output truncated]"));
     }
 
     #[test]
