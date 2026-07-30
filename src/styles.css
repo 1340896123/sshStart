@@ -367,6 +367,10 @@ button:disabled {
   border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
 }
 
+.transfer-item.status-paused {
+  border-color: color-mix(in srgb, var(--warn) 38%, var(--border));
+}
+
 .transfer-main {
   width: 100%;
   display: flex;
@@ -450,11 +454,26 @@ button:disabled {
   color: var(--danger);
 }
 
+.status-paused .transfer-state > span {
+  color: var(--warn);
+}
+
+.status-cancelled .transfer-state > span {
+  color: var(--muted-2);
+}
+
 .transfer-state time {
   font-family: var(--font-mono);
 }
 
-.transfer-dismiss {
+.transfer-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 2px;
+}
+
+.transfer-action {
   width: 18px;
   height: 18px;
   display: grid;
@@ -467,9 +486,21 @@ button:disabled {
   cursor: pointer;
 }
 
-.transfer-dismiss:hover {
+.transfer-action:hover {
   background: var(--surface-muted);
   color: var(--fg);
+}
+
+.status-failed .transfer-action {
+  color: color-mix(in srgb, var(--danger) 72%, var(--muted-2));
+}
+
+.status-failed .transfer-action:hover {
+  color: var(--danger);
+}
+
+.transfer-dismiss {
+  color: var(--muted-2) !important;
 }
 
 .transfer-progress {
@@ -1692,6 +1723,31 @@ body.is-resizing-rows .system-dock {
   font-size: 9px;
 }
 
+.file-editor-status {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-right: auto;
+  color: var(--muted);
+}
+
+.file-editor-status > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-editor-status.syncing,
+.file-editor-status.saved,
+.file-editor-status.closed {
+  color: var(--success);
+}
+
+.file-editor-status.error {
+  color: var(--danger);
+}
+
 .inline-error,
 .pane-error {
   color: var(--danger);
@@ -1898,6 +1954,14 @@ body.is-resizing-rows .system-dock {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.local-file-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  display: block;
+  object-fit: contain;
 }
 
 .file-table td code {

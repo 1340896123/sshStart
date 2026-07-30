@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Bell,
@@ -82,6 +82,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
+  const cancelledTransfers = useRef(new Set<string>());
 
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const activeServer = servers.find((server) => server.id === activeSession?.serverId);
@@ -207,12 +208,14 @@ export default function App() {
     session: SessionState,
     server: ServerProfile,
     request: TransferRequest,
-    operation: () => Promise<void>,
+    operation: (transferId: string) => Promise<void>,
   ) => {
     const id = uid("transfer");
+    const transferId = uid("transfer-run");
     const task: TransferTask = {
       ...request,
       id,
+      transferId,
       sessionId: session.id,
       sessionTitle: session.title,
       serverName: server.name,
@@ -221,16 +224,115 @@ export default function App() {
       createdAt: Date.now(),
     };
     setTransfers((current) => [task, ...current]);
-    await Promise.resolve();
+    const operationPromise = operation(transferId);
     setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "running" } : item));
     try {
-      await operation();
-      setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "completed", finishedAt: Date.now() } : item));
+      await operationPromise;
+      if (cancelledTransfers.current.has(id)) {
+        cancelledTransfers.current.delete(id);
+        setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "cancelled", finishedAt: item.finishedAt ?? Date.now() } : item));
+      } else {
+        setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "completed", finishedAt: Date.now() } : item));
+      }
     } catch (reason) {
+      if (cancelledTransfers.current.has(id)) {
+        cancelledTransfers.current.delete(id);
+        setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "cancelled", error: undefined, finishedAt: item.finishedAt ?? Date.now() } : item));
+        return;
+      }
       const error = String(reason);
       setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "failed", error, finishedAt: Date.now() } : item));
       throw reason;
     }
+  };
+
+  const retryTransfer = async (task: TransferTask) => {
+    const session = sessions.find((item) => item.id === task.sessionId);
+    const server = session
+      ? servers.find((item) => item.id === session.serverId)
+      : servers.find((item) => item.name === task.serverName && item.host === task.serverHost);
+    if (!server) {
+      setTransfers((current) => current.map((item) => item.id === task.id
+        ? { ...item, status: "failed", error: "找不到对应的服务器配置，请重新连接后再试。", finishedAt: Date.now() }
+        : item));
+      return;
+    }
+
+    const transferId = uid("transfer-run");
+    cancelledTransfers.current.delete(task.id);
+    setTransfers((current) => current.map((item) => item.id === task.id
+      ? { ...item, transferId, status: "queued", error: undefined, finishedAt: undefined }
+      : item));
+    setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
+
+    try {
+      if (task.direction === "upload") {
+        await invoke("start_upload_file", { server, localPath: task.sourcePath, remotePath: task.destinationPath, transferId });
+      } else {
+        await invoke("start_download_file", { server, remotePath: task.sourcePath, localPath: task.destinationPath, transferId });
+      }
+      if (cancelledTransfers.current.has(task.id)) {
+        cancelledTransfers.current.delete(task.id);
+        setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, status: "cancelled", finishedAt: item.finishedAt ?? Date.now() } : item));
+      } else {
+        setTransfers((current) => current.map((item) => item.id === task.id
+          ? { ...item, status: "completed", error: undefined, finishedAt: Date.now() }
+          : item));
+      }
+    } catch (reason) {
+      if (cancelledTransfers.current.has(task.id)) {
+        cancelledTransfers.current.delete(task.id);
+        setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, status: "cancelled", error: undefined, finishedAt: item.finishedAt ?? Date.now() } : item));
+      } else {
+        setTransfers((current) => current.map((item) => item.id === task.id
+          ? { ...item, status: "failed", error: String(reason), finishedAt: Date.now() }
+          : item));
+      }
+    }
+  };
+
+  const pauseTransfer = async (task: TransferTask) => {
+    try {
+      await invoke("pause_transfer", { transferId: task.transferId });
+      setTransfers((current) => current.map((item) => item.id === task.id && (item.status === "queued" || item.status === "running")
+        ? { ...item, status: "paused", error: undefined }
+        : item));
+    } catch (reason) {
+      setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, error: `暂停失败：${String(reason)}` } : item));
+    }
+  };
+
+  const resumeTransfer = async (task: TransferTask) => {
+    try {
+      await invoke("resume_transfer", { transferId: task.transferId });
+      setTransfers((current) => current.map((item) => item.id === task.id && item.status === "paused"
+        ? { ...item, status: "running", error: undefined }
+        : item));
+    } catch (reason) {
+      setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, error: `继续失败：${String(reason)}` } : item));
+    }
+  };
+
+  const cancelTransfer = async (task: TransferTask) => {
+    const currentTask = transfers.find((item) => item.id === task.id);
+    if (!currentTask || (currentTask.status !== "queued" && currentTask.status !== "running" && currentTask.status !== "paused")) return;
+    cancelledTransfers.current.add(task.id);
+    setTransfers((current) => current.map((item) => item.id === task.id
+      ? { ...item, status: "cancelled", error: undefined, finishedAt: item.finishedAt ?? Date.now() }
+      : item));
+    try {
+      await invoke("cancel_transfer", { transferId: task.transferId });
+    } catch (reason) {
+      cancelledTransfers.current.delete(task.id);
+      setTransfers((current) => current.map((item) => item.id === task.id && item.status === "cancelled"
+        ? { ...item, status: "running", error: `取消失败：${String(reason)}`, finishedAt: undefined }
+        : item));
+    }
+  };
+
+  const copyTransferPath = async (task: TransferTask) => {
+    if (!navigator.clipboard) throw new Error("当前环境不支持复制到剪贴板");
+    await navigator.clipboard.writeText(task.destinationPath);
   };
 
   const selectSidebar = (view: "servers" | "transfers") => {
@@ -276,7 +378,7 @@ export default function App() {
     if (normalized) setSavedGroups((current) => current.includes(normalized) ? current : [...current, normalized]);
   };
 
-  const activeTransferCount = transfers.filter((task) => task.status === "queued" || task.status === "running").length;
+  const activeTransferCount = transfers.filter((task) => task.status === "queued" || task.status === "running" || task.status === "paused").length;
 
   return (
     <div className="app-shell">
@@ -338,8 +440,13 @@ export default function App() {
           <TransferPanel
             transfers={transfers}
             onActivateSession={setActiveSessionId}
-            onClearFinished={() => setTransfers((current) => current.filter((task) => task.status === "queued" || task.status === "running"))}
+            onClearFinished={() => setTransfers((current) => current.filter((task) => task.status === "queued" || task.status === "running" || task.status === "paused"))}
             onDismiss={(id) => setTransfers((current) => current.filter((task) => task.id !== id))}
+            onRetry={(task) => { void retryTransfer(task); }}
+            onCopyPath={copyTransferPath}
+            onPause={(task) => { void pauseTransfer(task); }}
+            onResume={(task) => { void resumeTransfer(task); }}
+            onCancel={(task) => { void cancelTransfer(task); }}
           />
         )}
 

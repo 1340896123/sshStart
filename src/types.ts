@@ -79,7 +79,7 @@ export interface NetworkInterface {
 }
 
 export type TransferDirection = "upload" | "download";
-export type TransferStatus = "queued" | "running" | "completed" | "failed";
+export type TransferStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
 
 export interface TransferRequest {
   direction: TransferDirection;
@@ -90,6 +90,7 @@ export interface TransferRequest {
 
 export interface TransferTask extends TransferRequest {
   id: string;
+  transferId: string;
   sessionId: string;
   sessionTitle: string;
   serverName: string;

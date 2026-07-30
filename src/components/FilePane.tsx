@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine,
@@ -10,10 +11,8 @@ import {
   ChevronUp,
   Clipboard,
   Download,
-  File,
   FileArchive,
-  FileCode2,
-  FileText,
+  FilePenLine,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -30,13 +29,38 @@ interface Props {
   session: SessionState;
   server: ServerProfile;
   onUpdate: (patch: Partial<SessionState>) => void;
-  onTransfer: (request: TransferRequest, operation: () => Promise<void>) => Promise<void>;
+  onTransfer: (request: TransferRequest, operation: (transferId: string) => Promise<void>) => Promise<void>;
 }
 
 type SortKey = "name" | "size" | "modified" | "permissions";
 type SortDirection = "asc" | "desc";
 type ColumnWidths = Record<SortKey, number>;
 type MenuState = { x: number; y: number; file?: RemoteFile };
+type FileIconName = "archive" | "code" | "config" | "file" | "folder" | "image" | "json" | "markdown" | "shell" | "text";
+type SystemFileIconRequest = { key: string; fileName: string; isDir: boolean };
+type SystemFileIcon = { key: string; dataUrl: string };
+type VscodeSyncEvent = {
+  sessionId: string;
+  serverId: string;
+  remotePath: string;
+  localPath: string;
+  status: "opening" | "watching" | "syncing" | "saved" | "closed" | "error";
+  message: string;
+};
+
+const COMMON_TEXT_EXTENSIONS = new Set([
+  "astro", "bash", "bat", "c", "cc", "cfg", "cjs", "cmake", "cmd", "conf", "cpp", "css", "csv",
+  "dockerignore", "editorconfig", "env", "fish", "gitattributes", "gitignore", "go", "gql", "graphql", "h",
+  "hpp", "htm", "html", "ini", "java", "js", "json", "jsonc", "jsx", "kt", "kts", "less", "log", "lua",
+  "markdown", "md", "mjs", "path", "php", "properties", "ps1", "py", "rb", "rs", "sass", "scss", "service",
+  "sh", "socket", "sql", "svelte", "swift", "target", "timer", "toml", "ts", "tsx", "txt", "vue", "xml",
+  "yaml", "yml", "zsh",
+]);
+const COMMON_TEXT_NAMES = new Set([
+  ".babelrc", ".bashrc", ".browserslistrc", ".dockerignore", ".editorconfig", ".gitattributes", ".gitignore", ".npmignore",
+  ".npmrc", ".prettierrc", ".profile", ".stylelintrc", ".vimrc", ".wgetrc", ".zshrc", "cmakelists.txt", "dockerfile",
+  "fstab", "gemfile", "hosts", "justfile", "license", "makefile", "procfile", "rakefile", "readme",
+]);
 
 const DEMO_FILES: RemoteFile[] = [
   { name: "apps", path: "/apps", isDir: true, size: 0, permissions: "drwxr-xr-x", modified: 1785313920 },
@@ -51,13 +75,59 @@ const DEMO_FILES: RemoteFile[] = [
 ];
 
 const minimumColumnWidths: ColumnWidths = { name: 180, size: 82, modified: 138, permissions: 112 };
+const systemFileIconCache = new Map<string, string>();
 
-function FileGlyph({ file }: { file: RemoteFile }) {
-  if (file.isDir) return <Folder size={15} className="folder-glyph" />;
-  if (/\.(zip|tar|gz|7z)$/i.test(file.name)) return <FileArchive size={15} />;
-  if (/\.(sh|js|ts|rs|py|json|ya?ml)$/i.test(file.name)) return <FileCode2 size={15} />;
-  if (/\.(txt|log|md)$/i.test(file.name)) return <FileText size={15} />;
-  return <File size={15} />;
+function fileExtension(name: string) {
+  const index = name.lastIndexOf(".");
+  return index > -1 ? name.slice(index + 1).toLowerCase() : "";
+}
+
+function isCommonTextFile(file: RemoteFile) {
+  if (file.isDir) return false;
+  const name = file.name.toLowerCase();
+  return COMMON_TEXT_NAMES.has(name)
+    || name === ".env"
+    || name.startsWith(".env.")
+    || COMMON_TEXT_EXTENSIONS.has(fileExtension(name));
+}
+
+function fileIconName(file: RemoteFile): FileIconName {
+  if (file.isDir) return "folder";
+  const extension = fileExtension(file.name);
+  if (/^(7z|bz2|gz|rar|tar|tgz|xz|zip)$/.test(extension)) return "archive";
+  if (/^(avif|bmp|gif|ico|jpe?g|png|svg|webp)$/.test(extension)) return "image";
+  if (/^(md|markdown)$/.test(extension)) return "markdown";
+  if (/^(json|jsonc)$/.test(extension)) return "json";
+  if (/^(cfg|conf|env|ini|properties|toml|ya?ml)$/.test(extension) || file.name.startsWith(".")) return "config";
+  if (/^(bash|bat|cmd|fish|ps1|sh|zsh)$/.test(extension)) return "shell";
+  if (/^(astro|c|cc|cjs|cmake|cpp|css|go|graphql|gql|h|hpp|html?|java|js|jsx|kt|kts|less|lua|mjs|php|py|rb|rs|sass|scss|sql|svelte|swift|ts|tsx|vue|xml)$/.test(extension)) return "code";
+  if (isCommonTextFile(file)) return "text";
+  return "file";
+}
+
+function fileIconKey(file: RemoteFile) {
+  if (file.isDir) return "folder";
+  const name = file.name.toLowerCase();
+  if (name.startsWith(".")) return `name:${name}`;
+  const extension = fileExtension(name);
+  return extension ? `extension:.${extension}` : `name:${name}`;
+}
+
+function FileGlyph({ file, systemIconUrl }: { file: RemoteFile; systemIconUrl?: string }) {
+  const icon = fileIconName(file);
+  const fallback = `/file-icons/${icon}.svg`;
+  return (
+    <img
+      className="local-file-icon"
+      src={systemIconUrl ?? fallback}
+      alt=""
+      aria-hidden="true"
+      onError={({ currentTarget }) => {
+        currentTarget.onerror = null;
+        currentTarget.src = fallback;
+      }}
+    />
+  );
 }
 
 function modifiedLabel(timestamp?: number) {
@@ -87,6 +157,8 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({ key: "name", direction: "asc" });
   const [columnWidths, setColumnWidths] = useState<ColumnWidths>({ name: 340, size: 100, modified: 168, permissions: 126 });
   const [menu, setMenu] = useState<MenuState>();
+  const [editorStatus, setEditorStatus] = useState<VscodeSyncEvent>();
+  const [systemFileIcons, setSystemFileIcons] = useState<Record<string, string>>({});
 
   const load = useCallback(async (path: string) => {
     const normalizedPath = path.trim() === "" ? "/" : path.trim().startsWith("/") ? path.trim() : `/${path.trim()}`;
@@ -114,6 +186,40 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   }, [session.id]);
 
   useEffect(() => {
+    if (!isTauri() || files.length === 0) return;
+    const requests = new Map<string, SystemFileIconRequest>();
+    const cached: Record<string, string> = {};
+    for (const file of files) {
+      const key = fileIconKey(file);
+      const dataUrl = systemFileIconCache.get(key);
+      if (dataUrl) cached[key] = dataUrl;
+      else if (!requests.has(key)) requests.set(key, { key, fileName: file.name, isDir: file.isDir });
+    }
+    if (Object.keys(cached).length > 0) {
+      setSystemFileIcons((current) => ({ ...current, ...cached }));
+    }
+    if (requests.size === 0) return;
+
+    let disposed = false;
+    void invoke<SystemFileIcon[]>("get_system_file_icons", { requests: [...requests.values()] })
+      .then((icons) => {
+        if (disposed) return;
+        const resolved: Record<string, string> = {};
+        for (const icon of icons) {
+          systemFileIconCache.set(icon.key, icon.dataUrl);
+          resolved[icon.key] = icon.dataUrl;
+        }
+        setSystemFileIcons((current) => ({ ...current, ...resolved }));
+      })
+      .catch(() => {
+        // Bundled file icons remain visible when the native Shell lookup is unavailable.
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [files]);
+
+  useEffect(() => {
     if (!menu) return;
     const close = () => setMenu(undefined);
     window.addEventListener("pointerdown", close);
@@ -123,6 +229,23 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
       window.removeEventListener("blur", close);
     };
   }, [menu]);
+
+  useEffect(() => {
+    setEditorStatus(undefined);
+    if (!isTauri()) return;
+    let dispose: (() => void) | undefined;
+    let disposed = false;
+    void listen<VscodeSyncEvent>("vscode-file-sync", ({ payload }) => {
+      if (payload.serverId === server.id && payload.sessionId === session.id) setEditorStatus(payload);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else dispose = unlisten;
+    });
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
+  }, [server.id, session.id]);
 
   const visibleFiles = useMemo(() => {
     const direction = sort.direction === "asc" ? 1 : -1;
@@ -154,7 +277,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
       const remotePath = joinRemotePath(session.cwd, name);
       return onTransfer(
         { direction: "upload", fileName: name, sourcePath: localPath, destinationPath: remotePath },
-        () => invoke("upload_file", { server, localPath, remotePath }),
+        (transferId) => invoke("start_upload_file", { server, localPath, remotePath, transferId }),
       );
     }));
     if (results.some((result) => result.status === "rejected")) setError("部分文件上传失败，请在传输列表中查看详情。");
@@ -169,11 +292,40 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
     try {
       await onTransfer(
         { direction: "download", fileName: file.name, sourcePath: file.path, destinationPath: localPath },
-        () => invoke("download_file", { server, remotePath: file.path, localPath }),
+        (transferId) => invoke("start_download_file", { server, remotePath: file.path, localPath, transferId }),
       );
     } catch {
       setError("下载失败，请在传输列表中查看详情。");
     }
+  };
+
+  const openInVscode = async (file: RemoteFile) => {
+    if (file.isDir || !isCommonTextFile(file)) return;
+    if (!isTauri()) {
+      setError("VS Code 编辑仅在桌面应用中可用。");
+      return;
+    }
+    setError("");
+    setEditorStatus({
+      sessionId: session.id,
+      serverId: server.id,
+      remotePath: file.path,
+      localPath: "",
+      status: "opening",
+      message: `正在用 VS Code 打开 ${file.name}`,
+    });
+    try {
+      await invoke("open_remote_file_in_vscode", { sessionId: session.id, server, remotePath: file.path });
+    } catch (reason) {
+      setEditorStatus(undefined);
+      setError(`无法使用 VS Code 打开 ${file.name}：${String(reason)}`);
+    }
+  };
+
+  const openFile = (file: RemoteFile) => {
+    if (file.isDir) return void load(file.path);
+    if (isCommonTextFile(file)) return void openInVscode(file);
+    return void download(file);
   };
 
   const createFolder = async () => {
@@ -352,10 +504,10 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
                   key={file.path}
                   className={selected === file.path ? "selected" : ""}
                   onClick={() => selectFile(file)}
-                  onDoubleClick={() => file.isDir ? void load(file.path) : void download(file)}
+                  onDoubleClick={() => openFile(file)}
                   onContextMenu={(event) => openMenu(event, file)}
                 >
-                  <td><FileGlyph file={file} /><span>{file.name}</span></td>
+                  <td><FileGlyph file={file} systemIconUrl={systemFileIcons[fileIconKey(file)]} /><span>{file.name}</span></td>
                   <td>{file.isDir ? "—" : formatBytes(file.size)}</td>
                   <td>{modifiedLabel(file.modified)}</td>
                   <td><code>{file.permissions}</code></td>
@@ -366,7 +518,15 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
           {!loading && visibleFiles.length === 0 && <div className="table-empty">当前目录为空</div>}
         </div>
       )}
-      <div className="file-footer"><span>{visibleFiles.length} 个项目</span><span>{server.host}</span></div>
+      <div className="file-footer">
+        {editorStatus && (
+          <span className={`file-editor-status ${editorStatus.status}`} title={editorStatus.localPath || editorStatus.remotePath}>
+            <FilePenLine size={10} />
+            <span>{editorStatus.message}</span>
+          </span>
+        )}
+        <span>{visibleFiles.length} 个项目</span><span>{server.host}</span>
+      </div>
 
       {menu && (
         <div className="file-context-menu" role="menu" style={{ left: menu.x, top: menu.y }} onPointerDown={(event) => event.stopPropagation()}>
@@ -375,7 +535,12 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
               {menu.file.isDir ? (
                 <button role="menuitem" onClick={() => { setMenu(undefined); void load(menu.file!.path); }}><FolderOpen size={13} />打开</button>
               ) : (
-                <button role="menuitem" onClick={() => { setMenu(undefined); void download(menu.file); }}><Download size={13} />下载</button>
+                <>
+                  {isCommonTextFile(menu.file) && (
+                    <button role="menuitem" onClick={() => { setMenu(undefined); void openInVscode(menu.file!); }}><FilePenLine size={13} />使用 VS Code 打开</button>
+                  )}
+                  <button role="menuitem" onClick={() => { setMenu(undefined); void download(menu.file); }}><Download size={13} />下载</button>
+                </>
               )}
               <button role="menuitem" onClick={() => { setMenu(undefined); void rename(menu.file!); }}><Pencil size={13} />重命名</button>
               <button role="menuitem" onClick={() => { setMenu(undefined); void copyPath(menu.file!); }}><Clipboard size={13} />复制路径</button>
