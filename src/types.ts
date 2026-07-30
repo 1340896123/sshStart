@@ -211,6 +211,8 @@ export interface AiConfig {
   apiKey: string;
   model: string;
   contextWindow: number;
+  maxOutputTokens: number;
+  autoCompress: boolean;
   supportsImages: boolean;
   temperature: number;
   systemPrompt: string;
@@ -223,6 +225,8 @@ export interface AiResponse {
   approval?: AiApproval;
   toolCalls: AiToolResult[];
   usage?: AiTokenUsage;
+  compactionSummary?: string;
+  compactionMessagesRemoved?: number;
 }
 
 export interface AiStreamDelta {

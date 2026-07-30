@@ -33,6 +33,8 @@ const DEFAULT_AI_CONFIG: AiConfig = {
   apiKey: "",
   model: "gpt-4.1-mini",
   contextWindow: 128000,
+  maxOutputTokens: 4096,
+  autoCompress: true,
   supportsImages: true,
   temperature: 0.2,
   systemPrompt:

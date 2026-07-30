@@ -1,8 +1,9 @@
-import { useId, useState } from "react";
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
   Bot,
+  Check,
   CircleAlert,
   Container,
   Download,
@@ -107,15 +108,18 @@ const SETTINGS_SECTIONS: Array<{
 export function SettingsDialog({ config, onSave, onClose }: Props) {
   const [value, setValue] = useState(() => ({
     ...config,
+    maxOutputTokens: config.maxOutputTokens ?? 4096,
+    autoCompress: config.autoCompress ?? true,
     tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...(config.tools ?? {}) },
   }));
   const [models, setModels] = useState<string[]>([]);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [modelSearch, setModelSearch] = useState("");
   const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSection>("model");
   const [navSearch, setNavSearch] = useState("");
-  const modelListId = useId();
 
   const loadModels = async () => {
     setLoadingModels(true);
@@ -131,6 +135,12 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
     }
   };
 
+  const openModelPicker = async () => {
+    setModelPickerOpen(true);
+    setModelSearch("");
+    await loadModels();
+  };
+
   const save = async () => {
     if (!value.endpoint.trim()) {
       setError("请填写接口地址");
@@ -142,6 +152,10 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
     }
     if (!Number.isInteger(value.contextWindow) || value.contextWindow < 1024 || value.contextWindow > 2000000) {
       setError("上下文大小需为 1,024–2,000,000 之间的整数");
+      return;
+    }
+    if (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 256 || value.maxOutputTokens > value.contextWindow) {
+      setError("输出长度需为 256 到上下文大小之间的整数");
       return;
     }
     if (!Number.isFinite(value.temperature) || value.temperature < 0 || value.temperature > 2) {
@@ -216,7 +230,7 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
 
   return (
     <div className="settings-backdrop">
-      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => event.key === "Escape" && onClose()}>
+      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape") { if (modelPickerOpen) setModelPickerOpen(false); else onClose(); } }}>
         <aside className="settings-sidebar">
           <div className="settings-sidebar-header">
             <span className="settings-brand-mark"><Bot size={17} /></span>
@@ -287,13 +301,12 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>Model</strong><small>{models.length > 0 ? `已获取 ${models.length} 个模型` : "支持手动输入模型名称"}</small></span>
                     <span className="settings-model-control">
-                      <input className="settings-input settings-mono-input" list={modelListId} value={value.model} onChange={(event) => setValue({ ...value, model: event.target.value })} placeholder="输入或选择模型" />
-                      <button type="button" disabled={loadingModels} onClick={() => void loadModels()}>
+                      <input className="settings-input settings-mono-input" value={value.model} onChange={(event) => setValue({ ...value, model: event.target.value })} placeholder="输入模型 ID" />
+                      <button type="button" disabled={loadingModels} onClick={() => void openModelPicker()}>
                         <RefreshCw className={loadingModels ? "spinning" : ""} size={14} />
-                        {loadingModels ? "获取中" : "获取模型列表"}
+                        {loadingModels ? "获取中" : "选择模型"}
                       </button>
                     </span>
-                    <datalist id={modelListId}>{models.map((model) => <option key={model} value={model} />)}</datalist>
                   </label>
                   <div className="settings-config-row settings-toggle-row">
                     <span className="settings-row-copy"><strong>视觉 / 支持图片</strong><small>允许把粘贴或拖入的图片发送给模型</small></span>
@@ -314,9 +327,21 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
                 <section className="settings-panel">
                   <header><strong>会话参数</strong><small>控制模型可读取的上下文和回答随机性</small></header>
                   <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>上下文大小</strong><small>模型上下文窗口，单位为 tokens</small></span>
+                    <span className="settings-row-copy"><strong>最大上下文长度</strong><small>模型可读取的最大上下文窗口，单位为 tokens</small></span>
                     <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={1024} max={2000000} step={1024} value={value.contextWindow} onChange={(event) => setValue({ ...value, contextWindow: Number(event.target.value) })} /><em>tokens</em></span>
                   </label>
+                  <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>输出长度</strong><small>单次回答最多生成的 tokens 数</small></span>
+                    <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={256} max={2000000} step={256} value={value.maxOutputTokens} onChange={(event) => setValue({ ...value, maxOutputTokens: Number(event.target.value) })} /><em>tokens</em></span>
+                  </label>
+                  <div className="settings-config-row settings-toggle-row">
+                    <span className="settings-row-copy"><strong>自动压缩上下文</strong><small>接近上限时先总结较早对话，再保留最近几轮继续请求</small></span>
+                    <label className="settings-toggle-control">
+                      <input type="checkbox" checked={value.autoCompress} onChange={(event) => setValue({ ...value, autoCompress: event.target.checked })} />
+                      <span className="switch" aria-hidden="true" />
+                      <span>达到上下文阈值时自动压缩</span>
+                    </label>
+                  </div>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>温度</strong><small>较低值更稳定，较高值更发散</small></span>
                     <span className="settings-range-control"><input type="range" min={0} max={2} step={0.1} value={value.temperature} onChange={(event) => setValue({ ...value, temperature: Number(event.target.value) })} /><output>{value.temperature.toFixed(1)}</output></span>
@@ -361,6 +386,28 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
             )}
           </div>
         </main>
+
+        {modelPickerOpen && (
+          <div className="model-picker-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setModelPickerOpen(false); }}>
+            <section className="model-picker" role="dialog" aria-modal="true" aria-labelledby="model-picker-title">
+              <header className="model-picker-header">
+                <div><span>模型服务</span><h3 id="model-picker-title">选择模型</h3><small>{models.length > 0 ? `${models.length} 个模型可用` : "从当前接口读取模型列表"}</small></div>
+                <button className="icon-button quiet" type="button" onClick={() => setModelPickerOpen(false)} title="关闭模型选择" aria-label="关闭模型选择"><X size={16} /></button>
+              </header>
+              <label className="model-picker-search"><Search size={14} /><input autoFocus value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="筛选模型 ID" aria-label="筛选模型 ID" /></label>
+              <div className="model-picker-list" role="listbox" aria-label="可用模型">
+                {models.filter((model) => model.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())).map((model) => (
+                  <button className={`model-picker-option ${value.model === model ? "selected" : ""}`} type="button" role="option" aria-selected={value.model === model} key={model} onClick={() => { setValue({ ...value, model }); setModelPickerOpen(false); }}>
+                    <span className="model-picker-option-icon"><Bot size={14} /></span><span>{model}</span>{value.model === model && <Check size={14} />}
+                  </button>
+                ))}
+                {models.length === 0 && !loadingModels && <div className="model-picker-empty"><CircleAlert size={16} /><span>没有可显示的模型，请检查接口地址和密钥，或直接在文本框输入模型 ID。</span></div>}
+                {models.length > 0 && models.filter((model) => model.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())).length === 0 && <div className="model-picker-empty"><Search size={16} /><span>没有匹配的模型</span></div>}
+              </div>
+              <footer className="model-picker-footer"><span>当前选择</span><code>{value.model || "未选择"}</code></footer>
+            </section>
+          </div>
+        )}
       </form>
     </div>
   );

@@ -111,6 +111,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   const activeConversationIdRef = useRef<string>();
   const conversationsRef = useRef(conversations);
   const messagesRef = useRef(session.aiMessages);
+  const compactionStateRef = useRef<{ summary: string; cutoff: number }>();
   const approvalArgumentsRef = useRef(new Map<string, Record<string, unknown>>());
   messagesRef.current = session.aiMessages;
   const historyControlRef = useRef<HTMLDivElement>(null);
@@ -143,6 +144,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     };
   }, [config.contextWindow, session.aiMessages]);
   const tokenUsagePopoverId = `token-usage-${session.id}`;
+
+  useEffect(() => {
+    compactionStateRef.current = undefined;
+  }, [config.autoCompress, config.contextWindow, config.maxOutputTokens]);
 
   useEffect(() => {
     const syncHistory = (event: Event) => {
@@ -207,6 +212,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setApprovalLoading(undefined);
     setThinkingOpen({});
     approvalArgumentsRef.current.clear();
+    compactionStateRef.current = undefined;
     messagesRef.current = [];
     onUpdate({ aiMessages: [] });
   };
@@ -221,6 +227,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setStreamingMessageId(undefined);
     setApprovalLoading(undefined);
     setThinkingOpen({});
+    compactionStateRef.current = undefined;
     messagesRef.current = conversation.messages;
     onUpdate({ aiMessages: conversation.messages });
   };
@@ -282,6 +289,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     const assistantMessageId = uid("message");
     const assistantCreatedAt = Date.now();
     const pendingMessages = [...session.aiMessages, userMessage];
+    const compactionState = config.autoCompress ? compactionStateRef.current : undefined;
+    const contextMessages = compactionState
+      ? [{ role: "assistant" as const, content: compactionState.summary }, ...session.aiMessages.slice(compactionState.cutoff), userMessage]
+      : pendingMessages;
     setMessages(pendingMessages);
     setLoading(true);
 
@@ -330,7 +341,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           response = await invoke<AiResponse>("ai_chat", {
             config,
             server,
-            messages: pendingMessages.map(({ role, content }) => ({ role, content })),
+            messages: contextMessages.map(({ role, content }) => ({ role, content })),
             allowExecute: autoExecute,
             streamId,
           });
@@ -338,6 +349,16 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           unlisten();
         }
         if (requestVersionRef.current !== requestVersion) return;
+        if (response.compactionSummary && typeof response.compactionMessagesRemoved === "number") {
+          const previousCutoff = compactionState?.cutoff ?? 0;
+          const removedFromDisplay = compactionState
+            ? Math.max(0, response.compactionMessagesRemoved - 1)
+            : response.compactionMessagesRemoved;
+          compactionStateRef.current = {
+            summary: response.compactionSummary,
+            cutoff: Math.min(pendingMessages.length, previousCutoff + removedFromDisplay),
+          };
+        }
         const lastTool = response.toolCalls[response.toolCalls.length - 1];
         const approval = response.approval;
         if (approval?.arguments) approvalArgumentsRef.current.set(assistantMessageId, approval.arguments);

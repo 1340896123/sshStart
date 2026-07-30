@@ -204,6 +204,10 @@ struct AiConfig {
     model: String,
     #[serde(default = "default_context_window")]
     context_window: u32,
+    #[serde(default = "default_max_output_tokens")]
+    max_output_tokens: u32,
+    #[serde(default = "default_auto_compress")]
+    auto_compress: bool,
     #[serde(default)]
     supports_images: bool,
     #[serde(default = "default_temperature")]
@@ -324,6 +328,8 @@ struct AiResponse {
     approval: Option<AiApproval>,
     tool_calls: Vec<AiToolResult>,
     usage: AiTokenUsage,
+    compaction_summary: Option<String>,
+    compaction_messages_removed: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -2547,6 +2553,14 @@ fn default_context_window() -> u32 {
     128_000
 }
 
+fn default_max_output_tokens() -> u32 {
+    4_096
+}
+
+fn default_auto_compress() -> bool {
+    true
+}
+
 fn default_temperature() -> f32 {
     0.2
 }
@@ -2574,6 +2588,115 @@ fn estimate_tokens(value: &str) -> usize {
 fn input_token_budget(context_window: u32) -> usize {
     let context_window = context_window as usize;
     context_window.saturating_sub((context_window / 4).max(256))
+}
+
+fn compaction_split_index(
+    messages: &[AiInputMessage],
+    context_window: u32,
+    max_output_tokens: u32,
+) -> Option<usize> {
+    if messages.len() < 2 {
+        return None;
+    }
+    let total_cost = messages
+        .iter()
+        .map(|message| estimate_tokens(&message.content) + 4)
+        .sum::<usize>();
+    let effective_window =
+        (context_window as usize).saturating_sub((max_output_tokens as usize).min(20_000));
+    let reserve = (effective_window / 4).clamp(256, 13_000);
+    let trigger = effective_window.saturating_sub(reserve);
+    if trigger == 0 || total_cost <= trigger {
+        return None;
+    }
+
+    // Keep the newest turns live and summarize complete older turns.
+    let keep_budget = trigger.saturating_mul(45) / 100;
+    let mut recent_cost = 0usize;
+    let mut fallback = None;
+    for index in (1..messages.len()).rev() {
+        let cost = estimate_tokens(&messages[index].content) + 4;
+        recent_cost = recent_cost.saturating_add(cost);
+        if messages[index].role == "user" {
+            fallback.get_or_insert(index);
+            if recent_cost >= keep_budget {
+                return Some(index);
+            }
+        }
+    }
+    fallback
+}
+
+fn parse_compaction_response(payload: &Value) -> Result<(String, AiTokenUsage), String> {
+    let summary = payload
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "上下文压缩接口未返回摘要".to_string())?;
+    let usage = AiTokenUsage::from_payload(payload).unwrap_or_default();
+    Ok((summary.to_string(), usage))
+}
+
+async fn compact_messages_with_model(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[AiInputMessage],
+    context_window: u32,
+    max_output_tokens: u32,
+) -> Result<Option<(AiInputMessage, usize, AiTokenUsage)>, String> {
+    let Some(split_index) = compaction_split_index(messages, context_window, max_output_tokens)
+    else {
+        return Ok(None);
+    };
+    let transcript = messages[..split_index]
+        .iter()
+        .map(|message| format!("{}: {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let transcript_budget = input_token_budget(context_window).min(12_000);
+    let transcript = truncate_to_token_budget(&transcript, transcript_budget);
+    let summary_prompt = "你负责压缩一段 SSH 运维助手对话，以便会话继续工作。只输出 plain text 交接摘要，不要调用工具、不要回答原问题、不要披露隐藏思维链。按时间顺序保留：用户目标、已确认事实、关键命令及结果、文件路径和函数、已作决策、约束/风险、错误与修复、已完成事项和待办事项。若信息不确定，明确标注不确定。摘要要短而具体，不能遗漏后续工作所需的技术细节。";
+    let body = json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": summary_prompt },
+            { "role": "user", "content": transcript }
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_output_tokens.clamp(256, 2_048),
+        "stream": false
+    });
+    let response = client
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("上下文压缩请求失败: {error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("上下文压缩响应解析失败: {error}"))?;
+    if !status.is_success() {
+        let detail = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("未知接口错误");
+        return Err(format!("上下文压缩接口返回 {status}: {detail}"));
+    }
+    let (summary, usage) = parse_compaction_response(&payload)?;
+    Ok(Some((
+        AiInputMessage {
+            role: "assistant".to_string(),
+            content: format!("[自动压缩摘要]\n会话已继续。以下摘要替代较早的对话记录；最近几轮消息仍保留。\n\n{summary}"),
+        },
+        split_index,
+        usage,
+    )))
 }
 
 fn trim_messages_for_context(
@@ -3533,6 +3656,11 @@ async fn ai_chat(
     if !(1_024..=2_000_000).contains(&config.context_window) {
         return Err("上下文大小需在 1,024–2,000,000 之间".to_string());
     }
+    if !(256..=2_000_000).contains(&config.max_output_tokens)
+        || config.max_output_tokens > config.context_window
+    {
+        return Err("输出长度需在 256 到上下文大小之间".to_string());
+    }
     if !config.temperature.is_finite() || !(0.0..=2.0).contains(&config.temperature) {
         return Err("温度需在 0–2 之间".to_string());
     }
@@ -3560,22 +3688,58 @@ async fn ai_chat(
         server.port,
         if config.tools.allow_mutating_tools { "是" } else { "否" },
     );
+    let mut usage = AiTokenUsage::default();
+    let mut conversation_messages = messages;
+    let mut compaction_summary = None;
+    let mut compaction_messages_removed = None;
+    if config.auto_compress {
+        match compact_messages_with_model(
+            &client,
+            &endpoint,
+            &api_key,
+            &config.model,
+            &conversation_messages,
+            config.context_window,
+            config.max_output_tokens,
+        )
+        .await
+        {
+            Ok(Some((summary, split_index, compaction_usage))) => {
+                usage.record(compaction_usage);
+                compaction_summary = Some(summary.content.clone());
+                compaction_messages_removed = Some(split_index);
+                let mut compacted = vec![summary];
+                compacted.extend(conversation_messages.drain(split_index..));
+                conversation_messages = compacted;
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("{error}; 回退到普通上下文裁剪"),
+        }
+    }
     let mut api_messages = vec![json!({ "role": "system", "content": system })];
     api_messages.extend(
-        trim_messages_for_context(messages, config.context_window, &system)?
+        trim_messages_for_context(conversation_messages, config.context_window, &system)?
             .into_iter()
             .map(|message| json!(message)),
     );
     let mut executed_tools = Vec::new();
-    let mut usage = AiTokenUsage::default();
     let stream_event_name = format!("ai-stream:{stream_id}");
 
     for _ in 0..config.tools.max_tool_rounds.clamp(1, 12) {
         trim_api_messages_for_context(&mut api_messages, config.context_window)?;
+        let input_cost = api_messages.iter().map(api_message_cost).sum::<usize>();
+        let output_budget = (config.context_window as usize)
+            .saturating_sub(input_cost)
+            .saturating_sub(64)
+            .min(config.max_output_tokens as usize);
+        if output_budget == 0 {
+            return Err("当前上下文没有可用的输出空间，请缩短对话或增大上下文大小".to_string());
+        }
         let mut body = json!({
             "model": config.model,
             "messages": api_messages,
             "temperature": config.temperature,
+            "max_tokens": output_budget,
             "stream": true,
             "stream_options": { "include_usage": true }
         });
@@ -3632,6 +3796,8 @@ async fn ai_chat(
                 approval: None,
                 tool_calls: executed_tools,
                 usage,
+                compaction_summary: compaction_summary.clone(),
+                compaction_messages_removed,
             });
         }
 
@@ -3722,6 +3888,8 @@ async fn ai_chat(
                             }),
                             tool_calls: executed_tools,
                             usage,
+                            compaction_summary: compaction_summary.clone(),
+                            compaction_messages_removed,
                         });
                     }
                 }
@@ -3734,6 +3902,8 @@ async fn ai_chat(
                                 approval: None,
                                 tool_calls: executed_tools,
                                 usage,
+                                compaction_summary: compaction_summary.clone(),
+                                compaction_messages_removed,
                             });
                         }
                     }
@@ -4063,6 +4233,78 @@ mod tests {
         assert_eq!(aggregate.cached_tokens, 1_000);
         assert_eq!(aggregate.context_tokens, 240);
         assert_eq!(aggregate.requests, 2);
+    }
+
+    #[test]
+    fn compaction_triggers_near_the_effective_window_and_keeps_recent_turns() {
+        let messages = vec![
+            AiInputMessage {
+                role: "user".into(),
+                content: "old goal ".repeat(160),
+            },
+            AiInputMessage {
+                role: "assistant".into(),
+                content: "old result ".repeat(160),
+            },
+            AiInputMessage {
+                role: "user".into(),
+                content: "recent request ".repeat(160),
+            },
+            AiInputMessage {
+                role: "assistant".into(),
+                content: "recent answer ".repeat(160),
+            },
+        ];
+        let split = super::compaction_split_index(&messages, 2_048, 256)
+            .expect("compaction should trigger");
+        assert!(split >= 2 && split < messages.len());
+        assert!(super::compaction_split_index(&messages, 128_000, 4_096).is_none());
+    }
+
+    #[test]
+    fn compaction_skips_short_histories_and_requires_a_real_turn_boundary() {
+        let short_history = vec![
+            AiInputMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            },
+            AiInputMessage {
+                role: "assistant".into(),
+                content: "hello back".into(),
+            },
+        ];
+        assert!(super::compaction_split_index(&short_history, 8_192, 4_096).is_none());
+
+        let oversized_single_turn = vec![
+            AiInputMessage {
+                role: "user".into(),
+                content: "request ".repeat(2_000),
+            },
+            AiInputMessage {
+                role: "assistant".into(),
+                content: "response ".repeat(2_000),
+            },
+        ];
+        assert!(super::compaction_split_index(&oversized_single_turn, 8_192, 4_096).is_none());
+    }
+
+    #[test]
+    fn parses_compaction_summary_and_usage() {
+        let payload = json!({
+            "choices": [{ "message": { "content": "  retained facts  " } }],
+            "usage": {
+                "prompt_tokens": 320,
+                "completion_tokens": 48,
+                "total_tokens": 368
+            }
+        });
+        let (summary, usage) = super::parse_compaction_response(&payload).unwrap();
+        assert_eq!(summary, "retained facts");
+        assert!(usage.available);
+        assert_eq!(usage.input_tokens, 320);
+        assert_eq!(usage.output_tokens, 48);
+        assert_eq!(usage.total_tokens, 368);
+        assert_eq!(usage.requests, 1);
     }
 
     #[test]

@@ -63,6 +63,8 @@ const createDevBootstrap = (): DevBootstrapConfig | undefined => {
       apiKey,
       model: envValue("VITE_PORTICO_AI_MODEL"),
       contextWindow: envNumber("VITE_PORTICO_AI_CONTEXT_WINDOW", 65536),
+      maxOutputTokens: envNumber("VITE_PORTICO_AI_MAX_OUTPUT_TOKENS", 4096),
+      autoCompress: envValue("VITE_PORTICO_AI_AUTO_COMPRESS") !== "false",
       supportsImages: envValue("VITE_PORTICO_AI_SUPPORTS_IMAGES") === "true",
       temperature: envNumber("VITE_PORTICO_AI_TEMPERATURE", 0.2),
     } : undefined,
