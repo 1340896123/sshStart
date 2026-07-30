@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{Read, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{mpsc, Mutex},
     thread,
@@ -17,6 +17,20 @@ use tauri::{Emitter, State};
 #[serde(rename_all = "camelCase")]
 struct ServerProfile {
     id: String,
+    host: String,
+    port: u16,
+    username: String,
+    auth_type: String,
+    password: Option<String>,
+    private_key_path: Option<String>,
+    passphrase: Option<String>,
+    jump_host: Option<JumpHostProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JumpHostProfile {
+    enabled: bool,
     host: String,
     port: u16,
     username: String,
@@ -84,6 +98,78 @@ struct NetworkInterface {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AiToolSettings {
+    #[serde(default = "default_true")]
+    execute_command: bool,
+    #[serde(default = "default_true")]
+    background_task: bool,
+    #[serde(default)]
+    pty_interaction: bool,
+    #[serde(default = "default_true")]
+    read_file: bool,
+    #[serde(default)]
+    write_file: bool,
+    #[serde(default)]
+    sftp_upload: bool,
+    #[serde(default = "default_true")]
+    sftp_download: bool,
+    #[serde(default = "default_true")]
+    list_directory: bool,
+    #[serde(default = "default_true")]
+    get_system_metrics: bool,
+    #[serde(default = "default_true")]
+    process_manager: bool,
+    #[serde(default = "default_true")]
+    network_checker: bool,
+    #[serde(default = "default_true")]
+    docker_manager: bool,
+    #[serde(default = "default_true")]
+    systemd_control: bool,
+    #[serde(default = "default_true")]
+    risk_checker: bool,
+    #[serde(default = "default_true")]
+    snippet_library: bool,
+    #[serde(default = "default_true")]
+    log_analyzer: bool,
+    #[serde(default = "default_tool_rounds")]
+    max_tool_rounds: u32,
+    #[serde(default = "default_tool_output_chars")]
+    max_output_chars: usize,
+    #[serde(default = "default_command_timeout_seconds")]
+    command_timeout_seconds: u32,
+    #[serde(default)]
+    allow_mutating_tools: bool,
+}
+
+impl Default for AiToolSettings {
+    fn default() -> Self {
+        Self {
+            execute_command: true,
+            background_task: true,
+            pty_interaction: false,
+            read_file: true,
+            write_file: false,
+            sftp_upload: false,
+            sftp_download: true,
+            list_directory: true,
+            get_system_metrics: true,
+            process_manager: true,
+            network_checker: true,
+            docker_manager: true,
+            systemd_control: true,
+            risk_checker: true,
+            snippet_library: true,
+            log_analyzer: true,
+            max_tool_rounds: default_tool_rounds(),
+            max_output_chars: default_tool_output_chars(),
+            command_timeout_seconds: default_command_timeout_seconds(),
+            allow_mutating_tools: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AiConfig {
     endpoint: String,
     api_key: String,
@@ -95,6 +181,8 @@ struct AiConfig {
     #[serde(default = "default_temperature")]
     temperature: f32,
     system_prompt: String,
+    #[serde(default)]
+    tools: AiToolSettings,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -106,6 +194,7 @@ struct AiInputMessage {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiToolResult {
+    tool: String,
     command: String,
     output: String,
     exit_code: i32,
@@ -113,10 +202,159 @@ struct AiToolResult {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AiApproval {
+    tool: String,
+    command: String,
+    arguments: Value,
+    reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiTokenUsage {
+    available: bool,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cached_tokens: u64,
+    reasoning_tokens: u64,
+    context_tokens: u64,
+    requests: u32,
+}
+
+impl AiTokenUsage {
+    fn from_payload(payload: &Value) -> Option<Self> {
+        let usage = payload.get("usage")?;
+        let field = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| usage.get(*name).and_then(Value::as_u64))
+        };
+        let pointer = |paths: &[&str]| {
+            paths
+                .iter()
+                .find_map(|path| usage.pointer(path).and_then(Value::as_u64))
+        };
+        let input = field(&["prompt_tokens", "input_tokens"]);
+        let output = field(&["completion_tokens", "output_tokens"]);
+        let total = field(&["total_tokens"]);
+        let cached = pointer(&[
+            "/prompt_tokens_details/cached_tokens",
+            "/input_tokens_details/cached_tokens",
+            "/prompt_cache_hit_tokens",
+            "/cache_read_input_tokens",
+            "/cached_tokens",
+        ]);
+        let reasoning = pointer(&[
+            "/completion_tokens_details/reasoning_tokens",
+            "/output_tokens_details/reasoning_tokens",
+            "/reasoning_tokens",
+        ]);
+        if input.is_none()
+            && output.is_none()
+            && total.is_none()
+            && cached.is_none()
+            && reasoning.is_none()
+        {
+            return None;
+        }
+        let input_tokens = input.unwrap_or_default();
+        let output_tokens = output.unwrap_or_default();
+        let total_tokens = total.unwrap_or(input_tokens.saturating_add(output_tokens));
+        Some(Self {
+            available: true,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_tokens: cached.unwrap_or_default(),
+            reasoning_tokens: reasoning.unwrap_or_default(),
+            context_tokens: total_tokens,
+            requests: 1,
+        })
+    }
+
+    fn record(&mut self, usage: Self) {
+        if !usage.available {
+            return;
+        }
+        self.available = true;
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(usage.cached_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(usage.reasoning_tokens);
+        self.context_tokens = usage.context_tokens;
+        self.requests = self.requests.saturating_add(usage.requests);
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AiResponse {
     content: String,
     reasoning: Option<String>,
+    approval: Option<AiApproval>,
     tool_calls: Vec<AiToolResult>,
+    usage: AiTokenUsage,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiStreamDelta {
+    content: Option<String>,
+    reasoning: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AiStreamToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Default)]
+struct AiStreamCompletion {
+    content: String,
+    reasoning: String,
+    tool_calls: Vec<AiStreamToolCall>,
+    usage: AiTokenUsage,
+}
+
+impl AiStreamCompletion {
+    fn message(&self) -> Value {
+        let content = if self.content.is_empty() {
+            Value::Null
+        } else {
+            json!(self.content)
+        };
+        let mut message = json!({ "role": "assistant", "content": content });
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = json!(self.reasoning);
+        }
+        if !self.tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(
+                self.tool_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool_call)| {
+                        json!({
+                            "id": if tool_call.id.is_empty() {
+                                format!("tool-call-{index}")
+                            } else {
+                                tool_call.id.clone()
+                            },
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        message
+    }
 }
 
 enum TerminalRequest {
@@ -154,6 +392,14 @@ fn hydrate_server_secrets(server: &ServerProfile) -> ServerProfile {
         .is_empty()
     {
         hydrated.passphrase = read_secret(&format!("server:{}:passphrase", server.id));
+    }
+    if let Some(jump) = hydrated.jump_host.as_mut() {
+        if jump.password.as_deref().unwrap_or_default().is_empty() {
+            jump.password = read_secret(&format!("server:{}:jump:password", server.id));
+        }
+        if jump.passphrase.as_deref().unwrap_or_default().is_empty() {
+            jump.passphrase = read_secret(&format!("server:{}:jump:passphrase", server.id));
+        }
     }
     hydrated
 }
@@ -217,21 +463,7 @@ fn verify_known_host(session: &Session, server: &ServerProfile) -> Result<(), St
     }
 }
 
-fn connect_ssh(server: &ServerProfile) -> Result<Session, String> {
-    let server = hydrate_server_secrets(server);
-    let address = resolve_address(&server)?;
-    let tcp = TcpStream::connect_timeout(&address, Duration::from_secs(12))
-        .map_err(|error| format!("TCP 连接失败: {error}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
-
-    let mut session = Session::new().map_err(|error| format!("SSH 会话初始化失败: {error}"))?;
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|error| format!("SSH 握手失败: {error}"))?;
-    verify_known_host(&session, &server)?;
-
+fn authenticate_session(session: &mut Session, server: &ServerProfile) -> Result<(), String> {
     match server.auth_type.as_str() {
         "key" => {
             let key_path = server
@@ -262,11 +494,158 @@ fn connect_ssh(server: &ServerProfile) -> Result<Session, String> {
                 .map_err(|error| format!("密码认证失败: {error}"))?;
         }
     }
-
     if !session.authenticated() {
         return Err("服务器拒绝了身份验证".to_string());
     }
+    Ok(())
+}
+
+fn connect_ssh_direct(server: &ServerProfile) -> Result<Session, String> {
+    let address = resolve_address(&server)?;
+    let tcp = TcpStream::connect_timeout(&address, Duration::from_secs(12))
+        .map_err(|error| format!("TCP 连接失败: {error}"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
+
+    let mut session = Session::new().map_err(|error| format!("SSH 会话初始化失败: {error}"))?;
+    session.set_tcp_stream(tcp);
+    session
+        .handshake()
+        .map_err(|error| format!("SSH 握手失败: {error}"))?;
+    verify_known_host(&session, &server)?;
+    authenticate_session(&mut session, server)?;
     Ok(session)
+}
+
+fn jump_as_server(jump: &JumpHostProfile, id: &str) -> ServerProfile {
+    ServerProfile {
+        id: format!("{id}:jump"),
+        host: jump.host.clone(),
+        port: jump.port,
+        username: jump.username.clone(),
+        auth_type: jump.auth_type.clone(),
+        password: jump.password.clone(),
+        private_key_path: jump.private_key_path.clone(),
+        passphrase: jump.passphrase.clone(),
+        jump_host: None,
+    }
+}
+
+fn relay_jump_channel(mut tcp: TcpStream, mut channel: ssh2::Channel) {
+    if tcp.set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut tcp_to_ssh = Vec::new();
+    let mut ssh_to_tcp = Vec::new();
+    let mut buffer = [0_u8; 32 * 1024];
+
+    loop {
+        let mut progressed = false;
+        if tcp_to_ssh.is_empty() {
+            match tcp.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = channel.send_eof();
+                    let _ = channel.close();
+                    return;
+                }
+                Ok(size) => {
+                    tcp_to_ssh.extend_from_slice(&buffer[..size]);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+        if !tcp_to_ssh.is_empty() {
+            match channel.write(&tcp_to_ssh) {
+                Ok(size) => {
+                    tcp_to_ssh.drain(..size);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+        if ssh_to_tcp.is_empty() {
+            match channel.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = tcp.shutdown(std::net::Shutdown::Write);
+                    return;
+                }
+                Ok(size) => {
+                    ssh_to_tcp.extend_from_slice(&buffer[..size]);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+        if !ssh_to_tcp.is_empty() {
+            match tcp.write(&ssh_to_tcp) {
+                Ok(size) => {
+                    ssh_to_tcp.drain(..size);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+        if !progressed {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+fn connect_ssh(server: &ServerProfile) -> Result<Session, String> {
+    let server = hydrate_server_secrets(server);
+    let Some(jump) = server.jump_host.as_ref().filter(|jump| jump.enabled) else {
+        return connect_ssh_direct(&server);
+    };
+    if jump.host.trim().is_empty() {
+        return Err("跳板机地址不能为空".to_string());
+    }
+    let jump_server = jump_as_server(jump, &server.id);
+    let jump_session = connect_ssh_direct(&jump_server)?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("创建本地跳板通道失败: {error}"))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|error| format!("读取本地跳板地址失败: {error}"))?;
+    let local_client = TcpStream::connect_timeout(&local_addr, Duration::from_secs(3))
+        .map_err(|error| format!("初始化本地跳板通道失败: {error}"))?;
+    let (local_proxy, _) = listener
+        .accept()
+        .map_err(|error| format!("接收本地跳板通道失败: {error}"))?;
+    let channel = jump_session
+        .channel_direct_tcpip(&server.host, server.port, None)
+        .map_err(|error| format!("打开跳板机转发通道失败: {error}"))?;
+    jump_session.set_blocking(false);
+    local_client
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok();
+    local_client
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .ok();
+    local_proxy
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok();
+    local_proxy
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .ok();
+    thread::Builder::new()
+        .name("portico-jump-relay".to_string())
+        .spawn(move || relay_jump_channel(local_proxy, channel))
+        .map_err(|error| format!("启动跳板回程线程失败: {error}"))?;
+
+    let mut target_session =
+        Session::new().map_err(|error| format!("SSH 会话初始化失败: {error}"))?;
+    target_session.set_tcp_stream(local_client);
+    target_session
+        .handshake()
+        .map_err(|error| format!("内网目标 SSH 握手失败: {error}"))?;
+    verify_known_host(&target_session, &server)?;
+    authenticate_session(&mut target_session, &server)?;
+    Ok(target_session)
 }
 
 #[tauri::command]
@@ -274,6 +653,8 @@ fn store_server_secret(
     server_id: String,
     password: Option<String>,
     passphrase: Option<String>,
+    jump_password: Option<String>,
+    jump_passphrase: Option<String>,
 ) -> Result<(), String> {
     if let Some(password) = password.filter(|value| !value.is_empty()) {
         keyring_entry(&format!("server:{server_id}:password"))?
@@ -285,12 +666,22 @@ fn store_server_secret(
             .set_password(&passphrase)
             .map_err(|error| format!("保存私钥口令失败: {error}"))?;
     }
+    if let Some(password) = jump_password.filter(|value| !value.is_empty()) {
+        keyring_entry(&format!("server:{server_id}:jump:password"))?
+            .set_password(&password)
+            .map_err(|error| format!("保存跳板机密码失败: {error}"))?;
+    }
+    if let Some(passphrase) = jump_passphrase.filter(|value| !value.is_empty()) {
+        keyring_entry(&format!("server:{server_id}:jump:passphrase"))?
+            .set_password(&passphrase)
+            .map_err(|error| format!("保存跳板机口令失败: {error}"))?;
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn delete_server_secret(server_id: String) -> Result<(), String> {
-    for suffix in ["password", "passphrase"] {
+    for suffix in ["password", "passphrase", "jump:password", "jump:passphrase"] {
         if let Ok(entry) = keyring_entry(&format!("server:{server_id}:{suffix}")) {
             entry.delete_credential().ok();
         }
@@ -915,8 +1306,13 @@ async fn run_ssh_command(server: ServerProfile, command: String) -> Result<Comma
         .map_err(|error| format!("命令任务失败: {error}"))?
 }
 
-fn is_high_risk_command(command: &str) -> bool {
-    let normalized = command.to_lowercase().replace("  ", " ");
+fn risk_reasons(command: &str) -> Vec<String> {
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let mut reasons = Vec::new();
     let root_delete = normalized.split([';', '&', '|']).any(|part| {
         let part = part.trim().strip_prefix("sudo ").unwrap_or(part.trim());
         ["rm -rf /", "rm -fr /"].iter().any(|prefix| {
@@ -925,19 +1321,41 @@ fn is_high_risk_command(command: &str) -> bool {
                 || part.starts_with(&format!("{prefix}*"))
         })
     });
-    root_delete
-        || [
-            "--no-preserve-root",
-            "mkfs",
-            "dd if=",
-            ":(){",
-            "shutdown",
-            "reboot",
-            "init 0",
-            "chmod -r 777 /",
-        ]
-        .iter()
-        .any(|pattern| normalized.contains(pattern))
+    if root_delete {
+        reasons.push("递归删除根目录或根目录下的内容".to_string());
+    }
+    for (pattern, reason) in [
+        ("--no-preserve-root", "绕过 rm 的根目录保护"),
+        ("mkfs", "格式化文件系统"),
+        ("dd if=", "直接写入块设备"),
+        (":(){", "Fork bomb"),
+        ("shutdown", "关闭系统"),
+        ("reboot", "重启系统"),
+        ("init 0", "切换到关机运行级别"),
+        ("chmod -r 777 /", "递归放开根目录权限"),
+        ("iptables", "修改防火墙规则"),
+        ("nft ", "修改 nftables 防火墙规则"),
+        ("ufw ", "修改 UFW 防火墙规则"),
+        ("firewall-cmd", "修改 firewalld 防火墙规则"),
+        ("docker system prune", "清理 Docker 资源"),
+        ("docker rm", "删除 Docker 容器"),
+        ("kill -9", "强制终止进程"),
+        ("kill -kill", "强制终止进程"),
+        ("systemctl stop", "停止系统服务"),
+        ("systemctl restart", "重启系统服务"),
+        ("systemctl disable", "禁用系统服务"),
+    ] {
+        if normalized.contains(pattern) {
+            reasons.push(reason.to_string());
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+fn is_high_risk_command(command: &str) -> bool {
+    !risk_reasons(command).is_empty()
 }
 
 fn extract_reasoning_summary(content: &str) -> (String, Option<String>) {
@@ -955,6 +1373,152 @@ fn extract_reasoning_summary(content: &str) -> (String, Option<String>) {
     cleaned.push_str(&content[..start]);
     cleaned.push_str(&content[end + close.len()..]);
     (cleaned.trim().to_string(), Some(reasoning))
+}
+
+fn apply_ai_stream_payload(
+    data: &str,
+    completion: &mut AiStreamCompletion,
+) -> Result<AiStreamDelta, String> {
+    if data == "[DONE]" {
+        return Ok(AiStreamDelta::default());
+    }
+    let payload: Value =
+        serde_json::from_str(data).map_err(|error| format!("AI 流式响应解析失败: {error}"))?;
+    if let Some(detail) = payload.pointer("/error/message").and_then(Value::as_str) {
+        return Err(format!("AI 接口返回错误: {detail}"));
+    }
+    if let Some(usage) = AiTokenUsage::from_payload(&payload) {
+        completion.usage = usage;
+    }
+
+    let Some(delta) = payload
+        .pointer("/choices/0/delta")
+        .or_else(|| payload.pointer("/choices/0/message"))
+    else {
+        return Ok(AiStreamDelta::default());
+    };
+    let content = delta
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let reasoning = ["reasoning_content", "reasoning", "thinking"]
+        .iter()
+        .find_map(|key| delta.get(key).and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if let Some(value) = &content {
+        completion.content.push_str(value);
+    }
+    if let Some(value) = &reasoning {
+        completion.reasoning.push_str(value);
+    }
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for (position, tool_call) in tool_calls.iter().enumerate() {
+            let index = tool_call
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(position);
+            while completion.tool_calls.len() <= index {
+                completion.tool_calls.push(AiStreamToolCall::default());
+            }
+            let target = &mut completion.tool_calls[index];
+            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                target.id = id.to_string();
+            }
+            if let Some(name) = tool_call.pointer("/function/name").and_then(Value::as_str) {
+                target.name.push_str(name);
+            }
+            if let Some(arguments) = tool_call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+            {
+                target.arguments.push_str(arguments);
+            }
+        }
+    }
+
+    Ok(AiStreamDelta { content, reasoning })
+}
+
+fn process_ai_stream_line(
+    line: &[u8],
+    completion: &mut AiStreamCompletion,
+    app: &tauri::AppHandle,
+    event_name: &str,
+) -> Result<bool, String> {
+    let line = std::str::from_utf8(line)
+        .map_err(|error| format!("AI 流式响应不是有效 UTF-8: {error}"))?
+        .trim_end_matches(['\r', '\n']);
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(false);
+    };
+    let delta = apply_ai_stream_payload(data.trim_start(), completion)?;
+    if delta.content.is_some() || delta.reasoning.is_some() {
+        app.emit(event_name, delta).ok();
+    }
+    Ok(true)
+}
+
+async fn read_ai_stream(
+    mut response: reqwest::Response,
+    app: &tauri::AppHandle,
+    event_name: &str,
+) -> Result<AiStreamCompletion, String> {
+    let mut completion = AiStreamCompletion::default();
+    let mut buffer = Vec::new();
+    let mut plain_body = Vec::new();
+    let mut saw_sse = false;
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("AI 流式响应读取失败: {error}"))?
+    {
+        buffer.extend_from_slice(&chunk);
+        while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line = buffer.drain(..=end).collect::<Vec<_>>();
+            if process_ai_stream_line(&line, &mut completion, app, event_name)? {
+                saw_sse = true;
+            } else if !line.iter().all(u8::is_ascii_whitespace) && !line.starts_with(b":") {
+                plain_body.extend_from_slice(&line);
+            }
+        }
+    }
+    if !buffer.is_empty() {
+        if process_ai_stream_line(&buffer, &mut completion, app, event_name)? {
+            saw_sse = true;
+        } else {
+            plain_body.extend_from_slice(&buffer);
+        }
+    }
+    if !saw_sse {
+        let data = std::str::from_utf8(&plain_body)
+            .map_err(|error| format!("AI 响应不是有效 UTF-8: {error}"))?;
+        let delta = apply_ai_stream_payload(data.trim(), &mut completion)?;
+        if delta.content.is_some() || delta.reasoning.is_some() {
+            app.emit(event_name, delta).ok();
+        }
+    }
+    Ok(completion)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_tool_rounds() -> u32 {
+    6
+}
+
+fn default_tool_output_chars() -> usize {
+    12_000
+}
+
+fn default_command_timeout_seconds() -> u32 {
+    30
 }
 
 fn default_context_window() -> u32 {
@@ -1188,12 +1752,761 @@ async fn list_ai_models(config: AiConfig) -> Result<Vec<String>, String> {
     Ok(models)
 }
 
+fn ai_tool_enabled(settings: &AiToolSettings, name: &str) -> bool {
+    match name {
+        "execute_command" | "run_ssh_command" => settings.execute_command,
+        "background_task" => settings.background_task,
+        "pty_interaction" => settings.pty_interaction,
+        "read_file" => settings.read_file,
+        "write_file" => settings.write_file,
+        "sftp_upload" => settings.sftp_upload,
+        "sftp_download" => settings.sftp_download,
+        "list_directory" => settings.list_directory,
+        "get_system_metrics" => settings.get_system_metrics,
+        "process_manager" => settings.process_manager,
+        "network_checker" => settings.network_checker,
+        "docker_manager" => settings.docker_manager,
+        "systemd_control" => settings.systemd_control,
+        "risk_checker" => settings.risk_checker,
+        "snippet_library" => settings.snippet_library,
+        "log_analyzer" => settings.log_analyzer,
+        _ => false,
+    }
+}
+
+fn ai_function_tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required.iter().map(|value| Value::String((*value).to_string())).collect::<Vec<_>>(),
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn ai_tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
+    let mut tools = Vec::new();
+    let mut add = |name: &str, description: &str, properties: Value, required: &[&str]| {
+        if ai_tool_enabled(settings, name) {
+            tools.push(ai_function_tool(name, description, properties, required));
+        }
+    };
+
+    add(
+        "execute_command",
+        "在当前 SSH 服务器执行命令，返回 stdout、stderr 和退出码。执行前必须考虑风险。",
+        json!({ "command": { "type": "string", "description": "完整的远端 Shell 命令" } }),
+        &["command"],
+    );
+    add(
+        "background_task",
+        "管理当前 SSH 服务器上的后台任务，可启动、查看状态、读取日志或停止任务。",
+        json!({
+            "action": { "type": "string", "enum": ["start", "status", "logs", "stop"], "description": "后台作业动作" },
+            "command": { "type": "string", "description": "start 时要在后台运行的命令" },
+            "pid": { "type": "integer", "description": "status、logs 或 stop 时的 PID" },
+            "lines": { "type": "integer", "description": "logs 返回的行数" }
+        }),
+        &["action"],
+    );
+    add(
+        "pty_interaction",
+        "向需要一次输入的命令传入响应。密码、确认提示和变更型命令必须先请求人工确认。",
+        json!({
+            "command": { "type": "string", "description": "需要交互的命令" },
+            "input": { "type": "string", "description": "写入标准输入的内容，不包含回车" }
+        }),
+        &["command", "input"],
+    );
+    add(
+        "read_file",
+        "读取远端文本文件的前 800 行，适合配置和日志诊断。",
+        json!({ "path": { "type": "string", "description": "远端文件路径" } }),
+        &["path"],
+    );
+    add(
+        "write_file",
+        "覆写远端文本文件。仅在设置中显式允许变更型工具后可用。",
+        json!({
+            "path": { "type": "string", "description": "远端文件路径" },
+            "content": { "type": "string", "description": "要写入的完整文本" }
+        }),
+        &["path", "content"],
+    );
+    add(
+        "sftp_upload",
+        "通过 SFTP 将本机文件上传到当前服务器。仅在设置中显式允许变更型工具后可用。",
+        json!({
+            "localPath": { "type": "string", "description": "本机文件路径" },
+            "remotePath": { "type": "string", "description": "远端目标路径" }
+        }),
+        &["localPath", "remotePath"],
+    );
+    add(
+        "sftp_download",
+        "通过 SFTP 将远端文件下载到本机。",
+        json!({
+            "remotePath": { "type": "string", "description": "远端文件路径" },
+            "localPath": { "type": "string", "description": "本机目标路径" }
+        }),
+        &["remotePath", "localPath"],
+    );
+    add(
+        "list_directory",
+        "结构化列出远端目录及其文件元数据。",
+        json!({ "path": { "type": "string", "description": "远端目录路径，默认为 /" } }),
+        &[],
+    );
+    add(
+        "get_system_metrics",
+        "读取 CPU、内存、磁盘、网络吞吐和 NVIDIA GPU 状态。",
+        json!({}),
+        &[],
+    );
+    add(
+        "process_manager",
+        "列出高占用进程，或在人工允许后发送 TERM/KILL 信号。",
+        json!({
+            "action": { "type": "string", "enum": ["list", "terminate"], "description": "list 或 terminate" },
+            "pid": { "type": "integer", "description": "terminate 时的 PID" },
+            "signal": { "type": "string", "enum": ["TERM", "KILL"], "description": "terminate 时的信号" }
+        }),
+        &["action"],
+    );
+    add(
+        "network_checker",
+        "检查网络连接、网卡、主机连通性和 TCP 端口。",
+        json!({
+            "mode": { "type": "string", "enum": ["connections", "interfaces", "ping", "port"], "description": "检查模式" },
+            "host": { "type": "string", "description": "ping 或 port 的主机" },
+            "port": { "type": "integer", "description": "port 模式的 TCP 端口" }
+        }),
+        &["mode"],
+    );
+    add(
+        "docker_manager",
+        "查看 Docker 容器、镜像和日志；生命周期变更需要人工允许。",
+        json!({
+            "action": { "type": "string", "enum": ["ps", "images", "logs", "pull", "start", "stop", "restart", "rm"], "description": "Docker 动作" },
+            "target": { "type": "string", "description": "容器、镜像或镜像名" },
+            "lines": { "type": "integer", "description": "logs 返回的行数" }
+        }),
+        &["action"],
+    );
+    add(
+        "systemd_control",
+        "查看 systemd 服务状态和日志；启动、停止、重启等动作需要人工允许。",
+        json!({
+            "action": { "type": "string", "enum": ["status", "logs", "start", "stop", "restart", "enable", "disable"], "description": "服务动作" },
+            "service": { "type": "string", "description": "systemd 服务名" },
+            "lines": { "type": "integer", "description": "logs 返回的行数" }
+        }),
+        &["action", "service"],
+    );
+    add(
+        "risk_checker",
+        "在执行前检查命令是否包含删除、格式化、防火墙、重启或其他高危动作。",
+        json!({ "command": { "type": "string", "description": "要评估的命令" } }),
+        &["command"],
+    );
+    add(
+        "snippet_library",
+        "返回常用的只读运维命令片段；传入 name 可获取单个片段。",
+        json!({ "name": { "type": "string", "description": "片段名称，可选" } }),
+        &[],
+    );
+    add(
+        "log_analyzer",
+        "抓取应用日志或 systemd 错误日志，供模型进行因果分析。",
+        json!({
+            "path": { "type": "string", "description": "可选的日志文件路径，默认为 journalctl 错误日志" },
+            "lines": { "type": "integer", "description": "最多读取的行数，默认 120" }
+        }),
+        &[],
+    );
+    tools
+}
+
+fn required_ai_arg<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("工具参数缺少 {key}"))
+}
+
+fn optional_ai_arg(arguments: &Value, key: &str, fallback: &str) -> String {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn ai_action<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
+    required_ai_arg(arguments, key)
+}
+
+fn bounded_ai_command(command: &str, timeout_seconds: u32) -> String {
+    let timeout_seconds = timeout_seconds.clamp(5, 300);
+    let quoted = shell_quote(command);
+    format!(
+        "if command -v timeout >/dev/null 2>&1; then timeout --signal=TERM {timeout_seconds}s sh -lc {quoted}; else sh -lc {quoted}; fi"
+    )
+}
+
+async fn run_ai_command(
+    server: &ServerProfile,
+    command: String,
+    settings: &AiToolSettings,
+) -> Result<CommandResult, String> {
+    let server = server.clone();
+    let command = bounded_ai_command(&command, settings.command_timeout_seconds);
+    tauri::async_runtime::spawn_blocking(move || run_command_sync(&server, &command))
+        .await
+        .map_err(|error| format!("AI 工具任务失败: {error}"))?
+}
+
+fn json_command_result<T: Serialize>(value: &T) -> CommandResult {
+    match serde_json::to_string_pretty(value) {
+        Ok(stdout) => CommandResult {
+            stdout,
+            stderr: String::new(),
+            exit_code: 0,
+        },
+        Err(error) => CommandResult {
+            stdout: String::new(),
+            stderr: format!("结构化结果序列化失败: {error}"),
+            exit_code: 1,
+        },
+    }
+}
+
+fn ai_blocked_result(message: impl Into<String>) -> CommandResult {
+    CommandResult {
+        stdout: String::new(),
+        stderr: message.into(),
+        exit_code: 126,
+    }
+}
+
+fn docker_command(arguments: &Value) -> Result<String, String> {
+    let action = ai_action(arguments, "action")?;
+    let target = optional_ai_arg(arguments, "target", "");
+    let lines = arguments
+        .get("lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(120)
+        .clamp(1, 1_000);
+    match action {
+        "ps" => Ok("docker ps --format '{{json .}}'".to_string()),
+        "images" => Ok("docker images --format '{{json .}}'".to_string()),
+        "logs" if !target.is_empty() => Ok(format!(
+            "docker logs --tail {lines} {}",
+            shell_quote(&target)
+        )),
+        "pull" | "start" | "stop" | "restart" | "rm" if !target.is_empty() => {
+            Ok(format!("docker {action} {}", shell_quote(&target)))
+        }
+        "logs" | "pull" | "start" | "stop" | "restart" | "rm" => {
+            Err("该 Docker 动作需要 target".to_string())
+        }
+        _ => Err("不支持的 Docker 动作".to_string()),
+    }
+}
+
+fn systemd_command(arguments: &Value) -> Result<String, String> {
+    let action = ai_action(arguments, "action")?;
+    let service = required_ai_arg(arguments, "service")?;
+    let lines = arguments
+        .get("lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(120)
+        .clamp(1, 1_000);
+    if !service.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '@' | '.' | '_' | '-' | ':')
+    }) {
+        return Err("服务名包含不允许的字符".to_string());
+    }
+    match action {
+        "status" => Ok(format!(
+            "systemctl status --no-pager {}",
+            shell_quote(service)
+        )),
+        "logs" => Ok(format!(
+            "journalctl -u {} -n {lines} --no-pager",
+            shell_quote(service)
+        )),
+        "start" | "stop" | "restart" | "enable" | "disable" => {
+            Ok(format!("systemctl {action} {}", shell_quote(service)))
+        }
+        _ => Err("不支持的 systemd 动作".to_string()),
+    }
+}
+
+fn process_command(arguments: &Value) -> Result<String, String> {
+    match ai_action(arguments, "action")? {
+        "list" => Ok(
+            "LC_ALL=C ps -eo pid=,user=,comm=,%mem=,%cpu=,etimes=,args= --sort=-%cpu".to_string(),
+        ),
+        "terminate" => {
+            let pid = arguments
+                .get("pid")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "terminate 需要 pid".to_string())?;
+            let signal = arguments
+                .get("signal")
+                .and_then(Value::as_str)
+                .unwrap_or("TERM");
+            if !matches!(signal, "TERM" | "KILL") || pid <= 1 {
+                return Err("仅支持对大于 1 的 PID 发送 TERM 或 KILL".to_string());
+            }
+            Ok(format!("kill -{signal} {pid}"))
+        }
+        _ => Err("不支持的进程动作".to_string()),
+    }
+}
+
+fn ai_tool_is_mutating(name: &str, arguments: &Value) -> bool {
+    match name {
+        "write_file" | "sftp_upload" | "pty_interaction" => true,
+        "background_task" => arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .map(|action| action == "stop")
+            .unwrap_or(true),
+        "process_manager" => arguments.get("action").and_then(Value::as_str) == Some("terminate"),
+        "docker_manager" => matches!(
+            arguments.get("action").and_then(Value::as_str),
+            Some("pull" | "start" | "stop" | "restart" | "rm")
+        ),
+        "systemd_control" => matches!(
+            arguments.get("action").and_then(Value::as_str),
+            Some("start" | "stop" | "restart" | "enable" | "disable")
+        ),
+        _ => false,
+    }
+}
+
+fn ai_tool_command_for_risk(name: &str, arguments: &Value) -> Option<String> {
+    match name {
+        "execute_command" | "run_ssh_command" | "pty_interaction" => arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "background_task" => match arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("start")
+        {
+            "start" => arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            "stop" => arguments
+                .get("pid")
+                .and_then(Value::as_u64)
+                .map(|pid| format!("kill -TERM {pid}")),
+            _ => None,
+        },
+        "process_manager" => process_command(arguments).ok(),
+        "docker_manager" => docker_command(arguments).ok(),
+        "systemd_control" => systemd_command(arguments).ok(),
+        "write_file" => required_ai_arg(arguments, "path")
+            .ok()
+            .map(|path| format!("write_file {path}")),
+        _ => None,
+    }
+}
+
+fn protected_write_path(path: &str) -> bool {
+    ["/etc", "/boot", "/usr", "/bin", "/sbin", "/lib", "/var/lib"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn snippet_library(name: Option<&str>) -> CommandResult {
+    let snippets = vec![
+        json!({ "name": "disk", "description": "磁盘空间", "command": "df -hT" }),
+        json!({ "name": "memory", "description": "内存和交换分区", "command": "free -h" }),
+        json!({ "name": "load", "description": "系统负载", "command": "uptime" }),
+        json!({ "name": "failed-services", "description": "失败的 systemd 服务", "command": "systemctl --failed --no-pager" }),
+        json!({ "name": "recent-errors", "description": "最近的错误日志", "command": "journalctl -p err -n 120 --no-pager" }),
+        json!({ "name": "listening", "description": "监听端口", "command": "ss -tlpn" }),
+    ];
+    let selected = name
+        .map(|value| {
+            snippets
+                .iter()
+                .filter(|item| item.get("name").and_then(Value::as_str) == Some(value))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or(snippets);
+    json_command_result(&selected)
+}
+
+struct AiToolExecution {
+    display_command: String,
+    result: CommandResult,
+}
+
+async fn execute_ai_tool(
+    name: &str,
+    arguments: &Value,
+    server: &ServerProfile,
+    settings: &AiToolSettings,
+) -> Result<AiToolExecution, String> {
+    let execution = match name {
+        "execute_command" | "run_ssh_command" => {
+            let command = required_ai_arg(arguments, "command")?.to_string();
+            let result = run_ai_command(server, command.clone(), settings).await?;
+            AiToolExecution {
+                display_command: command,
+                result,
+            }
+        }
+        "background_task" => {
+            let action = optional_ai_arg(arguments, "action", "start");
+            let (display_command, remote_command) = match action.as_str() {
+                "start" => {
+                    let command = required_ai_arg(arguments, "command")?;
+                    let remote_command = format!(
+                        "log=/tmp/portico-ai-task-$$.log; nohup sh -lc {} >\"$log\" 2>&1 & pid=$!; mv \"$log\" /tmp/portico-ai-task-$pid.log; printf '{{\"pid\":%s,\"log\":\"/tmp/portico-ai-task-%s.log\"}}\\n' \"$pid\" \"$pid\"",
+                        shell_quote(command)
+                    );
+                    (format!("background_task start {command}"), remote_command)
+                }
+                "status" => {
+                    let pid = arguments
+                        .get("pid")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "status 需要 pid".to_string())?;
+                    (
+                        format!("background_task status {pid}"),
+                        format!("ps -p {pid} -o pid=,stat=,etime=,cmd="),
+                    )
+                }
+                "logs" => {
+                    let pid = arguments
+                        .get("pid")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "logs 需要 pid".to_string())?;
+                    let lines = arguments
+                        .get("lines")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(120)
+                        .clamp(1, 1_000);
+                    (
+                        format!("background_task logs {pid}"),
+                        format!("tail -n {lines} -- /tmp/portico-ai-task-{pid}.log"),
+                    )
+                }
+                "stop" => {
+                    let pid = arguments
+                        .get("pid")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "stop 需要 pid".to_string())?;
+                    (
+                        format!("background_task stop {pid}"),
+                        format!("kill -TERM {pid}"),
+                    )
+                }
+                _ => return Err("不支持的后台作业动作".to_string()),
+            };
+            let result = run_ai_command(server, remote_command, settings).await?;
+            AiToolExecution {
+                display_command,
+                result,
+            }
+        }
+        "pty_interaction" => {
+            let command = required_ai_arg(arguments, "command")?;
+            let input = required_ai_arg(arguments, "input")?;
+            let remote_command = format!(
+                "printf '%s' {} | sh -lc {}",
+                shell_quote(input),
+                shell_quote(command)
+            );
+            let result = run_ai_command(server, remote_command, settings).await?;
+            AiToolExecution {
+                display_command: format!("pty_interaction {command}"),
+                result,
+            }
+        }
+        "read_file" => {
+            let path = required_ai_arg(arguments, "path")?;
+            let command = format!("sed -n '1,800p' -- {}", shell_quote(path));
+            let result = run_ai_command(server, command, settings).await?;
+            AiToolExecution {
+                display_command: format!("read_file {path}"),
+                result,
+            }
+        }
+        "write_file" => {
+            let path = required_ai_arg(arguments, "path")?;
+            let content = required_ai_arg(arguments, "content")?;
+            let command = format!(
+                "umask 077; printf '%s' {} > {}",
+                shell_quote(content),
+                shell_quote(path)
+            );
+            let result = run_ai_command(server, command, settings).await?;
+            AiToolExecution {
+                display_command: format!("write_file {path}"),
+                result,
+            }
+        }
+        "sftp_upload" => {
+            let local_path = required_ai_arg(arguments, "localPath")?.to_string();
+            let remote_path = required_ai_arg(arguments, "remotePath")?.to_string();
+            let result =
+                match upload_file(server.clone(), local_path.clone(), remote_path.clone()).await {
+                    Ok(()) => CommandResult {
+                        stdout: "SFTP upload completed".to_string(),
+                        stderr: String::new(),
+                        exit_code: 0,
+                    },
+                    Err(error) => ai_blocked_result(error),
+                };
+            AiToolExecution {
+                display_command: format!("sftp_upload {local_path} -> {remote_path}"),
+                result,
+            }
+        }
+        "sftp_download" => {
+            let remote_path = required_ai_arg(arguments, "remotePath")?.to_string();
+            let local_path = required_ai_arg(arguments, "localPath")?.to_string();
+            let result = match download_file(
+                server.clone(),
+                remote_path.clone(),
+                local_path.clone(),
+            )
+            .await
+            {
+                Ok(()) => CommandResult {
+                    stdout: "SFTP download completed".to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                },
+                Err(error) => ai_blocked_result(error),
+            };
+            AiToolExecution {
+                display_command: format!("sftp_download {remote_path} -> {local_path}"),
+                result,
+            }
+        }
+        "list_directory" => {
+            let path = optional_ai_arg(arguments, "path", "/");
+            let result = match list_directory(server.clone(), path.clone()).await {
+                Ok(entries) => json_command_result(&entries),
+                Err(error) => ai_blocked_result(error),
+            };
+            AiToolExecution {
+                display_command: format!("list_directory {path}"),
+                result,
+            }
+        }
+        "get_system_metrics" => {
+            let command = "LC_ALL=C sh -lc 'printf -- \"[load]\n\"; uptime; printf -- \"[memory]\n\"; free -h; printf -- \"[disk]\n\"; df -hT; printf -- \"[network]\n\"; cat /proc/net/dev; printf -- \"[gpu]\n\"; if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader; else printf -- \"unavailable\\n\"; fi'";
+            let result = run_ai_command(server, command.to_string(), settings).await?;
+            AiToolExecution {
+                display_command: "get_system_metrics".to_string(),
+                result,
+            }
+        }
+        "process_manager" => {
+            let action = ai_action(arguments, "action")?;
+            let result = if action == "list" {
+                match list_processes(server.clone()).await {
+                    Ok(processes) => json_command_result(&processes),
+                    Err(error) => ai_blocked_result(error),
+                }
+            } else {
+                let pid = arguments
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default() as u32;
+                let signal = arguments
+                    .get("signal")
+                    .and_then(Value::as_str)
+                    .unwrap_or("TERM")
+                    .to_string();
+                match signal_process(server.clone(), pid, signal).await {
+                    Ok(()) => CommandResult {
+                        stdout: "process signal sent".to_string(),
+                        stderr: String::new(),
+                        exit_code: 0,
+                    },
+                    Err(error) => ai_blocked_result(error),
+                }
+            };
+            AiToolExecution {
+                display_command: process_command(arguments)?,
+                result,
+            }
+        }
+        "network_checker" => {
+            let mode = ai_action(arguments, "mode")?;
+            let (display_command, result) = match mode {
+                "connections" => (
+                    "network_checker connections".to_string(),
+                    match list_network_connections(server.clone()).await {
+                        Ok(value) => json_command_result(&value),
+                        Err(error) => ai_blocked_result(error),
+                    },
+                ),
+                "interfaces" => (
+                    "network_checker interfaces".to_string(),
+                    match list_network_interfaces(server.clone()).await {
+                        Ok(value) => json_command_result(&value),
+                        Err(error) => ai_blocked_result(error),
+                    },
+                ),
+                "ping" => {
+                    let host = required_ai_arg(arguments, "host")?;
+                    (
+                        format!("ping {host}"),
+                        run_ai_command(
+                            server,
+                            format!("ping -c 3 -W 2 -- {}", shell_quote(host)),
+                            settings,
+                        )
+                        .await?,
+                    )
+                }
+                "port" => {
+                    let host = required_ai_arg(arguments, "host")?;
+                    let port = arguments
+                        .get("port")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "port 模式需要 port".to_string())?;
+                    if !(1..=65_535).contains(&port) {
+                        return Err("port 必须在 1–65535 之间".to_string());
+                    }
+                    let command = format!("if command -v nc >/dev/null 2>&1; then nc -vz -w 3 {} {port}; else curl -fsS --connect-timeout 3 telnet://{}:{port}; fi", shell_quote(host), shell_quote(host));
+                    (
+                        format!("network_checker port {host}:{port}"),
+                        run_ai_command(server, command, settings).await?,
+                    )
+                }
+                _ => return Err("不支持的网络检查模式".to_string()),
+            };
+            AiToolExecution {
+                display_command,
+                result,
+            }
+        }
+        "docker_manager" => {
+            let command = docker_command(arguments)?;
+            let result = run_ai_command(server, command, settings).await?;
+            AiToolExecution {
+                display_command: format!("docker_manager {}", ai_action(arguments, "action")?),
+                result,
+            }
+        }
+        "systemd_control" => {
+            let command = systemd_command(arguments)?;
+            let result = run_ai_command(server, command, settings).await?;
+            AiToolExecution {
+                display_command: format!(
+                    "systemd_control {} {}",
+                    ai_action(arguments, "action")?,
+                    required_ai_arg(arguments, "service")?
+                ),
+                result,
+            }
+        }
+        "risk_checker" => {
+            let command = required_ai_arg(arguments, "command")?;
+            let reasons = risk_reasons(command);
+            let result = json_command_result(
+                &json!({ "blocked": is_high_risk_command(command), "reasons": reasons }),
+            );
+            AiToolExecution {
+                display_command: format!("risk_checker {command}"),
+                result,
+            }
+        }
+        "snippet_library" => {
+            let name = arguments.get("name").and_then(Value::as_str);
+            AiToolExecution {
+                display_command: "snippet_library".to_string(),
+                result: snippet_library(name),
+            }
+        }
+        "log_analyzer" => {
+            let lines = arguments
+                .get("lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(120)
+                .clamp(1, 500);
+            let path = optional_ai_arg(arguments, "path", "");
+            let command = if path.is_empty() {
+                format!("journalctl -p err -n {lines} --no-pager 2>/dev/null || tail -n {lines} /var/log/syslog /var/log/messages 2>/dev/null")
+            } else {
+                format!("tail -n {lines} -- {}", shell_quote(&path))
+            };
+            let result = run_ai_command(server, command, settings).await?;
+            AiToolExecution {
+                display_command: if path.is_empty() {
+                    "log_analyzer journal".to_string()
+                } else {
+                    format!("log_analyzer {path}")
+                },
+                result,
+            }
+        }
+        _ => return Err(format!("未知 AI 工具 {name}")),
+    };
+    Ok(execution)
+}
+
+#[tauri::command]
+async fn approve_ai_tool(
+    server: ServerProfile,
+    tool: String,
+    arguments: Value,
+    settings: AiToolSettings,
+) -> Result<AiToolResult, String> {
+    if !ai_tool_enabled(&settings, &tool) {
+        return Err(format!("AI 工具 {tool} 未在设置中启用"));
+    }
+    if tool == "write_file"
+        && required_ai_arg(&arguments, "path")
+            .map(protected_write_path)
+            .unwrap_or(false)
+    {
+        return Err("已阻止写入受保护系统路径".to_string());
+    }
+    let execution = execute_ai_tool(&tool, &arguments, &server, &settings).await?;
+    let output = truncate_to_token_budget(
+        &format!("{}{}", execution.result.stdout, execution.result.stderr),
+        settings.max_output_chars / 4,
+    );
+    Ok(AiToolResult {
+        tool,
+        command: execution.display_command,
+        output,
+        exit_code: execution.result.exit_code,
+    })
+}
+
 #[tauri::command]
 async fn ai_chat(
+    app: tauri::AppHandle,
     config: AiConfig,
     server: ServerProfile,
     messages: Vec<AiInputMessage>,
     allow_execute: bool,
+    stream_id: String,
 ) -> Result<AiResponse, String> {
     if !(1_024..=2_000_000).contains(&config.context_window) {
         return Err("上下文大小需在 1,024–2,000,000 之间".to_string());
@@ -1218,8 +2531,12 @@ async fn ai_chat(
         "不支持"
     };
     let system = format!(
-        "{}\n当前 SSH 目标为 {}@{}:{}。当前模型配置为{image_capability}图片输入。最终回答开头必须使用 <reasoning_summary>...</reasoning_summary> 给出简明的判断依据与执行计划；不要披露隐藏思维链。",
-        config.system_prompt, server.username, server.host, server.port,
+        "{}\n当前 SSH 目标为 {}@{}:{}。当前模型配置为{image_capability}图片输入。已启用的工具由本地设置决定；变更型工具允许状态为{}。先调用 risk_checker 检查高风险动作，命中后必须等待客户端人工确认。最终回答开头必须使用 <reasoning_summary>...</reasoning_summary> 给出简明的判断依据与执行计划；不要披露隐藏思维链。",
+        config.system_prompt,
+        server.username,
+        server.host,
+        server.port,
+        if config.tools.allow_mutating_tools { "是" } else { "否" },
     );
     let mut api_messages = vec![json!({ "role": "system", "content": system })];
     api_messages.extend(
@@ -1228,28 +2545,23 @@ async fn ai_chat(
             .map(|message| json!(message)),
     );
     let mut executed_tools = Vec::new();
+    let mut usage = AiTokenUsage::default();
+    let stream_event_name = format!("ai-stream:{stream_id}");
 
-    for _ in 0..4 {
+    for _ in 0..config.tools.max_tool_rounds.clamp(1, 12) {
         trim_api_messages_for_context(&mut api_messages, config.context_window)?;
         let mut body = json!({
             "model": config.model,
             "messages": api_messages,
-            "temperature": config.temperature
+            "temperature": config.temperature,
+            "stream": true,
+            "stream_options": { "include_usage": true }
         });
         if allow_execute {
-            body["tools"] = json!([{
-                "type": "function",
-                "function": {
-                    "name": "run_ssh_command",
-                    "description": "在当前 SSH 服务器执行只读或低风险 shell 命令，并返回输出。高风险命令会被本地策略拒绝。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "command": { "type": "string", "description": "要执行的完整 shell 命令" } },
-                        "required": ["command"],
-                        "additionalProperties": false
-                    }
-                }
-            }]);
+            let tools = ai_tool_definitions(&config.tools);
+            if !tools.is_empty() {
+                body["tools"] = Value::Array(tools);
+            }
             body["tool_choice"] = json!("auto");
         }
 
@@ -1261,22 +2573,27 @@ async fn ai_chat(
             .await
             .map_err(|error| format!("AI 请求失败: {error}"))?;
         let status = response.status();
-        let payload: Value = response
-            .json()
-            .await
-            .map_err(|error| format!("AI 响应解析失败: {error}"))?;
         if !status.is_success() {
+            let response_body = response.text().await.unwrap_or_default();
+            let payload = serde_json::from_str::<Value>(&response_body).ok();
             let detail = payload
-                .pointer("/error/message")
+                .as_ref()
+                .and_then(|value| value.pointer("/error/message"))
                 .and_then(Value::as_str)
-                .unwrap_or("未知接口错误");
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    if response_body.is_empty() {
+                        "未知接口错误"
+                    } else {
+                        response_body.as_str()
+                    }
+                });
             return Err(format!("AI 接口返回 {status}: {detail}"));
         }
 
-        let message = payload
-            .pointer("/choices/0/message")
-            .cloned()
-            .ok_or_else(|| "AI 响应缺少 message".to_string())?;
+        let completion = read_ai_stream(response, &app, &stream_event_name).await?;
+        usage.record(completion.usage);
+        let message = completion.message();
         let tool_calls = message
             .get("tool_calls")
             .and_then(Value::as_array)
@@ -1284,19 +2601,15 @@ async fn ai_chat(
             .unwrap_or_default();
 
         if tool_calls.is_empty() {
-            let raw_content = message
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let provider_reasoning = message
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let (content, summary) = extract_reasoning_summary(raw_content);
+            let (content, summary) = extract_reasoning_summary(&completion.content);
+            let provider_reasoning =
+                (!completion.reasoning.is_empty()).then_some(completion.reasoning);
             return Ok(AiResponse {
                 content,
                 reasoning: summary.or(provider_reasoning),
+                approval: None,
                 tool_calls: executed_tools,
+                usage,
             });
         }
 
@@ -1328,33 +2641,92 @@ async fn ai_chat(
                 .unwrap_or("{}");
             let parsed: Value = serde_json::from_str(arguments)
                 .map_err(|error| format!("工具参数解析失败: {error}"))?;
-            let command = parsed
-                .get("command")
+            let tool_name = tool_call
+                .pointer("/function/name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "工具调用缺少 command".to_string())?
+                .unwrap_or("execute_command")
                 .to_string();
+            if !ai_tool_enabled(&config.tools, &tool_name) {
+                return Err(format!("AI 工具 {tool_name} 未在设置中启用"));
+            }
 
-            let result = if is_high_risk_command(&command) {
-                CommandResult {
-                    stdout: String::new(),
-                    stderr: "BLOCKED: 高风险命令需要用户通过 /run 显式执行。".to_string(),
-                    exit_code: 126,
+            if ai_tool_is_mutating(&tool_name, &parsed) && !config.tools.allow_mutating_tools {
+                let result = ai_blocked_result(
+                    "BLOCKED: 变更型工具未获设置授权，请在 AI 设置中打开“允许变更型工具”。",
+                );
+                let output = truncate_to_token_budget(
+                    &format!("{}{}", result.stdout, result.stderr),
+                    output_budget,
+                );
+                executed_tools.push(AiToolResult {
+                    tool: tool_name.clone(),
+                    command: format!("{tool_name} (blocked)"),
+                    output: output.clone(),
+                    exit_code: result.exit_code,
+                });
+                api_messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": format!("exit_code={}\n{}", result.exit_code, output)
+                }));
+                continue;
+            }
+
+            if tool_name != "risk_checker" {
+                if let Some(command) = ai_tool_command_for_risk(&tool_name, &parsed) {
+                    let reasons = risk_reasons(&command);
+                    if !reasons.is_empty() {
+                        let reason = reasons.join("、");
+                        let result =
+                            ai_blocked_result(format!("BLOCKED: {reason}。等待人工确认。"));
+                        let output = truncate_to_token_budget(
+                            &format!("{}{}", result.stdout, result.stderr),
+                            output_budget,
+                        );
+                        executed_tools.push(AiToolResult {
+                            tool: tool_name.clone(),
+                            command: command.clone(),
+                            output,
+                            exit_code: result.exit_code,
+                        });
+                        return Ok(AiResponse {
+                            content: "已暂停高风险操作，等待人工确认后再执行。".to_string(),
+                            reasoning: Some(format!("风险检查命中：{reason}")),
+                            approval: Some(AiApproval {
+                                tool: tool_name,
+                                command,
+                                arguments: parsed,
+                                reason,
+                            }),
+                            tool_calls: executed_tools,
+                            usage,
+                        });
+                    }
                 }
-            } else {
-                let server_for_command = server.clone();
-                let command_for_task = command.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    run_command_sync(&server_for_command, &command_for_task)
-                })
-                .await
-                .map_err(|error| format!("AI 工具任务失败: {error}"))??
-            };
+                if tool_name == "write_file" {
+                    if let Ok(path) = required_ai_arg(&parsed, "path") {
+                        if protected_write_path(path) {
+                            return Ok(AiResponse {
+                                content: "已阻止写入受保护系统路径。".to_string(),
+                                reasoning: Some("/etc、/boot、/usr、/lib 和 /var/lib 等路径需要通过人工终端操作。".to_string()),
+                                approval: None,
+                                tool_calls: executed_tools,
+                                usage,
+                            });
+                        }
+                    }
+                }
+            }
+
+            let execution = execute_ai_tool(&tool_name, &parsed, &server, &config.tools).await?;
+            let result = execution.result;
             let output = truncate_to_token_budget(
                 &format!("{}{}", result.stdout, result.stderr),
-                output_budget,
+                output_budget.min(config.tools.max_output_chars / 4),
             );
             executed_tools.push(AiToolResult {
-                command: command.clone(),
+                tool: tool_name,
+                command: execution.display_command,
                 output: output.clone(),
                 exit_code: result.exit_code,
             });
@@ -1395,6 +2767,7 @@ pub fn run() {
             compress_remote_path,
             run_ssh_command,
             list_ai_models,
+            approve_ai_tool,
             ai_chat
         ])
         .run(tauri::generate_context!())
@@ -1404,18 +2777,74 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_endpoint, api_message_cost, estimate_tokens, extract_reasoning_summary,
-        input_token_budget, is_high_risk_command, mode_string, parse_network_connections,
-        parse_network_interfaces, parse_processes, remote_parent_and_name, shell_quote,
-        tool_output_budget, trim_api_messages_for_context, trim_messages_for_context,
-        truncate_to_token_budget, AiInputMessage,
+        ai_endpoint, ai_tool_definitions, api_message_cost, apply_ai_stream_payload,
+        estimate_tokens, extract_reasoning_summary, input_token_budget, is_high_risk_command,
+        mode_string, parse_network_connections, parse_network_interfaces, parse_processes,
+        remote_parent_and_name, risk_reasons, shell_quote, tool_output_budget,
+        trim_api_messages_for_context, trim_messages_for_context, truncate_to_token_budget,
+        AiInputMessage, AiStreamCompletion, AiToolSettings,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn formats_unix_permissions() {
         assert_eq!(mode_string(Some(0o100755), false), "-rwxr-xr-x");
         assert_eq!(mode_string(Some(0o040750), true), "drwxr-x---");
+    }
+
+    #[test]
+    fn stores_and_reads_namespaced_server_secrets() {
+        let id = "keyring-regression-probe".to_string();
+        super::store_server_secret(
+            id.clone(),
+            Some("target-probe".to_string()),
+            Some("target-passphrase-probe".to_string()),
+            Some("jump-probe".to_string()),
+            Some("jump-passphrase-probe".to_string()),
+        )
+        .expect("keyring probe write failed");
+        let target = super::keyring_entry(&format!("server:{id}:password"))
+            .expect("keyring target entry failed")
+            .get_password()
+            .expect("keyring target read failed");
+        let jump = super::keyring_entry(&format!("server:{id}:jump:password"))
+            .expect("keyring jump entry failed")
+            .get_password()
+            .expect("keyring jump read failed");
+        assert_eq!(target, "target-probe");
+        assert_eq!(jump, "jump-probe");
+        super::delete_server_secret(id).expect("keyring probe cleanup failed");
+    }
+
+    #[test]
+    #[ignore = "requires PORTICO_TEST_* SSH credentials and network access"]
+    fn connects_through_configured_jump_host() {
+        let required = |name: &str| std::env::var(name).expect("missing jump-host test variable");
+        let port = |name: &str| required(name).parse::<u16>().expect("invalid test port");
+        let server = super::ServerProfile {
+            id: "jump-host-integration-test".to_string(),
+            host: required("PORTICO_TEST_TARGET_HOST"),
+            port: port("PORTICO_TEST_TARGET_PORT"),
+            username: required("PORTICO_TEST_TARGET_USERNAME"),
+            auth_type: "password".to_string(),
+            password: Some(required("PORTICO_TEST_TARGET_PASSWORD")),
+            private_key_path: None,
+            passphrase: None,
+            jump_host: Some(super::JumpHostProfile {
+                enabled: true,
+                host: required("PORTICO_TEST_JUMP_HOST"),
+                port: port("PORTICO_TEST_JUMP_PORT"),
+                username: required("PORTICO_TEST_JUMP_USERNAME"),
+                auth_type: "password".to_string(),
+                password: Some(required("PORTICO_TEST_JUMP_PASSWORD")),
+                private_key_path: None,
+                passphrase: None,
+            }),
+        };
+        let result = super::run_command_sync(&server, "printf portico-jump-ok")
+            .expect("jump-host SSH command failed");
+        assert_eq!(result.stdout, "portico-jump-ok");
+        assert_eq!(result.exit_code, 0);
     }
 
     #[test]
@@ -1431,8 +2860,29 @@ mod tests {
     #[test]
     fn blocks_high_risk_ai_commands() {
         assert!(is_high_risk_command("sudo rm -rf /"));
+        assert!(is_high_risk_command("sudo rm    -rf /"));
+        assert!(is_high_risk_command("sudo\trm\t-rf\t/"));
         assert!(is_high_risk_command("shutdown -h now"));
+        assert!(is_high_risk_command("systemctl restart nginx"));
+        assert!(risk_reasons("iptables -F")
+            .iter()
+            .any(|reason| reason.contains("防火墙")));
         assert!(!is_high_risk_command("rm -rf /tmp/old-release"));
+    }
+
+    #[test]
+    fn exposes_enabled_structured_ai_tools() {
+        let settings = AiToolSettings::default();
+        let definitions = ai_tool_definitions(&settings);
+        let names = definitions
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"execute_command"));
+        assert!(names.contains(&"get_system_metrics"));
+        assert!(names.contains(&"risk_checker"));
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"pty_interaction"));
     }
 
     #[test]
@@ -1442,6 +2892,73 @@ mod tests {
         );
         assert_eq!(content, "Disk usage is normal.");
         assert_eq!(reasoning.as_deref(), Some("Check disk pressure first."));
+    }
+
+    #[test]
+    fn accumulates_streamed_content_reasoning_and_tool_arguments() {
+        let mut completion = AiStreamCompletion::default();
+        let delta = apply_ai_stream_payload(
+            r#"{"choices":[{"delta":{"content":"状态正常","reasoning_content":"已检查"}}]}"#,
+            &mut completion,
+        )
+        .unwrap();
+        assert_eq!(delta.content.as_deref(), Some("状态正常"));
+        assert_eq!(delta.reasoning.as_deref(), Some("已检查"));
+
+        apply_ai_stream_payload(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"run_ssh_command","arguments":"{\"command\":"}}]}}]}"#,
+            &mut completion,
+        )
+        .unwrap();
+        apply_ai_stream_payload(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"df -h\"}"}}]}}]}"#,
+            &mut completion,
+        )
+        .unwrap();
+
+        let message = completion.message();
+        assert_eq!(message["content"], "状态正常");
+        assert_eq!(message["reasoning_content"], "已检查");
+        assert_eq!(message["tool_calls"][0]["id"], "call-1");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            r#"{"command":"df -h"}"#
+        );
+    }
+
+    #[test]
+    fn captures_streamed_usage_cache_and_reasoning_tokens() {
+        let mut completion = AiStreamCompletion::default();
+        apply_ai_stream_payload(
+            r#"{"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":240,"total_tokens":1440,"prompt_tokens_details":{"cached_tokens":900},"completion_tokens_details":{"reasoning_tokens":80}}}"#,
+            &mut completion,
+        )
+        .unwrap();
+
+        assert!(completion.usage.available);
+        assert_eq!(completion.usage.input_tokens, 1_200);
+        assert_eq!(completion.usage.output_tokens, 240);
+        assert_eq!(completion.usage.total_tokens, 1_440);
+        assert_eq!(completion.usage.cached_tokens, 900);
+        assert_eq!(completion.usage.reasoning_tokens, 80);
+        assert_eq!(completion.usage.context_tokens, 1_440);
+
+        let mut aggregate = super::AiTokenUsage::default();
+        aggregate.record(completion.usage);
+        aggregate.record(super::AiTokenUsage {
+            available: true,
+            input_tokens: 200,
+            output_tokens: 40,
+            total_tokens: 240,
+            cached_tokens: 100,
+            reasoning_tokens: 10,
+            context_tokens: 240,
+            requests: 1,
+        });
+        assert_eq!(aggregate.total_tokens, 1_680);
+        assert_eq!(aggregate.cached_tokens, 1_000);
+        assert_eq!(aggregate.context_tokens, 240);
+        assert_eq!(aggregate.requests, 2);
     }
 
     #[test]

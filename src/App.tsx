@@ -1,15 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Bell,
   Braces,
-  ChevronDown,
   CircleHelp,
   Command,
   FolderSync,
   PanelLeftClose,
   Plus,
-  Search,
   Server,
   Settings,
   Sparkles,
@@ -19,11 +17,15 @@ import {
 import { AiPane } from "./components/AiPane";
 import { FilePane } from "./components/FilePane";
 import { ServerDialog } from "./components/ServerDialog";
+import { ServerTree } from "./components/ServerTree";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalPane } from "./components/TerminalPane";
 import { TransferPanel } from "./components/TransferPanel";
 import { SystemDock } from "./components/SystemDock";
-import { DEMO_SERVER, connectionLabel, isTauri, uid } from "./lib";
+import { DEV_BOOTSTRAP } from "./devBootstrap";
+import { DEMO_SERVER, isTauri, uid } from "./lib";
+import { normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
+import { DEFAULT_AI_TOOL_SETTINGS } from "./types";
 import type { AiConfig, ServerProfile, SessionState, TransferRequest, TransferTask } from "./types";
 
 const DEFAULT_AI_CONFIG: AiConfig = {
@@ -34,7 +36,8 @@ const DEFAULT_AI_CONFIG: AiConfig = {
   supportsImages: true,
   temperature: 0.2,
   systemPrompt:
-    "你是一名谨慎的 Linux 运维助手。优先解释风险；需要时使用 run_ssh_command 工具，并在执行破坏性命令前请求确认。",
+    "你是一名谨慎的 Linux 运维助手。优先解释风险；先使用 risk_checker 评估动作，再调用合适的结构化工具。高风险操作必须等待人工确认，不要尝试绕过本地策略。",
+  tools: DEFAULT_AI_TOOL_SETTINGS,
 };
 
 function useStoredState<T>(key: string, initialValue: T, serialize: (value: T) => unknown = (value) => value) {
@@ -60,8 +63,12 @@ function useStoredState<T>(key: string, initialValue: T, serialize: (value: T) =
 
 export default function App() {
   const [servers, setServers] = useStoredState<ServerProfile[]>("portico.servers", [DEMO_SERVER], (items) =>
-    items.map(({ password: _password, passphrase: _passphrase, ...server }) => server),
+    items.map(({ password: _password, passphrase: _passphrase, jumpHost, ...server }) => ({
+      ...server,
+      jumpHost: jumpHost ? (({ password: _jumpPassword, passphrase: _jumpPassphrase, ...rest }) => rest)(jumpHost) : undefined,
+    })),
   );
+  const [savedGroups, setSavedGroups] = useStoredState<string[]>("portico.server-groups", []);
   const [aiConfig, setAiConfig] = useStoredState<AiConfig>("portico.ai", DEFAULT_AI_CONFIG, ({ apiKey: _apiKey, ...config }) => config);
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
@@ -70,6 +77,8 @@ export default function App() {
   const [aiOpen, setAiOpen] = useState(true);
   const [serverDialogOpen, setServerDialogOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ServerProfile>();
+  const [serverDialogGroup, setServerDialogGroup] = useState<string>();
+  const [selectedServerId, setSelectedServerId] = useState<string>();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
@@ -77,18 +86,37 @@ export default function App() {
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const activeServer = servers.find((server) => server.id === activeSession?.serverId);
 
-  const groups = useMemo(() => {
-    const filtered = servers.filter((server) => {
-      const value = `${server.name} ${server.host} ${server.group}`.toLowerCase();
-      return value.includes(search.toLowerCase());
+  useEffect(() => {
+    if (!DEV_BOOTSTRAP) return;
+
+    const { servers: bootstrapServers = [], ai } = DEV_BOOTSTRAP;
+    if (bootstrapServers.length) {
+      setServers((current) => {
+        const byId = new Map(current.map((item) => [item.id, item]));
+        bootstrapServers.forEach((server) => byId.set(server.id, { ...byId.get(server.id), ...server }));
+        return [...byId.values()];
+      });
+      setSavedGroups((current) => bootstrapServers.reduce((groups, server) =>
+        server.group && !groups.includes(server.group) ? [...groups, server.group] : groups, current));
+    }
+    if (ai) setAiConfig((current) => ({ ...current, ...ai }));
+
+    if (!isTauri()) return;
+    const writes: Promise<unknown>[] = [];
+    bootstrapServers.forEach((server) => {
+      if (server.password || server.passphrase || server.jumpHost?.password || server.jumpHost?.passphrase) {
+        writes.push(invoke("store_server_secret", {
+          serverId: server.id,
+          password: server.password ?? null,
+          passphrase: server.passphrase ?? null,
+          jumpPassword: server.jumpHost?.password ?? null,
+          jumpPassphrase: server.jumpHost?.passphrase ?? null,
+        }));
+      }
     });
-    return Object.entries(
-      filtered.reduce<Record<string, ServerProfile[]>>((result, server) => {
-        (result[server.group || "未分组"] ||= []).push(server);
-        return result;
-      }, {}),
-    );
-  }, [search, servers]);
+    if (ai?.apiKey) writes.push(invoke("store_ai_key", { apiKey: ai.apiKey }));
+    void Promise.all(writes).catch((error) => console.error("Failed to initialize development credentials", error));
+  }, [setAiConfig, setSavedGroups, setServers]);
 
   const updateSession = (id: string, patch: Partial<SessionState>) => {
     setSessions((current) =>
@@ -134,27 +162,35 @@ export default function App() {
   };
 
   const saveServer = async (server: ServerProfile) => {
+    const nextServer = { ...server, group: normalizeGroupPath(server.group) };
     if (isTauri()) {
       await invoke("store_server_secret", {
-        serverId: server.id,
-        password: server.password?.trim() || null,
-        passphrase: server.passphrase?.trim() || null,
+        serverId: nextServer.id,
+        password: nextServer.password?.trim() || null,
+        passphrase: nextServer.passphrase?.trim() || null,
+        jumpPassword: nextServer.jumpHost?.password?.trim() || null,
+        jumpPassphrase: nextServer.jumpHost?.passphrase?.trim() || null,
       });
     }
     setServers((current) => {
-      const exists = current.some((item) => item.id === server.id);
+      const exists = current.some((item) => item.id === nextServer.id);
       return exists
-        ? current.map((item) => (item.id === server.id ? server : item))
-        : [...current, server];
+        ? current.map((item) => (item.id === nextServer.id ? nextServer : item))
+        : [...current, nextServer];
     });
+    if (nextServer.group) {
+      setSavedGroups((current) => current.includes(nextServer.group) ? current : [...current, nextServer.group]);
+    }
     setServerDialogOpen(false);
     setEditingServer(undefined);
-    openSession(server, true);
+    setSelectedServerId(nextServer.id);
+    openSession(nextServer, true);
   };
 
   const deleteServer = (serverId: string) => {
     if (isTauri()) void invoke("delete_server_secret", { serverId }).catch(() => undefined);
     setServers((current) => current.filter((server) => server.id !== serverId));
+    setSelectedServerId((current) => current === serverId ? undefined : current);
     sessions
       .filter((session) => session.serverId === serverId)
       .forEach((session) => void closeSession(session.id));
@@ -202,6 +238,44 @@ export default function App() {
     setSidebarOpen(true);
   };
 
+  const openServerDialog = (server?: ServerProfile, group?: string) => {
+    setEditingServer(server);
+    setServerDialogGroup(group);
+    setServerDialogOpen(true);
+  };
+
+  const createGroup = (group: string) => {
+    const normalized = normalizeGroupPath(group);
+    setSavedGroups((current) => current.includes(normalized) ? current : [...current, normalized]);
+  };
+
+  const renameGroup = (currentGroup: string, nextGroup: string) => {
+    setServers((current) => current.map((server) =>
+      ({ ...server, group: replaceGroupPrefix(server.group, currentGroup, nextGroup) }),
+    ));
+    setSavedGroups((current) => {
+      const next = current.map((group) => replaceGroupPrefix(group, currentGroup, nextGroup));
+      if (!next.includes(nextGroup)) next.push(nextGroup);
+      return next.filter((group, index) => group && next.indexOf(group) === index);
+    });
+  };
+
+  const deleteGroup = (group: string) => {
+    setServers((current) => current.map((server) =>
+      ({ ...server, group: removeGroupLevel(server.group, group) }),
+    ));
+    setSavedGroups((current) => {
+      const next = current.map((item) => removeGroupLevel(item, group));
+      return next.filter((item, index) => item && next.indexOf(item) === index);
+    });
+  };
+
+  const moveServer = (server: ServerProfile, group: string) => {
+    const normalized = normalizeGroupPath(group);
+    setServers((current) => current.map((item) => item.id === server.id ? { ...item, group: normalized } : item));
+    if (normalized) setSavedGroups((current) => current.includes(normalized) ? current : [...current, normalized]);
+  };
+
   const activeTransferCount = transfers.filter((task) => task.status === "queued" || task.status === "running").length;
 
   return (
@@ -239,69 +313,25 @@ export default function App() {
 
         {sidebarOpen && sidebarView === "servers" && (
           <aside className="server-sidebar">
-            <div className="sidebar-heading">
-              <div>
-                <span className="eyebrow">工作区</span>
-                <h1>服务器</h1>
-              </div>
-              <button
-                className="icon-button"
-                aria-label="添加服务器"
-                title="添加服务器"
-                onClick={() => setServerDialogOpen(true)}
-              ><Plus size={15} /></button>
-            </div>
-            <label className="search-field">
-              <Search size={14} />
-              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索名称、主机或分组" />
-              <kbd>Ctrl K</kbd>
-            </label>
-
-            <div className="server-list">
-              {groups.map(([group, items]) => (
-                <section className="server-group" key={group}>
-                  <div className="group-label"><ChevronDown size={12} /><span>{group}</span><small>{items.length}</small></div>
-                  {items.map((server) => {
-                    const isActive = activeServer?.id === server.id;
-                    const liveCount = sessions.filter((session) => session.serverId === server.id).length;
-                    return (
-                      <div
-                        className={`server-row ${isActive ? "selected" : ""}`}
-                        key={server.id}
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => openSession(server)}
-                        onDoubleClick={() => openSession(server, true)}
-                        onKeyDown={(event) => event.key === "Enter" && openSession(server)}
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          setEditingServer(server);
-                          setServerDialogOpen(true);
-                        }}
-                      >
-                        <span className="server-avatar" style={{ background: server.color }}>{server.name.slice(0, 1).toUpperCase()}</span>
-                        <span className="server-copy">
-                          <strong>{server.name}</strong>
-                          <span>{connectionLabel(server)}</span>
-                        </span>
-                        {liveCount > 0 && <span className="session-count">{liveCount}</span>}
-                        <button
-                          className="row-action"
-                          title="新建独立会话"
-                          aria-label={`为 ${server.name} 新建会话`}
-                          onClick={(event) => { event.stopPropagation(); openSession(server, true); }}
-                        ><Plus size={13} /></button>
-                      </div>
-                    );
-                  })}
-                </section>
-              ))}
-              {groups.length === 0 && <div className="sidebar-empty">没有匹配的服务器</div>}
-            </div>
-
-            <button className="add-server-button" onClick={() => setServerDialogOpen(true)}>
-              <Plus size={14} /> 添加服务器
-            </button>
+            <ServerTree
+              servers={servers}
+              savedGroups={savedGroups}
+              sessions={sessions}
+              search={search}
+              selectedServerId={selectedServerId ?? activeServer?.id}
+              activeServerId={activeServer?.id}
+              onSearchChange={setSearch}
+              onSelect={(server) => setSelectedServerId(server.id)}
+              onOpen={(server) => { setSelectedServerId(server.id); openSession(server); }}
+              onNewSession={(server) => { setSelectedServerId(server.id); openSession(server, true); }}
+              onAddServer={(group) => openServerDialog(undefined, group)}
+              onEditServer={(server) => openServerDialog(server)}
+              onDeleteServer={(server) => deleteServer(server.id)}
+              onMoveServer={moveServer}
+              onCreateGroup={createGroup}
+              onRenameGroup={renameGroup}
+              onDeleteGroup={deleteGroup}
+            />
           </aside>
         )}
         {sidebarOpen && sidebarView === "transfers" && (
@@ -351,8 +381,8 @@ export default function App() {
             <div className="empty-workspace">
               <div className="empty-glyph"><Server size={24} /></div>
               <h2>选择一台服务器开始</h2>
-              <p>从左侧打开已有连接，双击可直接创建新的独立会话。</p>
-              <button className="primary-button" onClick={() => setServerDialogOpen(true)}><Plus size={14} /> 添加第一台服务器</button>
+              <p>在左侧选择连接，双击服务器或按 Enter 即可打开会话。</p>
+              <button className="primary-button" onClick={() => openServerDialog()}><Plus size={14} /> 添加第一台服务器</button>
             </div>
           ) : (
             <div className="workspace-sessions">
@@ -390,7 +420,8 @@ export default function App() {
       {serverDialogOpen && (
         <ServerDialog
           server={editingServer}
-          onClose={() => { setServerDialogOpen(false); setEditingServer(undefined); }}
+          initialGroup={serverDialogGroup}
+          onClose={() => { setServerDialogOpen(false); setEditingServer(undefined); setServerDialogGroup(undefined); }}
           onSave={saveServer}
           onDelete={editingServer ? () => { deleteServer(editingServer.id); setServerDialogOpen(false); setEditingServer(undefined); } : undefined}
         />

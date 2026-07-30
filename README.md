@@ -8,7 +8,9 @@ Portico SSH is a compact Tauri desktop workspace for managing SSH servers. Each 
 - Native Rust SSH PTY sessions rendered with xterm.js
 - SFTP directory browsing, upload, download, create-folder, and delete operations
 - OpenAI-compatible assistant with SSH command tools and visible reasoning summaries
+- Configurable AI tool catalog in settings: terminal jobs, file/SFTP, system metrics, process/network diagnostics, Docker/systemd, logs, snippets, and risk checks
 - High-risk AI command blocking; explicit `/run <command>` remains available to the operator
+- Mutating tools are opt-in, with per-tool output/timeout/round limits and an inline human approval step for high-risk actions
 - Secrets stored in the operating-system credential vault, never persisted in WebView local storage
 - SSH host-key verification through `~/.ssh/known_hosts`, including trust on first use
 

@@ -1,40 +1,72 @@
 import { useState } from "react";
-import { Eye, EyeOff, KeyRound, Server, Trash2, X } from "lucide-react";
+import { Eye, EyeOff, KeyRound, Network, Server, Trash2, X } from "lucide-react";
 import { uid } from "../lib";
 import type { ServerProfile } from "../types";
 
 interface Props {
   server?: ServerProfile;
+  initialGroup?: string;
   onClose: () => void;
   onSave: (server: ServerProfile) => void | Promise<void>;
   onDelete?: () => void;
 }
 
-export function ServerDialog({ server, onClose, onSave, onDelete }: Props) {
+export function ServerDialog({ server, initialGroup, onClose, onSave, onDelete }: Props) {
   const [value, setValue] = useState<ServerProfile>(server ?? {
     id: uid("server"),
     name: "",
-    group: "个人服务器",
+    group: initialGroup ?? "个人服务器",
     host: "",
     port: 22,
     username: "root",
     authType: "password",
     password: "",
     color: "var(--accent)",
+    jumpHost: {
+      enabled: false,
+      host: "",
+      port: 22,
+      username: "root",
+      authType: "password",
+      password: "",
+    },
   });
   const [showPassword, setShowPassword] = useState(false);
+  const [showJumpPassword, setShowJumpPassword] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
   const set = <K extends keyof ServerProfile>(key: K, next: ServerProfile[K]) =>
     setValue((current) => ({ ...current, [key]: next }));
+  const setJump = <K extends keyof NonNullable<ServerProfile["jumpHost"]>>(key: K, next: NonNullable<ServerProfile["jumpHost"]>[K]) =>
+    setValue((current) => ({
+      ...current,
+      jumpHost: {
+        enabled: false,
+        host: "",
+        port: 22,
+        username: "root",
+        authType: "password",
+        ...current.jumpHost,
+        [key]: next,
+      },
+    }));
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setSaving(true);
     setError("");
     try {
-      await onSave({ ...value, name: value.name.trim() || value.host.trim() });
+      const host = value.host.trim();
+      if (!host) throw new Error("请输入主机地址");
+      if (!Number.isInteger(value.port) || value.port < 1 || value.port > 65535) throw new Error("主机端口无效");
+      if (value.jumpHost?.enabled) {
+        if (!value.jumpHost.host.trim()) throw new Error("请输入跳板机地址");
+        if (!Number.isInteger(value.jumpHost.port) || value.jumpHost.port < 1 || value.jumpHost.port > 65535) throw new Error("跳板机端口无效");
+        if (!value.jumpHost.username.trim()) throw new Error("请输入跳板机用户名");
+        if (value.jumpHost.authType === "key" && !value.jumpHost.privateKeyPath?.trim()) throw new Error("请输入跳板机私钥路径");
+      }
+      await onSave({ ...value, host, name: value.name.trim() || host, jumpHost: value.jumpHost?.enabled ? { ...value.jumpHost, host: value.jumpHost.host.trim() } : value.jumpHost });
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -74,6 +106,35 @@ export function ServerDialog({ server, onClose, onSave, onDelete }: Props) {
             </div>
           )}
         </div>
+
+        <section className="jump-host-section">
+          <label className="jump-host-toggle">
+            <input type="checkbox" checked={Boolean(value.jumpHost?.enabled)} onChange={(event) => setJump("enabled", event.target.checked)} />
+            <span className="toggle-track" aria-hidden="true"><span /></span>
+            <span><strong>通过跳板机连接</strong><small>先连接跳板机，再访问目标服务器</small></span>
+          </label>
+          {value.jumpHost?.enabled && (
+            <div className="jump-host-fields">
+              <div className="section-caption"><Network size={14} /><span>跳板机配置</span></div>
+              <div className="form-grid">
+                <label className="field host-field"><span>跳板机地址</span><input value={value.jumpHost.host} onChange={(e) => setJump("host", e.target.value)} placeholder="202.104.115.238" required /></label>
+                <label className="field port-field"><span>端口</span><input type="number" min={1} max={65535} value={value.jumpHost.port} onChange={(e) => setJump("port", Number(e.target.value))} required /></label>
+                <label className="field"><span>用户名</span><input value={value.jumpHost.username} onChange={(e) => setJump("username", e.target.value)} required /></label>
+              </div>
+              <div className="jump-auth-row">
+                <div className="segmented-control">
+                  <button type="button" className={value.jumpHost.authType === "password" ? "active" : ""} onClick={() => setJump("authType", "password")}>密码</button>
+                  <button type="button" className={value.jumpHost.authType === "key" ? "active" : ""} onClick={() => setJump("authType", "key")}>私钥</button>
+                </div>
+                {value.jumpHost.authType === "password" ? (
+                  <label className="field password-field"><span>密码</span><div className="input-with-action"><input type={showJumpPassword ? "text" : "password"} autoComplete="current-password" value={value.jumpHost.password ?? ""} onChange={(e) => setJump("password", e.target.value)} /><button type="button" onClick={() => setShowJumpPassword((show) => !show)} title={showJumpPassword ? "隐藏密码" : "显示密码"}>{showJumpPassword ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></label>
+                ) : (
+                  <div className="form-grid jump-key-fields"><label className="field"><span>私钥路径</span><input value={value.jumpHost.privateKeyPath ?? ""} onChange={(e) => setJump("privateKeyPath", e.target.value)} placeholder="C:\\Users\\name\\.ssh\\id_ed25519" required /></label><label className="field"><span>私钥口令（可选）</span><input type="password" autoComplete="current-password" value={value.jumpHost.passphrase ?? ""} onChange={(e) => setJump("passphrase", e.target.value)} /></label></div>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
 
         {error && <div className="dialog-inline-error">{error}</div>}
         <div className="dialog-footer">

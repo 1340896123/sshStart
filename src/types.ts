@@ -1,5 +1,16 @@
 export type AuthType = "password" | "key";
 
+export interface JumpHostProfile {
+  enabled: boolean;
+  host: string;
+  port: number;
+  username: string;
+  authType: AuthType;
+  password?: string;
+  privateKeyPath?: string;
+  passphrase?: string;
+}
+
 export interface ServerProfile {
   id: string;
   name: string;
@@ -13,6 +24,7 @@ export interface ServerProfile {
   passphrase?: string;
   color: string;
   lastConnected?: string;
+  jumpHost?: JumpHostProfile;
 }
 
 export interface SessionState {
@@ -90,6 +102,17 @@ export interface TransferTask extends TransferRequest {
 
 export type MessageRole = "user" | "assistant" | "tool";
 
+export interface AiTokenUsage {
+  available: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
+  contextTokens: number;
+  requests: number;
+}
+
 export interface AiMessage {
   id: string;
   role: MessageRole;
@@ -97,8 +120,90 @@ export interface AiMessage {
   reasoning?: string;
   command?: string;
   commandOutput?: string;
+  toolName?: string;
+  approval?: AiApproval;
+  approvalState?: "pending" | "approved" | "rejected";
+  usage?: AiTokenUsage;
   createdAt: number;
 }
+
+export interface AiApproval {
+  tool: string;
+  command: string;
+  reason: string;
+  arguments?: Record<string, unknown>;
+}
+
+export interface AiToolResult {
+  tool: string;
+  command: string;
+  output: string;
+  exitCode: number;
+}
+
+export type AiToolKey =
+  | "executeCommand"
+  | "backgroundTask"
+  | "ptyInteraction"
+  | "readFile"
+  | "writeFile"
+  | "sftpUpload"
+  | "sftpDownload"
+  | "listDirectory"
+  | "getSystemMetrics"
+  | "processManager"
+  | "networkChecker"
+  | "dockerManager"
+  | "systemdControl"
+  | "riskChecker"
+  | "snippetLibrary"
+  | "logAnalyzer";
+
+export interface AiToolSettings {
+  executeCommand: boolean;
+  backgroundTask: boolean;
+  ptyInteraction: boolean;
+  readFile: boolean;
+  writeFile: boolean;
+  sftpUpload: boolean;
+  sftpDownload: boolean;
+  listDirectory: boolean;
+  getSystemMetrics: boolean;
+  processManager: boolean;
+  networkChecker: boolean;
+  dockerManager: boolean;
+  systemdControl: boolean;
+  riskChecker: boolean;
+  snippetLibrary: boolean;
+  logAnalyzer: boolean;
+  maxToolRounds: number;
+  maxOutputChars: number;
+  commandTimeoutSeconds: number;
+  allowMutatingTools: boolean;
+}
+
+export const DEFAULT_AI_TOOL_SETTINGS: AiToolSettings = {
+  executeCommand: true,
+  backgroundTask: true,
+  ptyInteraction: false,
+  readFile: true,
+  writeFile: false,
+  sftpUpload: false,
+  sftpDownload: true,
+  listDirectory: true,
+  getSystemMetrics: true,
+  processManager: true,
+  networkChecker: true,
+  dockerManager: true,
+  systemdControl: true,
+  riskChecker: true,
+  snippetLibrary: true,
+  logAnalyzer: true,
+  maxToolRounds: 6,
+  maxOutputChars: 12000,
+  commandTimeoutSeconds: 30,
+  allowMutatingTools: false,
+};
 
 export interface AiConfig {
   endpoint: string;
@@ -108,16 +213,20 @@ export interface AiConfig {
   supportsImages: boolean;
   temperature: number;
   systemPrompt: string;
+  tools: AiToolSettings;
 }
 
 export interface AiResponse {
   content: string;
   reasoning?: string;
-  toolCalls: Array<{
-    command: string;
-    output: string;
-    exitCode: number;
-  }>;
+  approval?: AiApproval;
+  toolCalls: AiToolResult[];
+  usage?: AiTokenUsage;
+}
+
+export interface AiStreamDelta {
+  content?: string;
+  reasoning?: string;
 }
 
 export type WorkspaceView = "terminal" | "files" | "split";

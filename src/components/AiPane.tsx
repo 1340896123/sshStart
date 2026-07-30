@@ -1,17 +1,20 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Bot,
   BrainCircuit,
   Check,
   ChevronDown,
   ChevronRight,
+  CircleGauge,
   CircleStop,
   Copy,
   History,
   MessageSquarePlus,
   Play,
   Send,
+  ShieldAlert,
   Settings2,
   Sparkles,
   TerminalSquare,
@@ -27,7 +30,7 @@ import {
   type AiConversation,
 } from "../aiHistory";
 import { isTauri, uid } from "../lib";
-import type { AiConfig, AiMessage, AiResponse, ServerProfile, SessionState } from "../types";
+import type { AiApproval, AiConfig, AiMessage, AiResponse, AiStreamDelta, AiTokenUsage, AiToolResult, ServerProfile, SessionState } from "../types";
 import { AiHistoryPopover } from "./AiHistoryPopover";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage").then((module) => ({ default: module.MarkdownMessage })));
@@ -41,6 +44,58 @@ interface Props {
 }
 
 const STARTERS = ["检查磁盘与内存使用", "查看最近的错误日志", "分析当前目录的部署结构"];
+const TOOL_LABELS: Record<string, string> = {
+  execute_command: "单条命令",
+  background_task: "后台作业",
+  pty_interaction: "交互式终端",
+  read_file: "读取文件",
+  write_file: "写入文件",
+  sftp_upload: "SFTP 上传",
+  sftp_download: "SFTP 下载",
+  list_directory: "目录列表",
+  get_system_metrics: "系统指标",
+  process_manager: "进程管理",
+  network_checker: "网络诊断",
+  docker_manager: "Docker 管理",
+  systemd_control: "systemd 服务",
+  risk_checker: "高危检查",
+  snippet_library: "代码片段",
+  log_analyzer: "日志分析",
+};
+const REASONING_OPEN = "<reasoning_summary>";
+const REASONING_CLOSE = "</reasoning_summary>";
+const TOKEN_NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN");
+const TOKEN_COMPACT_FORMATTER = new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 });
+
+const formatTokenCount = (value: number, compact = false) =>
+  (compact ? TOKEN_COMPACT_FORMATTER : TOKEN_NUMBER_FORMATTER).format(value);
+
+const formatUsagePercent = (value: number) => `${value < 0.1 && value > 0 ? "<0.1" : value.toFixed(1)}%`;
+
+function presentStreamedResponse(content: string, providerReasoning: string) {
+  const start = content.indexOf(REASONING_OPEN);
+  if (start < 0) {
+    const possibleTagStart = content.lastIndexOf("<");
+    const partialTag = possibleTagStart >= 0 ? content.slice(possibleTagStart) : "";
+    return {
+      content: REASONING_OPEN.startsWith(partialTag) ? content.slice(0, possibleTagStart).trim() : content,
+      reasoning: providerReasoning || undefined,
+    };
+  }
+  const summaryStart = start + REASONING_OPEN.length;
+  const end = content.indexOf(REASONING_CLOSE, summaryStart);
+  if (end < 0) {
+    return {
+      content: content.slice(0, start).trim(),
+      reasoning: content.slice(summaryStart).trim() || providerReasoning || undefined,
+    };
+  }
+  const summary = content.slice(summaryStart, end).trim();
+  return {
+    content: `${content.slice(0, start)}${content.slice(end + REASONING_CLOSE.length)}`.trim(),
+    reasoning: summary || providerReasoning || undefined,
+  };
+}
 
 export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Props) {
   const [input, setInput] = useState("");
@@ -50,9 +105,14 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   const [historyOpen, setHistoryOpen] = useState(false);
   const [conversations, setConversations] = useState<AiConversation[]>(readAiConversations);
   const [activeConversationId, setActiveConversationId] = useState<string>();
+  const [streamingMessageId, setStreamingMessageId] = useState<string>();
+  const [approvalLoading, setApprovalLoading] = useState<string>();
   const requestVersionRef = useRef(0);
   const activeConversationIdRef = useRef<string>();
   const conversationsRef = useRef(conversations);
+  const messagesRef = useRef(session.aiMessages);
+  const approvalArgumentsRef = useRef(new Map<string, Record<string, unknown>>());
+  messagesRef.current = session.aiMessages;
   const historyControlRef = useRef<HTMLDivElement>(null);
 
   const contextLabel = useMemo(() => `${server.name} · ${session.cwd}`, [server.name, session.cwd]);
@@ -60,6 +120,29 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     () => conversations.filter((conversation) => conversation.serverId === server.id),
     [conversations, server.id],
   );
+  const tokenUsage = useMemo(() => {
+    const records = session.aiMessages
+      .map((message) => message.usage)
+      .filter((usage): usage is AiTokenUsage => Boolean(usage?.available));
+    const latest = records[records.length - 1];
+    const totals = records.reduce((summary, usage) => ({
+      inputTokens: summary.inputTokens + usage.inputTokens,
+      outputTokens: summary.outputTokens + usage.outputTokens,
+      totalTokens: summary.totalTokens + usage.totalTokens,
+      cachedTokens: summary.cachedTokens + usage.cachedTokens,
+      reasoningTokens: summary.reasoningTokens + usage.reasoningTokens,
+      requests: summary.requests + usage.requests,
+    }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedTokens: 0, reasoningTokens: 0, requests: 0 });
+    const contextTokens = latest?.contextTokens ?? 0;
+    return {
+      ...totals,
+      available: records.length > 0,
+      contextTokens,
+      contextPercent: config.contextWindow > 0 ? Math.min(100, contextTokens / config.contextWindow * 100) : 0,
+      cachePercent: totals.inputTokens > 0 ? Math.min(100, totals.cachedTokens / totals.inputTokens * 100) : 0,
+    };
+  }, [config.contextWindow, session.aiMessages]);
+  const tokenUsagePopoverId = `token-usage-${session.id}`;
 
   useEffect(() => {
     const syncHistory = (event: Event) => {
@@ -101,9 +184,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setConversations(published);
   };
 
-  const setMessages = (messages: AiMessage[]) => {
+  const setMessages = (messages: AiMessage[], persist = true) => {
+    messagesRef.current = messages;
     onUpdate({ aiMessages: messages });
-    if (messages.length === 0) return;
+    if (!persist || messages.length === 0) return;
     const conversationId = activeConversationIdRef.current ?? uid("ai-conversation");
     if (!activeConversationIdRef.current) {
       activeConversationIdRef.current = conversationId;
@@ -119,7 +203,11 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setHistoryOpen(false);
     setInput("");
     setLoading(false);
+    setStreamingMessageId(undefined);
+    setApprovalLoading(undefined);
     setThinkingOpen({});
+    approvalArgumentsRef.current.clear();
+    messagesRef.current = [];
     onUpdate({ aiMessages: [] });
   };
 
@@ -130,7 +218,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setHistoryOpen(false);
     setInput("");
     setLoading(false);
+    setStreamingMessageId(undefined);
+    setApprovalLoading(undefined);
     setThinkingOpen({});
+    messagesRef.current = conversation.messages;
     onUpdate({ aiMessages: conversation.messages });
   };
 
@@ -144,6 +235,42 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     return invoke<{ stdout: string; stderr: string; exitCode: number }>("run_ssh_command", { server, command });
   };
 
+  const approveToolCall = async (messageId: string, approval: AiApproval) => {
+    if (approvalLoading) return;
+    const approvalArguments = approvalArgumentsRef.current.get(messageId);
+    if (!approvalArguments) {
+      approvalArgumentsRef.current.delete(messageId);
+      setMessages(messagesRef.current.map((message) => message.id === messageId
+        ? { ...message, approvalState: "rejected", commandOutput: "该审批请求缺少原始工具参数，已拒绝执行。" }
+        : message));
+      return;
+    }
+    setApprovalLoading(messageId);
+    try {
+      const result = await invoke<AiToolResult>("approve_ai_tool", {
+        server,
+        tool: approval.tool,
+        arguments: approvalArguments,
+        settings: config.tools,
+      });
+      setMessages(messagesRef.current.map((message) => message.id === messageId
+        ? { ...message, command: result.command, commandOutput: result.output, toolName: result.tool, approvalState: "approved" }
+        : message));
+    } catch (reason) {
+      setMessages(messagesRef.current.map((message) => message.id === messageId
+        ? { ...message, command: approval.command, commandOutput: String(reason), toolName: approval.tool, approvalState: "approved" }
+        : message));
+    } finally {
+      approvalArgumentsRef.current.delete(messageId);
+      setApprovalLoading(undefined);
+    }
+  };
+
+  const rejectToolCall = (messageId: string) => {
+    approvalArgumentsRef.current.delete(messageId);
+    setMessages(messagesRef.current.map((message) => message.id === messageId ? { ...message, approvalState: "rejected" } : message));
+  };
+
   const send = async (content = input) => {
     const text = content.trim();
     if (!text || loading) return;
@@ -152,6 +279,8 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     const requestVersion = requestVersionRef.current + 1;
     requestVersionRef.current = requestVersion;
     const userMessage: AiMessage = { id: uid("message"), role: "user", content: text, createdAt: Date.now() };
+    const assistantMessageId = uid("message");
+    const assistantCreatedAt = Date.now();
     const pendingMessages = [...session.aiMessages, userMessage];
     setMessages(pendingMessages);
     setLoading(true);
@@ -162,40 +291,72 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         const result = await runDirectCommand(command);
         if (requestVersionRef.current !== requestVersion) return;
         setMessages([...pendingMessages, {
-          id: uid("message"), role: "assistant", content: result.exitCode === 0 ? "命令已执行完成。" : "命令执行失败，请检查输出。",
+          id: assistantMessageId, role: "assistant", content: result.exitCode === 0 ? "命令已执行完成。" : "命令执行失败，请检查输出。",
           reasoning: "识别到显式 /run 指令，跳过模型推理并在当前 SSH 会话直接执行。",
-          command, commandOutput: `${result.stdout}${result.stderr}`, createdAt: Date.now(),
+          toolName: "execute_command", command, commandOutput: `${result.stdout}${result.stderr}`, createdAt: assistantCreatedAt,
         }]);
       } else if (!isTauri()) {
         await new Promise((resolve) => setTimeout(resolve, 850));
         if (requestVersionRef.current !== requestVersion) return;
         setMessages([...pendingMessages, {
-          id: uid("message"), role: "assistant",
+          id: assistantMessageId, role: "assistant",
           content: "当前服务器运行状态正常。磁盘根分区使用率 42%，内存仍有充足余量，没有发现需要立即处理的告警。建议继续检查最近 30 分钟的服务错误日志。",
           reasoning: "先确认请求目标，再读取当前会话上下文；浏览器预览未连接真实 SSH，因此返回演示分析，未执行远程命令。",
           command: "df -h / && free -h",
           commandOutput: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        80G   32G   44G  42% /\nMem:            7.7G  2.1G  4.8G",
-          createdAt: Date.now(),
+          createdAt: assistantCreatedAt,
         }]);
       } else {
-        const response = await invoke<AiResponse>("ai_chat", {
-          config,
-          server,
-          messages: pendingMessages.map(({ role, content }) => ({ role, content })),
-          allowExecute: autoExecute,
+        const streamId = uid("ai-stream");
+        let streamedContent = "";
+        let streamedReasoning = "";
+        const unlisten = await listen<AiStreamDelta>(`ai-stream:${streamId}`, ({ payload }) => {
+          if (requestVersionRef.current !== requestVersion) return;
+          streamedContent += payload.content ?? "";
+          streamedReasoning += payload.reasoning ?? "";
+          const visible = presentStreamedResponse(streamedContent, streamedReasoning);
+          if (!visible.content && !visible.reasoning) return;
+          setStreamingMessageId(assistantMessageId);
+          setMessages([...pendingMessages, {
+            id: assistantMessageId,
+            role: "assistant",
+            content: visible.content,
+            reasoning: visible.reasoning,
+            createdAt: assistantCreatedAt,
+          }], false);
         });
+        let response: AiResponse;
+        try {
+          response = await invoke<AiResponse>("ai_chat", {
+            config,
+            server,
+            messages: pendingMessages.map(({ role, content }) => ({ role, content })),
+            allowExecute: autoExecute,
+            streamId,
+          });
+        } finally {
+          unlisten();
+        }
         if (requestVersionRef.current !== requestVersion) return;
         const lastTool = response.toolCalls[response.toolCalls.length - 1];
+        const approval = response.approval;
+        if (approval?.arguments) approvalArgumentsRef.current.set(assistantMessageId, approval.arguments);
         setMessages([...pendingMessages, {
-          id: uid("message"), role: "assistant", content: response.content,
-          reasoning: response.reasoning, command: lastTool?.command, commandOutput: lastTool?.output, createdAt: Date.now(),
+          id: assistantMessageId, role: "assistant", content: response.content,
+          reasoning: response.reasoning, toolName: lastTool?.tool, command: lastTool?.command, commandOutput: lastTool?.output,
+          approval: approval ? { tool: approval.tool, command: approval.command, reason: approval.reason } : undefined,
+          approvalState: approval ? "pending" : undefined,
+          usage: response.usage, createdAt: assistantCreatedAt,
         }]);
       }
     } catch (reason) {
       if (requestVersionRef.current !== requestVersion) return;
-      setMessages([...pendingMessages, { id: uid("message"), role: "assistant", content: `请求失败：${String(reason)}`, createdAt: Date.now() }]);
+      setMessages([...pendingMessages, { id: assistantMessageId, role: "assistant", content: `请求失败：${String(reason)}`, createdAt: assistantCreatedAt }]);
     } finally {
-      if (requestVersionRef.current === requestVersion) setLoading(false);
+      if (requestVersionRef.current === requestVersion) {
+        setLoading(false);
+        setStreamingMessageId(undefined);
+      }
     }
   };
 
@@ -255,16 +416,28 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                 {thinkingOpen[message.id] && <p>{message.reasoning}</p>}
               </div>
             )}
+            {message.approval && message.approvalState === "pending" && (
+              <div className="approval-call">
+                <div className="approval-call-heading"><ShieldAlert size={14} /><span>需要人工确认</span><small>高危命令已暂停</small></div>
+                <code>$ {message.approval.command}</code>
+                <p>{message.approval.reason}</p>
+                <div className="approval-call-actions">
+                  <button className="approval-confirm" disabled={approvalLoading === message.id} onClick={() => void approveToolCall(message.id, message.approval!)}><Check size={12} />{approvalLoading === message.id ? "执行中…" : "确认并执行"}</button>
+                  <button className="approval-reject" disabled={approvalLoading === message.id} onClick={() => rejectToolCall(message.id)}><X size={12} />拒绝</button>
+                </div>
+              </div>
+            )}
+            {message.approvalState === "rejected" && <div className="approval-dismissed"><X size={12} />已拒绝执行该高危操作</div>}
             {message.command && (
               <div className="tool-call">
-                <div className="tool-call-header"><TerminalSquare size={12} /><span>执行命令</span><Check size={12} /><button title="复制命令" onClick={() => navigator.clipboard.writeText(message.command ?? "")}><Copy size={11} /></button></div>
+                <div className="tool-call-header"><TerminalSquare size={12} /><span>{message.toolName ? TOOL_LABELS[message.toolName] ?? message.toolName : "执行命令"}</span><Check size={12} /><button title="复制命令" onClick={() => navigator.clipboard.writeText(message.command ?? "")}><Copy size={11} /></button></div>
                 <code>$ {message.command}</code>
                 {message.commandOutput && <pre>{message.commandOutput}</pre>}
               </div>
             )}
           </article>
         ))}
-        {loading && (
+        {loading && !streamingMessageId && (
           <article className="ai-message assistant thinking-message">
             <div className="message-meta"><Bot size={12} /><span>Portico AI</span></div>
             <div className="thinking-progress"><span className="thinking-pulse" /><span>正在分析当前会话</span></div>
@@ -277,19 +450,67 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         <div className="execution-policy">
           <button className={`toggle ${autoExecute ? "on" : ""}`} onClick={() => setAutoExecute((value) => !value)} aria-pressed={autoExecute}><span /></button>
           <span>允许执行命令</span>
+          <div className="token-usage-control">
+            <button
+              className={`token-usage-button ${tokenUsage.available ? "has-data" : ""}`}
+              type="button"
+              title="当前会话 Token 用量"
+              aria-label="当前会话 Token 用量"
+              aria-describedby={tokenUsagePopoverId}
+            >
+              <CircleGauge size={14} strokeWidth={1.8} />
+            </button>
+            <div className="token-usage-popover" id={tokenUsagePopoverId} role="tooltip">
+              <div className="token-usage-heading">
+                <span>当前会话 Token</span>
+                <strong>{tokenUsage.available ? formatTokenCount(tokenUsage.totalTokens, true) : "--"}</strong>
+              </div>
+              {tokenUsage.available ? (
+                <>
+                  <div className="token-context-row">
+                    <span>上下文容量</span>
+                    <strong>{formatTokenCount(tokenUsage.contextTokens, true)} / {formatTokenCount(config.contextWindow, true)}</strong>
+                    <small>{formatUsagePercent(tokenUsage.contextPercent)}</small>
+                  </div>
+                  <div className="token-context-track" aria-hidden="true">
+                    <span style={{ width: `${tokenUsage.contextPercent}%` }} />
+                  </div>
+                  <dl className="token-usage-stats">
+                    <div className="input"><dt><span />输入 Token</dt><dd>{formatTokenCount(tokenUsage.inputTokens)}</dd></div>
+                    <div className="output"><dt><span />输出 Token</dt><dd>{formatTokenCount(tokenUsage.outputTokens)}</dd></div>
+                    <div className="cached"><dt><span />缓存 Token</dt><dd>{formatTokenCount(tokenUsage.cachedTokens)}</dd></div>
+                    <div className="reasoning"><dt><span />推理 Token</dt><dd>{formatTokenCount(tokenUsage.reasoningTokens)}</dd></div>
+                    <div className="requests"><dt><span />模型请求</dt><dd>{formatTokenCount(tokenUsage.requests)} 次</dd></div>
+                  </dl>
+                  <div className="token-cache-summary">
+                    <span>缓存率</span>
+                    <strong>{formatUsagePercent(tokenUsage.cachePercent)}</strong>
+                    <small>{formatTokenCount(tokenUsage.cachedTokens)} / {formatTokenCount(tokenUsage.inputTokens)}</small>
+                  </div>
+                </>
+              ) : (
+                <div className="token-usage-empty">
+                  <CircleGauge size={17} strokeWidth={1.6} />
+                  <strong>暂无 usage 数据</strong>
+                  <span>完成一次模型请求后更新</span>
+                </div>
+              )}
+            </div>
+          </div>
           <small>{autoExecute ? "自动" : "仅建议"}</small>
         </div>
         <div className="ai-composer">
           <textarea
             rows={2}
             value={input}
+            disabled={Boolean(approvalLoading)}
             onChange={(event) => setInput(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); }
             }}
             placeholder="描述任务，或输入 /run 执行命令"
           />
-          <div className="composer-footer"><span>当前目录 {session.cwd}</span>{loading ? <button className="send-button stop" title="停止" onClick={() => { requestVersionRef.current += 1; setLoading(false); }}><CircleStop size={15} /></button> : <button className="send-button" title="发送" disabled={!input.trim()} onClick={() => void send()}><Send size={15} /></button>}</div>
+          <div className="composer-footer"><span>当前目录 {session.cwd}</span>{loading ? <button className="send-button stop" title="停止" onClick={() => { requestVersionRef.current += 1; setLoading(false); setStreamingMessageId(undefined); }}><CircleStop size={15} /></button> : <button className="send-button" title="发送" disabled={Boolean(approvalLoading) || !input.trim()} onClick={() => void send()}><Send size={15} /></button>}</div>
         </div>
       </div>
     </aside>
