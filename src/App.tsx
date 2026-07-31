@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Bell,
@@ -15,6 +16,7 @@ import {
   X,
 } from "lucide-react";
 import { AiPane } from "./components/AiPane";
+import { ColumnSplitter } from "./components/ColumnSplitter";
 import { FilePane } from "./components/FilePane";
 import { ServerDialog } from "./components/ServerDialog";
 import { ServerTree } from "./components/ServerTree";
@@ -39,6 +41,26 @@ const DEFAULT_AI_CONFIG: AiConfig = {
   systemPrompt:
     "你是一名谨慎的 Linux 运维助手。优先解释风险；先使用 risk_checker 评估动作，再调用合适的结构化工具。高风险操作必须等待人工确认，不要尝试绕过本地策略。",
   tools: DEFAULT_AI_TOOL_SETTINGS,
+};
+
+const SIDEBAR_MIN_WIDTH = 210;
+const SIDEBAR_MAX_WIDTH = 420;
+const AI_PANE_MIN_WIDTH = 300;
+const AI_PANE_MAX_WIDTH = 520;
+const COLUMN_SPLITTER_WIDTH = 7;
+
+const clampWidth = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+const initialSidebarWidth = () => {
+  if (window.innerWidth <= 1100) return SIDEBAR_MIN_WIDTH;
+  if (window.innerWidth <= 1180) return 232;
+  return 276;
+};
+
+const initialAiPaneWidth = () => {
+  if (window.innerWidth <= 1100) return AI_PANE_MIN_WIDTH;
+  if (window.innerWidth <= 1180) return 330;
+  return clampWidth(window.innerWidth * 0.29, 330, 410);
 };
 
 function useStoredState<T>(key: string, initialValue: T, serialize: (value: T) => unknown = (value) => value) {
@@ -76,6 +98,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarView, setSidebarView] = useState<"servers" | "transfers">("servers");
   const [aiOpen, setAiOpen] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
+  const [aiPaneWidth, setAiPaneWidth] = useState(initialAiPaneWidth);
   const [serverDialogOpen, setServerDialogOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ServerProfile>();
   const [serverDialogGroup, setServerDialogGroup] = useState<string>();
@@ -84,6 +108,7 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
   const cancelledTransfers = useRef(new Set<string>());
+  const appBodyRef = useRef<HTMLDivElement>(null);
 
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const activeServer = servers.find((server) => server.id === activeSession?.serverId);
@@ -388,6 +413,29 @@ export default function App() {
 
   const activeTransferCount = transfers.filter((task) => task.status === "queued" || task.status === "running" || task.status === "paused").length;
 
+  const resizeSidebar = (nextWidth: number) => {
+    const body = appBodyRef.current;
+    const rail = body?.querySelector<HTMLElement>(".activity-rail");
+    const operations = body?.querySelector<HTMLElement>(".workspace-session.active .operations-column");
+    const aiPane = body?.querySelector<HTMLElement>(".workspace-session.active .ai-pane");
+    const operationsMinWidth = operations ? Number.parseFloat(getComputedStyle(operations).minWidth) : 380;
+    const aiWidth = aiOpen ? aiPane?.getBoundingClientRect().width ?? aiPaneWidth : 34;
+    const availableWidth = body
+      ? body.getBoundingClientRect().width - (rail?.getBoundingClientRect().width ?? 48) - COLUMN_SPLITTER_WIDTH
+      : window.innerWidth - 48 - COLUMN_SPLITTER_WIDTH;
+    const maxWidth = Math.min(SIDEBAR_MAX_WIDTH, availableWidth - operationsMinWidth - aiWidth - (aiOpen ? COLUMN_SPLITTER_WIDTH : 0));
+    setSidebarWidth(clampWidth(nextWidth, SIDEBAR_MIN_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, maxWidth)));
+  };
+
+  const resizeAiPane = (nextWidth: number) => {
+    const session = appBodyRef.current?.querySelector<HTMLElement>(".workspace-session.active");
+    const operations = session?.querySelector<HTMLElement>(".operations-column");
+    const operationsMinWidth = operations ? Number.parseFloat(getComputedStyle(operations).minWidth) : 380;
+    const availableWidth = session?.getBoundingClientRect().width ?? window.innerWidth - 48 - sidebarWidth - COLUMN_SPLITTER_WIDTH;
+    const maxWidth = Math.min(AI_PANE_MAX_WIDTH, availableWidth - operationsMinWidth - COLUMN_SPLITTER_WIDTH);
+    setAiPaneWidth(clampWidth(nextWidth, AI_PANE_MIN_WIDTH, Math.max(AI_PANE_MIN_WIDTH, maxWidth)));
+  };
+
   return (
     <div className="app-shell">
       <header className="titlebar" data-tauri-drag-region>
@@ -404,7 +452,11 @@ export default function App() {
         </div>
       </header>
 
-      <div className="app-body">
+      <div
+        ref={appBodyRef}
+        className="app-body"
+        style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+      >
         <nav className="activity-rail" aria-label="主导航">
           <div className="activity-main">
             <button className={`activity-button ${sidebarView === "servers" ? "active" : ""}`} title="服务器" onClick={() => selectSidebar("servers")}><SquareTerminal size={18} /></button>
@@ -457,6 +509,16 @@ export default function App() {
             onCancel={(task) => { void cancelTransfer(task); }}
           />
         )}
+        {sidebarOpen && (
+          <ColumnSplitter
+            label="调整服务器栏宽度"
+            value={sidebarWidth}
+            min={SIDEBAR_MIN_WIDTH}
+            max={SIDEBAR_MAX_WIDTH}
+            pane="previous"
+            onChange={resizeSidebar}
+          />
+        )}
 
         <main className="workspace">
           <div className="session-strip">
@@ -505,7 +567,11 @@ export default function App() {
                 const server = servers.find((item) => item.id === session.serverId);
                 if (!server) return null;
                 return (
-                  <div className={`workspace-session ${session.id === activeSessionId ? "active" : ""}`} key={session.id}>
+                  <div
+                    className={`workspace-session ${session.id === activeSessionId ? "active" : ""}`}
+                    key={session.id}
+                    style={{ "--ai-pane-width": `${aiPaneWidth}px` } as CSSProperties}
+                  >
                     <section className="operations-column">
                       <TerminalPane session={session} server={server} onUpdate={(patch) => updateSession(session.id, patch)} />
                       <SystemDock
@@ -520,7 +586,19 @@ export default function App() {
                         )}
                       />
                     </section>
-                    {aiOpen && <AiPane session={session} server={server} config={aiConfig} onUpdate={(patch) => updateSession(session.id, patch)} onOpenSettings={() => setSettingsOpen(true)} />}
+                    {aiOpen && (
+                      <>
+                        <ColumnSplitter
+                          label="调整 AI 助手宽度"
+                          value={aiPaneWidth}
+                          min={AI_PANE_MIN_WIDTH}
+                          max={AI_PANE_MAX_WIDTH}
+                          pane="next"
+                          onChange={resizeAiPane}
+                        />
+                        <AiPane session={session} server={server} config={aiConfig} onUpdate={(patch) => updateSession(session.id, patch)} onOpenSettings={() => setSettingsOpen(true)} />
+                      </>
+                    )}
                     {!aiOpen && (
                       <button className="ai-reopen" title="打开 AI 助手" onClick={() => setAiOpen(true)}><Sparkles size={16} /></button>
                     )}

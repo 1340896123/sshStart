@@ -113,6 +113,12 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     autoCompress: config.autoCompress ?? true,
     tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...(config.tools ?? {}) },
   }));
+  const [savedValue, setSavedValue] = useState(() => ({
+    ...config,
+    maxOutputTokens: config.maxOutputTokens ?? 4096,
+    autoCompress: config.autoCompress ?? true,
+    tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...(config.tools ?? {}) },
+  }));
   const [models, setModels] = useState<string[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
@@ -122,6 +128,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
   const [error, setError] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSection>("model");
   const [navSearch, setNavSearch] = useState("");
+  const isDirty = JSON.stringify(value) !== JSON.stringify(savedValue);
 
   const loadModels = async () => {
     setLoadingModels(true);
@@ -144,6 +151,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
   };
 
   const save = async () => {
+    if (!isDirty) return;
     if (!value.endpoint.trim()) {
       setError("请填写接口地址");
       return;
@@ -179,14 +187,16 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     setSaving(true);
     setError("");
     try {
-      await onSave({
+      const nextValue = {
         ...value,
         endpoint: value.endpoint.trim(),
         apiKey: value.apiKey.trim(),
         model: value.model.trim(),
         tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...value.tools },
-      });
-      onClose();
+      };
+      await onSave(nextValue);
+      setValue(nextValue);
+      setSavedValue(nextValue);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -200,6 +210,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     try {
       await onRemoveSavedKey();
       setValue((current) => ({ ...current, apiKey: "" }));
+      setSavedValue((current) => ({ ...current, apiKey: "" }));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -255,12 +266,12 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
 
   return (
     <div className="settings-backdrop">
-      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape") { if (modelPickerOpen) setModelPickerOpen(false); else if (!busy) onClose(); } }}>
+      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape") { if (modelPickerOpen) setModelPickerOpen(false); else if (!busy && (!isDirty || window.confirm("设置有未保存的修改，确定要退出吗？"))) onClose(); } }}>
         <aside className="settings-sidebar">
           <div className="settings-sidebar-header">
             <span className="settings-brand-mark"><Bot size={17} /></span>
             <span><strong>Portico</strong><small>AI 设置</small></span>
-            <button className="icon-button quiet" type="button" disabled={busy} onClick={onClose} title="关闭设置" aria-label="关闭设置"><X size={16} /></button>
+            <button className="icon-button quiet" type="button" disabled={busy} onClick={() => { if (!isDirty || window.confirm("设置有未保存的修改，确定要退出吗？")) onClose(); }} title="关闭设置" aria-label="关闭设置"><X size={16} /></button>
           </div>
 
           <label className="settings-search">
@@ -290,9 +301,10 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
 
           <div className="settings-sidebar-footer">
             {error && <div className="settings-save-error" role="alert"><CircleAlert size={13} /><span>{error}</span></div>}
-            <button className="settings-save-button" type="submit" disabled={busy}>
+            {isDirty && <div className="settings-save-pending" role="status"><CircleAlert size={13} /><span>有未保存的修改</span></div>}
+            <button className={`settings-save-button ${isDirty ? "" : "clean"}`} type="submit" disabled={busy || !isDirty}>
               {saving ? <RefreshCw className="spinning" size={15} /> : <Save size={15} />}
-              {saving ? "保存中…" : "保存设置"}
+              {saving ? "保存中…" : isDirty ? "保存设置" : "已保存"}
             </button>
           </div>
         </aside>
