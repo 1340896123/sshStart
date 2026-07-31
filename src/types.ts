@@ -119,6 +119,7 @@ export interface AiMessage {
   role: MessageRole;
   content: string;
   reasoning?: string;
+  toolCalls?: AiToolResult[];
   command?: string;
   commandOutput?: string;
   toolName?: string;
@@ -203,7 +204,7 @@ export const DEFAULT_AI_TOOL_SETTINGS: AiToolSettings = {
   maxToolRounds: 6,
   maxOutputChars: 12000,
   commandTimeoutSeconds: 30,
-  allowMutatingTools: false,
+  allowMutatingTools: true,
 };
 
 export interface AiConfig {

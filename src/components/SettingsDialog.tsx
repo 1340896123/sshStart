@@ -160,28 +160,28 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
       setError("请填写或选择模型");
       return;
     }
-    if (!Number.isInteger(value.contextWindow) || value.contextWindow < 1024 || value.contextWindow > 2000000) {
-      setError("上下文大小需为 1,024–2,000,000 之间的整数");
+    if (!Number.isInteger(value.contextWindow) || value.contextWindow < 1024) {
+      setError("上下文大小需为不小于 1,024 的整数");
       return;
     }
-    if (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 256 || value.maxOutputTokens > value.contextWindow) {
-      setError("输出长度需为 256 到上下文大小之间的整数");
+    if (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 256) {
+      setError("输出长度需为不小于 256 的整数");
       return;
     }
     if (!Number.isFinite(value.temperature) || value.temperature < 0 || value.temperature > 2) {
       setError("温度需在 0–2 之间");
       return;
     }
-    if (!Number.isInteger(value.tools.maxToolRounds) || value.tools.maxToolRounds < 1 || value.tools.maxToolRounds > 12) {
-      setError("工具调用轮数需为 1–12 之间的整数");
+    if (!Number.isInteger(value.tools.maxToolRounds) || value.tools.maxToolRounds < 1) {
+      setError("工具调用轮数需为不小于 1 的整数");
       return;
     }
-    if (!Number.isInteger(value.tools.maxOutputChars) || value.tools.maxOutputChars < 1000 || value.tools.maxOutputChars > 100000) {
-      setError("工具输出上限需为 1,000–100,000 字符之间的整数");
+    if (!Number.isInteger(value.tools.maxOutputChars) || value.tools.maxOutputChars < 1000) {
+      setError("工具输出上限需为不小于 1,000 的整数");
       return;
     }
-    if (!Number.isInteger(value.tools.commandTimeoutSeconds) || value.tools.commandTimeoutSeconds < 5 || value.tools.commandTimeoutSeconds > 300) {
-      setError("命令超时需为 5–300 秒之间的整数");
+    if (!Number.isInteger(value.tools.commandTimeoutSeconds) || value.tools.commandTimeoutSeconds < 5) {
+      setError("命令超时需为不小于 5 秒的整数");
       return;
     }
     setSaving(true);
@@ -372,11 +372,11 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                   <header><strong>会话参数</strong><small>控制模型可读取的上下文和回答随机性</small></header>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>最大上下文长度</strong><small>模型可读取的最大上下文窗口，单位为 tokens</small></span>
-                    <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={1024} max={2000000} step={1024} value={value.contextWindow} onChange={(event) => setValue({ ...value, contextWindow: Number(event.target.value) })} /><em>tokens</em></span>
+                    <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={1024} step={1} value={value.contextWindow} onChange={(event) => setValue({ ...value, contextWindow: Number(event.target.value) })} /><em>tokens</em></span>
                   </label>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>输出长度</strong><small>单次回答最多生成的 tokens 数</small></span>
-                    <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={256} max={2000000} step={256} value={value.maxOutputTokens} onChange={(event) => setValue({ ...value, maxOutputTokens: Number(event.target.value) })} /><em>tokens</em></span>
+                    <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={256} step={1} value={value.maxOutputTokens} onChange={(event) => setValue({ ...value, maxOutputTokens: Number(event.target.value) })} /><em>tokens</em></span>
                   </label>
                   <div className="settings-config-row settings-toggle-row">
                     <span className="settings-row-copy"><strong>自动压缩上下文</strong><small>接近上限时先总结较早对话，再保留最近几轮继续请求</small></span>
@@ -403,11 +403,11 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                 <div className="settings-section-summary"><div><strong>工具权限</strong><small>只向模型暴露已启用的函数工具</small></div><span><ListTree size={14} /> {enabledToolCount}/{TOOL_GROUPS.flatMap((group) => group.tools).length}</span></div>
                 <div className="settings-tool-groups">{TOOL_GROUPS.filter((_, index) => index === 0 || index === 2).map(renderToolGroup)}</div>
                 <section className="settings-panel settings-policy-panel">
-                  <header><strong>执行策略</strong><small>限制每次工具链的运行边界和输出体积</small></header>
+                  <header><strong>执行策略</strong><small>配置每次工具链的运行轮次、输出体积和命令超时</small></header>
                   <div className="tool-policy-grid">
-                    <label className="field"><span>最大工具轮数 <small>每次请求</small></span><input type="number" min={1} max={12} step={1} value={value.tools.maxToolRounds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxToolRounds: Number(event.target.value) } })} /></label>
-                    <label className="field"><span>输出上限 <small>字符</small></span><input type="number" min={1000} max={100000} step={1000} value={value.tools.maxOutputChars} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxOutputChars: Number(event.target.value) } })} /></label>
-                    <label className="field"><span>命令超时 <small>秒</small></span><input type="number" min={5} max={300} step={5} value={value.tools.commandTimeoutSeconds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, commandTimeoutSeconds: Number(event.target.value) } })} /></label>
+                    <label className="field"><span>最大工具轮数 <small>每次请求</small></span><input type="number" min={1} step={1} value={value.tools.maxToolRounds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxToolRounds: Number(event.target.value) } })} /></label>
+                    <label className="field"><span>输出上限 <small>字符</small></span><input type="number" min={1000} step={1} value={value.tools.maxOutputChars} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxOutputChars: Number(event.target.value) } })} /></label>
+                    <label className="field"><span>命令超时 <small>秒</small></span><input type="number" min={5} step={1} value={value.tools.commandTimeoutSeconds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, commandTimeoutSeconds: Number(event.target.value) } })} /></label>
                   </div>
                 </section>
               </>

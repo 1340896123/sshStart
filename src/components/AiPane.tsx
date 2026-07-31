@@ -97,6 +97,28 @@ function presentStreamedResponse(content: string, providerReasoning: string) {
   };
 }
 
+const isApprovalPlaceholder = (toolCall: AiToolResult, approval?: AiApproval) =>
+  Boolean(
+    approval &&
+    toolCall.exitCode === 126 &&
+    toolCall.command === approval.command &&
+    toolCall.output.startsWith("BLOCKED:"),
+  );
+
+const toolCallsForMessage = (message: AiMessage): AiToolResult[] => {
+  const toolCalls = message.toolCalls?.length
+    ? message.toolCalls
+    : !message.command
+      ? []
+      : [{
+          tool: message.toolName ?? "execute_command",
+          command: message.command,
+          output: message.commandOutput ?? "",
+          exitCode: 0,
+      }];
+  return toolCalls.filter((toolCall) => !isApprovalPlaceholder(toolCall, message.approval));
+};
+
 export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Props) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -261,11 +283,30 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         settings: config.tools,
       });
       setMessages(messagesRef.current.map((message) => message.id === messageId
-        ? { ...message, command: result.command, commandOutput: result.output, toolName: result.tool, approvalState: "approved" }
+        ? {
+          ...message,
+          toolCalls: [...toolCallsForMessage(message), result],
+          command: result.command,
+          commandOutput: result.output,
+          toolName: result.tool,
+          approvalState: "approved",
+        }
         : message));
     } catch (reason) {
       setMessages(messagesRef.current.map((message) => message.id === messageId
-        ? { ...message, command: approval.command, commandOutput: String(reason), toolName: approval.tool, approvalState: "approved" }
+        ? {
+          ...message,
+          toolCalls: [...toolCallsForMessage(message), {
+            tool: approval.tool,
+            command: approval.command,
+            output: String(reason),
+            exitCode: 1,
+          }],
+          command: approval.command,
+          commandOutput: String(reason),
+          toolName: approval.tool,
+          approvalState: "approved",
+        }
         : message));
     } finally {
       approvalArgumentsRef.current.delete(messageId);
@@ -304,6 +345,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         setMessages([...pendingMessages, {
           id: assistantMessageId, role: "assistant", content: result.exitCode === 0 ? "命令已执行完成。" : "命令执行失败，请检查输出。",
           reasoning: "识别到显式 /run 指令，跳过模型推理并在当前 SSH 会话直接执行。",
+          toolCalls: [{ tool: "execute_command", command, output: `${result.stdout}${result.stderr}`, exitCode: result.exitCode }],
           toolName: "execute_command", command, commandOutput: `${result.stdout}${result.stderr}`, createdAt: assistantCreatedAt,
         }]);
       } else if (!isTauri()) {
@@ -313,6 +355,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           id: assistantMessageId, role: "assistant",
           content: "当前服务器运行状态正常。磁盘根分区使用率 42%，内存仍有充足余量，没有发现需要立即处理的告警。建议继续检查最近 30 分钟的服务错误日志。",
           reasoning: "先确认请求目标，再读取当前会话上下文；浏览器预览未连接真实 SSH，因此返回演示分析，未执行远程命令。",
+          toolCalls: [{ tool: "execute_command", command: "df -h / && free -h", output: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        80G   32G   44G  42% /\nMem:            7.7G  2.1G  4.8G", exitCode: 0 }],
           command: "df -h / && free -h",
           commandOutput: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        80G   32G   44G  42% /\nMem:            7.7G  2.1G  4.8G",
           createdAt: assistantCreatedAt,
@@ -359,12 +402,13 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             cutoff: Math.min(pendingMessages.length, previousCutoff + removedFromDisplay),
           };
         }
-        const lastTool = response.toolCalls[response.toolCalls.length - 1];
         const approval = response.approval;
+        const toolCalls = response.toolCalls.filter((toolCall) => !isApprovalPlaceholder(toolCall, approval));
+        const lastTool = toolCalls[toolCalls.length - 1];
         if (approval?.arguments) approvalArgumentsRef.current.set(assistantMessageId, approval.arguments);
         setMessages([...pendingMessages, {
           id: assistantMessageId, role: "assistant", content: response.content,
-          reasoning: response.reasoning, toolName: lastTool?.tool, command: lastTool?.command, commandOutput: lastTool?.output,
+          reasoning: response.reasoning, toolCalls, toolName: lastTool?.tool, command: lastTool?.command, commandOutput: lastTool?.output,
           approval: approval ? { tool: approval.tool, command: approval.command, reason: approval.reason } : undefined,
           approvalState: approval ? "pending" : undefined,
           usage: response.usage, createdAt: assistantCreatedAt,
@@ -426,9 +470,6 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         {session.aiMessages.map((message) => (
           <article className={`ai-message ${message.role}`} key={message.id}>
             <div className="message-meta">{message.role === "user" ? <User size={12} /> : <Bot size={12} />}<span>{message.role === "user" ? "你" : "Portico AI"}</span></div>
-            {message.role === "assistant"
-              ? <Suspense fallback={<div className="message-copy plain-text">{message.content}</div>}><MarkdownMessage content={message.content} /></Suspense>
-              : <div className="message-copy plain-text">{message.content}</div>}
             {message.reasoning && (
               <div className="reasoning-block">
                 <button onClick={() => setThinkingOpen((current) => ({ ...current, [message.id]: !current[message.id] }))}>
@@ -437,6 +478,13 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                 {thinkingOpen[message.id] && <p>{message.reasoning}</p>}
               </div>
             )}
+            {toolCallsForMessage(message).map((toolCall, index) => (
+              <div className="tool-call" key={`${message.id}-tool-${index}`}>
+                <div className="tool-call-header"><TerminalSquare size={12} /><span>{TOOL_LABELS[toolCall.tool] ?? toolCall.tool}</span><Check size={12} /><button title="复制命令" onClick={() => navigator.clipboard.writeText(toolCall.command)}><Copy size={11} /></button></div>
+                <code>$ {toolCall.command}</code>
+                {toolCall.output && <pre>{toolCall.output}</pre>}
+              </div>
+            ))}
             {message.approval && message.approvalState === "pending" && (
               <div className="approval-call">
                 <div className="approval-call-heading"><ShieldAlert size={14} /><span>需要人工确认</span><small>高危命令已暂停</small></div>
@@ -449,13 +497,9 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
               </div>
             )}
             {message.approvalState === "rejected" && <div className="approval-dismissed"><X size={12} />已拒绝执行该高危操作</div>}
-            {message.command && (
-              <div className="tool-call">
-                <div className="tool-call-header"><TerminalSquare size={12} /><span>{message.toolName ? TOOL_LABELS[message.toolName] ?? message.toolName : "执行命令"}</span><Check size={12} /><button title="复制命令" onClick={() => navigator.clipboard.writeText(message.command ?? "")}><Copy size={11} /></button></div>
-                <code>$ {message.command}</code>
-                {message.commandOutput && <pre>{message.commandOutput}</pre>}
-              </div>
-            )}
+            {message.role === "assistant"
+              ? <Suspense fallback={<div className="message-copy plain-text">{message.content}</div>}><MarkdownMessage content={message.content} /></Suspense>
+              : <div className="message-copy plain-text">{message.content}</div>}
           </article>
         ))}
         {loading && !streamingMessageId && (

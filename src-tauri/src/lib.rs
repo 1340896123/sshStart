@@ -3110,7 +3110,7 @@ fn ai_action<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 
 fn bounded_ai_command(command: &str, timeout_seconds: u32) -> String {
-    let timeout_seconds = timeout_seconds.clamp(5, 300);
+    let timeout_seconds = timeout_seconds.max(5);
     let quoted = shell_quote(command);
     format!(
         "if command -v timeout >/dev/null 2>&1; then timeout --signal=TERM {timeout_seconds}s sh -lc {quoted}; else sh -lc {quoted}; fi"
@@ -3677,13 +3677,11 @@ async fn ai_chat(
     allow_execute: bool,
     stream_id: String,
 ) -> Result<AiResponse, String> {
-    if !(1_024..=2_000_000).contains(&config.context_window) {
-        return Err("上下文大小需在 1,024–2,000,000 之间".to_string());
+    if config.context_window < 1_024 {
+        return Err("上下文大小需不小于 1,024".to_string());
     }
-    if !(256..=2_000_000).contains(&config.max_output_tokens)
-        || config.max_output_tokens > config.context_window
-    {
-        return Err("输出长度需在 256 到上下文大小之间".to_string());
+    if config.max_output_tokens < 256 {
+        return Err("输出长度需不小于 256".to_string());
     }
     if !config.temperature.is_finite() || !(0.0..=2.0).contains(&config.temperature) {
         return Err("温度需在 0–2 之间".to_string());
@@ -3744,7 +3742,7 @@ async fn ai_chat(
     let mut executed_tools = Vec::new();
     let stream_event_name = format!("ai-stream:{stream_id}");
 
-    for _ in 0..config.tools.max_tool_rounds.clamp(1, 12) {
+    for _ in 0..config.tools.max_tool_rounds.max(1) {
         trim_api_messages_for_context(&mut api_messages, config.context_window)?;
         let input_cost = api_messages.iter().map(api_message_cost).sum::<usize>();
         let output_budget = (config.context_window as usize)
@@ -3998,13 +3996,14 @@ pub fn run() {
 mod tests {
     use super::{
         ai_endpoint, ai_tool_definitions, ai_tool_is_mutating, ai_tool_mutation_is_authorized,
-        api_message_cost, apply_ai_stream_payload, copy_transfer_bytes, ensure_remote_revision,
-        estimate_tokens, extract_reasoning_summary, input_token_budget, is_high_risk_command,
-        local_transfer_temp_path, mode_string, parse_network_connections, parse_network_interfaces,
-        parse_processes, remote_parent_and_name, remote_transfer_temp_path, replace_local_file,
-        risk_reasons, shell_quote, tool_output_budget, trim_api_messages_for_context,
-        trim_messages_for_context, truncate_to_token_budget, AiInputMessage, AiStreamCompletion,
-        AiToolSettings, RemoteFileRevision, TransferControl,
+        api_message_cost, apply_ai_stream_payload, bounded_ai_command, copy_transfer_bytes,
+        ensure_remote_revision, estimate_tokens, extract_reasoning_summary, input_token_budget,
+        is_high_risk_command, local_transfer_temp_path, mode_string, parse_network_connections,
+        parse_network_interfaces, parse_processes, remote_parent_and_name,
+        remote_transfer_temp_path, replace_local_file, risk_reasons, shell_quote,
+        tool_output_budget, trim_api_messages_for_context, trim_messages_for_context,
+        truncate_to_token_budget, AiInputMessage, AiStreamCompletion, AiToolSettings,
+        RemoteFileRevision, TransferControl,
     };
     use serde_json::{json, Value};
 
@@ -4178,6 +4177,12 @@ mod tests {
             .iter()
             .any(|reason| reason.contains("防火墙")));
         assert!(!is_high_risk_command("rm -rf /tmp/old-release"));
+    }
+
+    #[test]
+    fn preserves_configured_ai_command_timeout_without_upper_cap() {
+        assert!(bounded_ai_command("true", 600).contains(" 600s "));
+        assert!(bounded_ai_command("true", 1).contains(" 5s "));
     }
 
     #[test]
