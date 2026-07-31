@@ -208,8 +208,6 @@ struct AiConfig {
     max_output_tokens: u32,
     #[serde(default = "default_auto_compress")]
     auto_compress: bool,
-    #[serde(default)]
-    supports_images: bool,
     #[serde(default = "default_temperature")]
     temperature: f32,
     system_prompt: String,
@@ -863,6 +861,18 @@ fn store_ai_key(api_key: String) -> Result<(), String> {
     keyring_entry("ai:api-key")?
         .set_password(&api_key)
         .map_err(|error| format!("保存 AI API Key 失败: {error}"))
+}
+
+fn delete_ai_key_from_keyring(account: &str) -> Result<(), String> {
+    match keyring_entry(account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("删除 AI API Key 失败: {error}")),
+    }
+}
+
+#[tauri::command]
+fn delete_ai_key() -> Result<(), String> {
+    delete_ai_key_from_keyring("ai:api-key")
 }
 
 fn mode_string(mode: Option<u32>, is_dir: bool) -> String {
@@ -3221,12 +3231,15 @@ fn process_command(arguments: &Value) -> Result<String, String> {
 
 fn ai_tool_is_mutating(name: &str, arguments: &Value) -> bool {
     match name {
-        "write_file" | "sftp_upload" | "pty_interaction" => true,
-        "background_task" => arguments
-            .get("action")
-            .and_then(Value::as_str)
-            .map(|action| action == "stop")
-            .unwrap_or(true),
+        "execute_command" | "run_ssh_command" | "write_file" | "sftp_upload" | "sftp_download"
+        | "pty_interaction" => true,
+        "background_task" => matches!(
+            arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("start"),
+            "start" | "stop"
+        ),
         "process_manager" => arguments.get("action").and_then(Value::as_str) == Some("terminate"),
         "docker_manager" => matches!(
             arguments.get("action").and_then(Value::as_str),
@@ -3238,6 +3251,14 @@ fn ai_tool_is_mutating(name: &str, arguments: &Value) -> bool {
         ),
         _ => false,
     }
+}
+
+fn ai_tool_mutation_is_authorized(
+    settings: &AiToolSettings,
+    name: &str,
+    arguments: &Value,
+) -> bool {
+    !ai_tool_is_mutating(name, arguments) || settings.allow_mutating_tools
 }
 
 fn ai_tool_command_for_risk(name: &str, arguments: &Value) -> Option<String> {
@@ -3624,6 +3645,9 @@ async fn approve_ai_tool(
     if !ai_tool_enabled(&settings, &tool) {
         return Err(format!("AI 工具 {tool} 未在设置中启用"));
     }
+    if !ai_tool_mutation_is_authorized(&settings, &tool, &arguments) {
+        return Err("变更型工具未获设置授权，请在 AI 设置中打开“允许变更型工具”。".to_string());
+    }
     if tool == "write_file"
         && required_ai_arg(&arguments, "path")
             .map(protected_write_path)
@@ -3675,13 +3699,8 @@ async fn ai_chat(
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|error| format!("AI 客户端初始化失败: {error}"))?;
-    let image_capability = if config.supports_images {
-        "支持"
-    } else {
-        "不支持"
-    };
     let system = format!(
-        "{}\n当前 SSH 目标为 {}@{}:{}。当前模型配置为{image_capability}图片输入。已启用的工具由本地设置决定；变更型工具允许状态为{}。先调用 risk_checker 检查高风险动作，命中后必须等待客户端人工确认。最终回答开头必须使用 <reasoning_summary>...</reasoning_summary> 给出简明的判断依据与执行计划；不要披露隐藏思维链。",
+        "{}\n当前 SSH 目标为 {}@{}:{}。客户端当前不支持图片输入。已启用的工具由本地设置决定；变更型工具允许状态为{}。先调用 risk_checker 检查高风险动作，命中后必须等待客户端人工确认。最终回答开头必须使用 <reasoning_summary>...</reasoning_summary> 给出简明的判断依据与执行计划；不要披露隐藏思维链。",
         config.system_prompt,
         server.username,
         server.host,
@@ -3785,7 +3804,6 @@ async fn ai_chat(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-
         if tool_calls.is_empty() {
             let (content, summary) = extract_reasoning_summary(&completion.content);
             let provider_reasoning =
@@ -3838,7 +3856,7 @@ async fn ai_chat(
                 return Err(format!("AI 工具 {tool_name} 未在设置中启用"));
             }
 
-            if ai_tool_is_mutating(&tool_name, &parsed) && !config.tools.allow_mutating_tools {
+            if !ai_tool_mutation_is_authorized(&config.tools, &tool_name, &parsed) {
                 let result = ai_blocked_result(
                     "BLOCKED: 变更型工具未获设置授权，请在 AI 设置中打开“允许变更型工具”。",
                 );
@@ -3944,6 +3962,7 @@ pub fn run() {
             store_server_secret,
             delete_server_secret,
             store_ai_key,
+            delete_ai_key,
             start_terminal,
             terminal_input,
             terminal_resize,
@@ -3978,14 +3997,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_endpoint, ai_tool_definitions, api_message_cost, apply_ai_stream_payload,
-        copy_transfer_bytes, ensure_remote_revision, estimate_tokens, extract_reasoning_summary,
-        input_token_budget, is_high_risk_command, local_transfer_temp_path, mode_string,
-        parse_network_connections, parse_network_interfaces, parse_processes,
-        remote_parent_and_name, remote_transfer_temp_path, replace_local_file, risk_reasons,
-        shell_quote, tool_output_budget, trim_api_messages_for_context, trim_messages_for_context,
-        truncate_to_token_budget, AiInputMessage, AiStreamCompletion, AiToolSettings,
-        RemoteFileRevision, TransferControl,
+        ai_endpoint, ai_tool_definitions, ai_tool_is_mutating, ai_tool_mutation_is_authorized,
+        api_message_cost, apply_ai_stream_payload, copy_transfer_bytes, ensure_remote_revision,
+        estimate_tokens, extract_reasoning_summary, input_token_budget, is_high_risk_command,
+        local_transfer_temp_path, mode_string, parse_network_connections, parse_network_interfaces,
+        parse_processes, remote_parent_and_name, remote_transfer_temp_path, replace_local_file,
+        risk_reasons, shell_quote, tool_output_budget, trim_api_messages_for_context,
+        trim_messages_for_context, truncate_to_token_budget, AiInputMessage, AiStreamCompletion,
+        AiToolSettings, RemoteFileRevision, TransferControl,
     };
     use serde_json::{json, Value};
 
@@ -4091,6 +4110,23 @@ mod tests {
     }
 
     #[test]
+    fn removes_saved_ai_key_from_keyring() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let account = format!("ai:key-removal-regression-probe-{nonce}");
+        let entry = super::keyring_entry(&account).expect("keyring entry failed");
+        entry
+            .set_password("ai-key-removal-probe")
+            .expect("keyring probe write failed");
+
+        super::delete_ai_key_from_keyring(&account).expect("keyring probe cleanup failed");
+
+        assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+    }
+
+    #[test]
     #[ignore = "requires PORTICO_TEST_* SSH credentials and network access"]
     fn connects_through_configured_jump_host() {
         let required = |name: &str| std::env::var(name).expect("missing jump-host test variable");
@@ -4157,6 +4193,44 @@ mod tests {
         assert!(names.contains(&"risk_checker"));
         assert!(!names.contains(&"write_file"));
         assert!(!names.contains(&"pty_interaction"));
+    }
+
+    #[test]
+    fn blocks_mutation_capable_ai_tools_by_default() {
+        let settings = AiToolSettings::default();
+        assert!(!settings.allow_mutating_tools);
+
+        let mutation_capable_calls = vec![
+            ("execute_command", json!({ "command": "df -h" })),
+            ("run_ssh_command", json!({ "command": "uname -a" })),
+            (
+                "background_task",
+                json!({ "action": "start", "command": "sleep 60" }),
+            ),
+            ("background_task", json!({ "command": "sleep 60" })),
+            ("background_task", json!({ "action": "stop", "pid": 42 })),
+            (
+                "pty_interaction",
+                json!({ "command": "passwd", "input": "secret" }),
+            ),
+            (
+                "sftp_download",
+                json!({ "remotePath": "/srv/report", "localPath": "C:/tmp/report" }),
+            ),
+        ];
+        for (tool_name, arguments) in mutation_capable_calls {
+            assert!(ai_tool_is_mutating(tool_name, &arguments));
+            assert!(!ai_tool_mutation_is_authorized(
+                &settings, tool_name, &arguments
+            ));
+        }
+
+        let read_file = json!({ "path": "/etc/hostname" });
+        assert!(ai_tool_mutation_is_authorized(
+            &settings,
+            "read_file",
+            &read_file
+        ));
     }
 
     #[test]

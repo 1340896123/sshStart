@@ -3764,6 +3764,11 @@ body.is-resizing-rows .system-dock {
   max-width: 260px;
 }
 
+.settings-static-value {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .settings-input:focus,
 .settings-prompt-field textarea:focus {
   border-color: var(--accent);

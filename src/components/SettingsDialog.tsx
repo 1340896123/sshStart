@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
@@ -12,7 +12,6 @@ import {
   FilePenLine,
   FolderTree,
   Gauge,
-  Image,
   KeyRound,
   ListTree,
   Network,
@@ -25,6 +24,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   SquareTerminal,
+  Trash2,
   Upload,
   Wrench,
   X,
@@ -35,6 +35,7 @@ import { DEFAULT_AI_TOOL_SETTINGS, type AiConfig, type AiToolKey } from "../type
 interface Props {
   config: AiConfig;
   onSave: (config: AiConfig) => void | Promise<void>;
+  onRemoveSavedKey: () => void | Promise<void>;
   onClose: () => void;
 }
 
@@ -105,7 +106,7 @@ const SETTINGS_SECTIONS: Array<{
   { id: "security", label: "安全策略", description: "高危拦截与变更边界", icon: ShieldCheck },
 ];
 
-export function SettingsDialog({ config, onSave, onClose }: Props) {
+export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Props) {
   const [value, setValue] = useState(() => ({
     ...config,
     maxOutputTokens: config.maxOutputTokens ?? 4096,
@@ -117,6 +118,7 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
   const [modelSearch, setModelSearch] = useState("");
   const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [removingKey, setRemovingKey] = useState(false);
   const [error, setError] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSection>("model");
   const [navSearch, setNavSearch] = useState("");
@@ -192,14 +194,37 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
     }
   };
 
+  const removeSavedKey = async () => {
+    setRemovingKey(true);
+    setError("");
+    try {
+      await onRemoveSavedKey();
+      setValue((current) => ({ ...current, apiKey: "" }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setRemovingKey(false);
+    }
+  };
+
   const enabledToolCount = TOOL_GROUPS
     .flatMap((group) => group.tools)
     .filter((tool) => value.tools[tool.key]).length;
-  const activeSectionMeta = SETTINGS_SECTIONS.find((section) => section.id === activeSection) ?? SETTINGS_SECTIONS[0];
+  const busy = saving || removingKey;
   const visibleSections = SETTINGS_SECTIONS.filter((section) => {
     const query = navSearch.trim().toLocaleLowerCase();
     return !query || `${section.label} ${section.description}`.toLocaleLowerCase().includes(query);
   });
+  const visibleActiveSection = visibleSections.some((section) => section.id === activeSection)
+    ? activeSection
+    : visibleSections[0]?.id;
+  const activeSectionMeta = SETTINGS_SECTIONS.find((section) => section.id === visibleActiveSection);
+
+  useEffect(() => {
+    if (!visibleSections.some((section) => section.id === activeSection) && visibleSections[0]) {
+      setActiveSection(visibleSections[0].id);
+    }
+  }, [activeSection, visibleSections]);
 
   const renderToolGroup = (group: (typeof TOOL_GROUPS)[number]) => {
     const GroupIcon = group.icon;
@@ -230,12 +255,12 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
 
   return (
     <div className="settings-backdrop">
-      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape") { if (modelPickerOpen) setModelPickerOpen(false); else onClose(); } }}>
+      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape") { if (modelPickerOpen) setModelPickerOpen(false); else if (!busy) onClose(); } }}>
         <aside className="settings-sidebar">
           <div className="settings-sidebar-header">
             <span className="settings-brand-mark"><Bot size={17} /></span>
             <span><strong>Portico</strong><small>AI 设置</small></span>
-            <button className="icon-button quiet" type="button" onClick={onClose} title="关闭设置" aria-label="关闭设置"><X size={16} /></button>
+            <button className="icon-button quiet" type="button" disabled={busy} onClick={onClose} title="关闭设置" aria-label="关闭设置"><X size={16} /></button>
           </div>
 
           <label className="settings-search">
@@ -265,7 +290,7 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
 
           <div className="settings-sidebar-footer">
             {error && <div className="settings-save-error" role="alert"><CircleAlert size={13} /><span>{error}</span></div>}
-            <button className="settings-save-button" type="submit" disabled={saving}>
+            <button className="settings-save-button" type="submit" disabled={busy}>
               {saving ? <RefreshCw className="spinning" size={15} /> : <Save size={15} />}
               {saving ? "保存中…" : "保存设置"}
             </button>
@@ -274,30 +299,45 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
 
         <main className="settings-page">
           <header className="settings-page-header">
-            <div>
-              <span>AI 配置</span>
-              <h2 id="settings-page-title">{activeSectionMeta.label}</h2>
-              <p>{activeSectionMeta.description}</p>
-            </div>
+            {activeSectionMeta ? (
+              <div>
+                <span>AI 配置</span>
+                <h2 id="settings-page-title">{activeSectionMeta.label}</h2>
+                <p>{activeSectionMeta.description}</p>
+              </div>
+            ) : (
+              <div>
+                <span>AI 配置</span>
+                <h2 id="settings-page-title">没有匹配的设置</h2>
+                <p>尝试使用其他关键词搜索。</p>
+              </div>
+            )}
           </header>
 
           <div className="settings-page-scroll">
-            {activeSection === "model" && (
+            {visibleActiveSection === "model" && (
               <>
                 <section className="settings-panel">
-                  <header><strong>模型服务</strong><small>配置 OpenAI 兼容的大语言模型接入</small></header>
+                  <header><strong>模型服务</strong><small>配置 OpenAI 兼容的大语言模型接入；当前仅支持文本输入</small></header>
                   <div className="settings-config-row">
-                    <span className="settings-row-copy"><strong>Provider</strong><small>选择 LLM 提供商</small></span>
-                    <select className="settings-input" defaultValue="openai" aria-label="Provider"><option value="openai">OpenAI 兼容</option></select>
+                    <span className="settings-row-copy"><strong>Provider</strong><small>当前版本固定使用 OpenAI 兼容 Chat Completions 接口</small></span>
+                    <span className="settings-static-value">OpenAI 兼容</span>
                   </div>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>Base URL</strong><small>API 基础地址</small></span>
                     <input className="settings-input settings-mono-input" value={value.endpoint} onChange={(event) => setValue({ ...value, endpoint: event.target.value })} />
                   </label>
                   <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>API Key</strong><small>密钥保存到系统凭据库</small></span>
+                    <span className="settings-row-copy"><strong>API Key</strong><small>密钥保存到系统凭据库；留空并保存会保留已保存的密钥</small></span>
                     <input className="settings-input settings-mono-input" type="password" autoComplete="off" value={value.apiKey} onChange={(event) => setValue({ ...value, apiKey: event.target.value })} placeholder="sk-..." />
                   </label>
+                  <div className="settings-config-row">
+                    <span className="settings-row-copy"><strong>移除已保存密钥</strong><small>从系统凭据库永久删除当前密钥；此操作不能通过清空输入框完成</small></span>
+                    <button className="danger-button" type="button" disabled={busy} onClick={() => void removeSavedKey()}>
+                      {removingKey ? <RefreshCw className="spinning" size={14} /> : <Trash2 size={14} />}
+                      {removingKey ? "移除中…" : "移除已保存密钥"}
+                    </button>
+                  </div>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>Model</strong><small>{models.length > 0 ? `已获取 ${models.length} 个模型` : "支持手动输入模型名称"}</small></span>
                     <span className="settings-model-control">
@@ -308,21 +348,13 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
                       </button>
                     </span>
                   </label>
-                  <div className="settings-config-row settings-toggle-row">
-                    <span className="settings-row-copy"><strong>视觉 / 支持图片</strong><small>允许把粘贴或拖入的图片发送给模型</small></span>
-                    <label className="settings-toggle-control">
-                      <input type="checkbox" checked={value.supportsImages} onChange={(event) => setValue({ ...value, supportsImages: event.target.checked })} />
-                      <span className="switch" aria-hidden="true" />
-                      <span><Image size={14} />允许向模型发送图片</span>
-                    </label>
-                  </div>
                 </section>
 
                 <a className="settings-page-link" href="https://platform.openai.com/docs" target="_blank" rel="noreferrer">查看 OpenAI 兼容接口格式 <ExternalLink size={13} /></a>
               </>
             )}
 
-            {activeSection === "agent" && (
+            {visibleActiveSection === "agent" && (
               <>
                 <section className="settings-panel">
                   <header><strong>会话参数</strong><small>控制模型可读取的上下文和回答随机性</small></header>
@@ -354,7 +386,7 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
               </>
             )}
 
-            {activeSection === "tools" && (
+            {visibleActiveSection === "tools" && (
               <>
                 <div className="settings-section-summary"><div><strong>工具权限</strong><small>只向模型暴露已启用的函数工具</small></div><span><ListTree size={14} /> {enabledToolCount}/{TOOL_GROUPS.flatMap((group) => group.tools).length}</span></div>
                 <div className="settings-tool-groups">{TOOL_GROUPS.filter((_, index) => index === 0 || index === 2).map(renderToolGroup)}</div>
@@ -369,14 +401,14 @@ export function SettingsDialog({ config, onSave, onClose }: Props) {
               </>
             )}
 
-            {activeSection === "transfer" && (
+            {visibleActiveSection === "transfer" && (
               <>
                 <div className="settings-section-summary"><div><strong>文件与 SFTP</strong><small>控制模型可使用的远端文件和传输能力</small></div></div>
                 <div className="settings-tool-groups">{renderToolGroup(TOOL_GROUPS[1])}</div>
               </>
             )}
 
-            {activeSection === "security" && (
+            {visibleActiveSection === "security" && (
               <>
                 <div className="settings-section-summary"><div><strong>安全与知识</strong><small>在执行前检查风险并复用经过整理的命令片段</small></div></div>
                 <div className="settings-tool-groups">{renderToolGroup(TOOL_GROUPS[3])}</div>

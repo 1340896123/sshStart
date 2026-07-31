@@ -213,7 +213,6 @@ export interface AiConfig {
   contextWindow: number;
   maxOutputTokens: number;
   autoCompress: boolean;
-  supportsImages: boolean;
   temperature: number;
   systemPrompt: string;
   tools: AiToolSettings;

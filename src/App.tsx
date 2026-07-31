@@ -35,7 +35,6 @@ const DEFAULT_AI_CONFIG: AiConfig = {
   contextWindow: 128000,
   maxOutputTokens: 4096,
   autoCompress: true,
-  supportsImages: true,
   temperature: 0.2,
   systemPrompt:
     "你是一名谨慎的 Linux 运维助手。优先解释风险；先使用 risk_checker 评估动作，再调用合适的结构化工具。高风险操作必须等待人工确认，不要尝试绕过本地策略。",
@@ -204,6 +203,13 @@ export default function App() {
       await invoke("store_ai_key", { apiKey: next.apiKey.trim() });
     }
     setAiConfig(next);
+  };
+
+  const removeSavedAiKey = async () => {
+    if (isTauri()) {
+      await invoke("delete_ai_key");
+    }
+    setAiConfig((current) => ({ ...current, apiKey: "" }));
   };
 
   const startTransfer = async (
@@ -535,7 +541,7 @@ export default function App() {
           onDelete={editingServer ? () => { deleteServer(editingServer.id); setServerDialogOpen(false); setEditingServer(undefined); } : undefined}
         />
       )}
-      {settingsOpen && <SettingsDialog config={aiConfig} onSave={saveAiConfig} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsDialog config={aiConfig} onSave={saveAiConfig} onRemoveSavedKey={removeSavedAiKey} onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }
