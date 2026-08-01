@@ -130,6 +130,7 @@ export type AiStreamEventType = "message_delta" | "action_update";
 export interface AiReasoning {
   id: string;
   content: string;
+  sequence?: number;
 }
 
 export interface AiMessage {
@@ -163,6 +164,7 @@ export interface AiApproval {
 export interface AiToolResult {
   id: string;
   callId?: string;
+  sequence?: number;
   tool: string;
   command: string;
   output: string;

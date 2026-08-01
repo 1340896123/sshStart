@@ -177,13 +177,15 @@ const reasoningsForMessage = (message: AiMessage): AiReasoning[] => {
     : [];
 };
 
-const mergeReasoning = (reasonings: AiReasoning[], id: string, content: string): AiReasoning[] => {
+const mergeReasoning = (reasonings: AiReasoning[], id: string, content: string, sequence?: number): AiReasoning[] => {
   if (!content.trim()) return reasonings;
   const existingIndex = reasonings.findIndex((reasoning) => reasoning.id === id);
   if (existingIndex >= 0) {
-    return reasonings.map((reasoning, index) => index === existingIndex ? { ...reasoning, content } : reasoning);
+    return reasonings.map((reasoning, index) => index === existingIndex
+      ? { ...reasoning, content, sequence: reasoning.sequence ?? sequence }
+      : reasoning);
   }
-  return [...reasonings, { id, content }];
+  return [...reasonings, { id, content, sequence }];
 };
 
 function presentStreamedResponse(content: string, providerReasoning: string) {
@@ -240,9 +242,29 @@ const toolCallsForMessage = (message: AiMessage): AiToolResult[] => {
     .map((toolCall, index) => normalizeToolCall(toolCall, `${message.id}-tool-${index}`, message.createdAt));
 };
 
+type AiTimelineItem =
+  | { kind: "reasoning"; reasoning: AiReasoning; index: number; sequence: number }
+  | { kind: "tool"; toolCall: AiToolResult; index: number; sequence: number };
+
+const timelineForMessage = (reasonings: AiReasoning[], toolCalls: AiToolResult[]): AiTimelineItem[] => [
+  ...reasonings.map((reasoning, index): AiTimelineItem => ({
+    kind: "reasoning",
+    reasoning,
+    index,
+    sequence: reasoning.sequence ?? index * 2,
+  })),
+  ...toolCalls.map((toolCall, index): AiTimelineItem => ({
+    kind: "tool",
+    toolCall,
+    index,
+    sequence: toolCall.sequence ?? index * 2 + 1,
+  })),
+].sort((left, right) => left.sequence - right.sequence || left.index - right.index);
+
 const mergeStreamedToolCall = (
   toolCalls: AiToolResult[],
   update: NonNullable<AiStreamDelta["toolCall"]>,
+  sequence?: number,
 ) => {
   const updateId = update.id || update.callId || uid("ai-action");
   const existingIndex = toolCalls.findIndex((toolCall) => toolCall.id === updateId || toolCall.callId === update.callId);
@@ -253,6 +275,7 @@ const mergeStreamedToolCall = (
   const next: AiToolResult = {
     id: updateId,
     callId: update.callId ?? existing?.callId,
+    sequence: existing?.sequence ?? sequence,
     tool: update.tool || existing?.tool || "execute_command",
     command: update.command || existing?.command || update.tool,
     output: update.output ?? existing?.output ?? "",
@@ -789,6 +812,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         const actionId = uid("ai-action");
         const runningToolCall: AiToolResult = {
           id: actionId,
+          sequence: 1,
           tool: "execute_command",
           command,
           output: "",
@@ -805,6 +829,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           reasonings: [{
             id: uid("ai-reasoning"),
             content: "识别到显式 /run 指令，跳过模型推理并在当前 SSH 会话直接执行。",
+            sequence: 0,
           }],
           toolCalls: streamedToolCalls,
         });
@@ -841,9 +866,11 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           reasonings: [{
             id: uid("ai-reasoning"),
             content: "先确认请求目标，再读取当前会话上下文；浏览器预览未连接真实 SSH，因此返回演示分析，未执行远程命令。",
+            sequence: 0,
           }],
           toolCalls: [{
             id: uid("ai-action"),
+            sequence: 1,
             tool: "execute_command",
             command: "df -h / && free -h",
             output: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        80G   32G   44G  42% /\nMem:            7.7G  2.1G  4.8G",
@@ -865,7 +892,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         let streamedReasoning = "";
         let streamedReasonings: AiReasoning[] = [];
         let activeReasoningId: string | undefined;
+        let activeReasoningSequence: number | undefined;
         let responseReasoningId: string | undefined;
+        let responseReasoningSequence: number | undefined;
+        let nextTimelineSequence = 0;
         let streamFrame: number | undefined;
         let latestStreamUpdatedAt = assistantCreatedAt;
         const flushStream = () => {
@@ -873,8 +903,12 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           const visible = presentStreamedResponse(streamedContent, streamedReasoning);
           let visibleReasonings = streamedReasonings;
           if (visibleReasonings.length === 0 && visible.reasoning) {
-            responseReasoningId ??= uid("ai-reasoning");
-            visibleReasonings = mergeReasoning(visibleReasonings, responseReasoningId, visible.reasoning);
+            if (!responseReasoningId) {
+              responseReasoningId = uid("ai-reasoning");
+              responseReasoningSequence = nextTimelineSequence;
+              nextTimelineSequence += 1;
+            }
+            visibleReasonings = mergeReasoning(visibleReasonings, responseReasoningId, visible.reasoning, responseReasoningSequence);
           }
           if (!visible.content && visibleReasonings.length === 0 && streamedToolCalls.length === 0) return;
           updateMessage(assistantMessageId, {
@@ -898,18 +932,26 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             const reasoningDelta = payload.reasoning ?? "";
             streamedReasoning += reasoningDelta;
             if (reasoningDelta) {
-              activeReasoningId ??= uid("ai-reasoning");
+              if (!activeReasoningId) {
+                activeReasoningId = uid("ai-reasoning");
+                activeReasoningSequence = nextTimelineSequence;
+                nextTimelineSequence += 1;
+              }
               const currentReasoning = streamedReasonings.find((reasoning) => reasoning.id === activeReasoningId);
               streamedReasonings = mergeReasoning(
                 streamedReasonings,
                 activeReasoningId,
                 `${currentReasoning?.content ?? ""}${reasoningDelta}`,
+                activeReasoningSequence,
               );
             }
           }
           if (eventType === "action_update" && payload.toolCall) {
+            const previousToolCallCount = streamedToolCalls.length;
+            streamedToolCalls = mergeStreamedToolCall(streamedToolCalls, payload.toolCall, nextTimelineSequence);
+            if (streamedToolCalls.length > previousToolCallCount) nextTimelineSequence += 1;
             activeReasoningId = undefined;
-            streamedToolCalls = mergeStreamedToolCall(streamedToolCalls, payload.toolCall);
+            activeReasoningSequence = undefined;
           }
           latestStreamUpdatedAt = Math.max(latestStreamUpdatedAt, payload.toolCall?.updatedAt ?? Date.now());
           scheduleStreamFlush();
@@ -946,14 +988,24 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         const approval = response.approval;
         const responseToolCalls = response.toolCalls
           .filter((toolCall) => !isApprovalPlaceholder(toolCall, approval))
-          .map((toolCall, index) => normalizeToolCall(toolCall, `${assistantMessageId}-tool-${index}`, assistantCreatedAt));
+          .map((toolCall, index) => {
+            const normalized = normalizeToolCall(toolCall, `${assistantMessageId}-tool-${index}`, assistantCreatedAt);
+            if (streamedToolCalls.some((streamedToolCall) => streamedToolCall.id === normalized.id)) return normalized;
+            const sequenced = { ...normalized, sequence: nextTimelineSequence };
+            nextTimelineSequence += 1;
+            return sequenced;
+          });
         streamedToolCalls = mergeToolCalls(streamedToolCalls, responseToolCalls);
         const toolCalls = streamedToolCalls;
         const lastTool = toolCalls[toolCalls.length - 1];
         const lastReasoning = streamedReasonings[streamedReasonings.length - 1];
         if (response.reasoning && lastReasoning?.content.trim() !== response.reasoning.trim()) {
-          responseReasoningId ??= uid("ai-reasoning");
-          streamedReasonings = mergeReasoning(streamedReasonings, responseReasoningId, response.reasoning);
+          if (!responseReasoningId) {
+            responseReasoningId = uid("ai-reasoning");
+            responseReasoningSequence = nextTimelineSequence;
+            nextTimelineSequence += 1;
+          }
+          streamedReasonings = mergeReasoning(streamedReasonings, responseReasoningId, response.reasoning, responseReasoningSequence);
         }
         if (approval?.arguments) approvalArgumentsRef.current.set(assistantMessageId, approval.arguments);
         const completedAt = Date.now();
@@ -1050,6 +1102,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           const updatedAt = message.updatedAt ?? message.completedAt ?? message.createdAt;
           const toolCalls = toolCallsForMessage(message);
           const reasonings = reasoningsForMessage(message);
+          const timeline = timelineForMessage(reasonings, toolCalls);
           return (
           <article className={`ai-message ${message.role} status-${status} ${streamingMessageId === message.id ? "streaming" : ""}`} data-message-type={type} key={message.id}>
             <div className="message-meta">
@@ -1075,23 +1128,22 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                 ))}
               </div>
             ) : null}
-            {reasonings.map((reasoning, index) => (
-              <div className="reasoning-block" data-reasoning-id={reasoning.id} key={reasoning.id}>
+            {timeline.map((item) => item.kind === "reasoning" ? (
+              <div className="reasoning-block" data-reasoning-id={item.reasoning.id} key={`reasoning-${item.reasoning.id}`}>
                 <button
-                  aria-controls={`${reasoning.id}-content`}
-                  aria-expanded={Boolean(thinkingOpen[reasoning.id])}
-                  onClick={() => setThinkingOpen((current) => ({ ...current, [reasoning.id]: !current[reasoning.id] }))}
+                  aria-controls={`${item.reasoning.id}-content`}
+                  aria-expanded={Boolean(thinkingOpen[item.reasoning.id])}
+                  onClick={() => setThinkingOpen((current) => ({ ...current, [item.reasoning.id]: !current[item.reasoning.id] }))}
                 >
                   <BrainCircuit size={13} />
-                  <span>{reasonings.length > 1 ? `深度思考 ${index + 1}` : "深度思考"}</span>
-                  <code title={reasoning.id}>{shortActionId(reasoning.id)}</code>
-                  {thinkingOpen[reasoning.id] ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                  <span>{reasonings.length > 1 ? `深度思考 ${item.index + 1}` : "深度思考"}</span>
+                  <code title={item.reasoning.id}>{shortActionId(item.reasoning.id)}</code>
+                  {thinkingOpen[item.reasoning.id] ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                 </button>
-                {thinkingOpen[reasoning.id] && <p id={`${reasoning.id}-content`}>{reasoning.content}</p>}
+                {thinkingOpen[item.reasoning.id] && <p id={`${item.reasoning.id}-content`}>{item.reasoning.content}</p>}
               </div>
-            ))}
-            {toolCalls.map((toolCall) => (
-              <ToolCallCard toolCall={toolCall} key={toolCall.id} />
+            ) : (
+              <ToolCallCard toolCall={item.toolCall} key={`tool-${item.toolCall.id}`} />
             ))}
             {message.role === "assistant" && !message.content && reasonings.length === 0 && toolCalls.length === 0 && (status === "started" || status === "running") && (
               <div className="thinking-progress"><span className="thinking-pulse" /><span>{status === "started" ? "开始分析当前会话" : "正在分析当前会话"}</span></div>
