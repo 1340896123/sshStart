@@ -428,7 +428,7 @@ struct AiResponse {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiStreamDelta {
-    event_type: Option<String>,
+    event_type: String,
     content: Option<String>,
     reasoning: Option<String>,
     tool_call: Option<AiToolStreamUpdate>,
@@ -438,7 +438,6 @@ struct AiStreamDelta {
 #[serde(rename_all = "camelCase")]
 struct AiToolStreamUpdate {
     id: String,
-    call_id: String,
     phase: String,
     status: String,
     tool: String,
@@ -2715,7 +2714,7 @@ fn apply_ai_stream_payload(
     }
 
     Ok(AiStreamDelta {
-        event_type: Some("message_delta".to_string()),
+        event_type: "message_delta".to_string(),
         content,
         reasoning,
         ..AiStreamDelta::default()
@@ -2740,10 +2739,9 @@ fn ai_tool_stream_delta(
         _ => "running",
     };
     AiStreamDelta {
-        event_type: Some("action_update".to_string()),
+        event_type: "action_update".to_string(),
         tool_call: Some(AiToolStreamUpdate {
             id: call_id.to_string(),
-            call_id: call_id.to_string(),
             phase: phase.to_string(),
             status: status.to_string(),
             tool: tool.to_string(),
@@ -4724,7 +4722,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(started["toolCall"]["callId"], "call-1");
+        assert_eq!(started["toolCall"]["id"], "call-1");
         assert_eq!(started["toolCall"]["phase"], "started");
         assert!(started["toolCall"]["output"].is_null());
         assert_eq!(finished["toolCall"]["phase"], "finished");

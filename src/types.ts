@@ -140,11 +140,7 @@ export interface AiMessage {
   content: string;
   attachments?: AiImageAttachment[];
   reasonings?: AiReasoning[];
-  reasoning?: string;
   toolCalls?: AiToolResult[];
-  command?: string;
-  commandOutput?: string;
-  toolName?: string;
   approval?: AiApproval;
   approvalState?: "pending" | "approved" | "rejected";
   usage?: AiTokenUsage;
@@ -163,7 +159,6 @@ export interface AiApproval {
 
 export interface AiToolResult {
   id: string;
-  callId?: string;
   sequence?: number;
   tool: string;
   command: string;
@@ -267,8 +262,7 @@ export interface AiStreamDelta {
   reasoning?: string;
   toolCall?: {
     id: string;
-    callId?: string;
-    phase?: "started" | "running" | "finished" | "error";
+    phase: "started" | "running" | "finished" | "error";
     status: AiActionStatus;
     tool: string;
     command: string;

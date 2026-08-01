@@ -143,39 +143,7 @@ const formatActionDuration = (startedAt: number, completedAt?: number) => {
 
 const shortActionId = (id: string) => id.length > 14 ? `${id.slice(0, 6)}…${id.slice(-6)}` : id;
 
-const messageStatus = (message: AiMessage): AiActionStatus => message.status ?? "completed";
-
-const resolveMessageType = (message: AiMessage): AiMessageType => {
-  if (message.messageType) return message.messageType;
-  if (messageStatus(message) === "error") return "error";
-  if (message.approval) return "approval";
-  if (message.role === "user" && message.content.trim().startsWith("/run ")) return "command";
-  if (message.toolCalls?.length || message.command) return "tool";
-  if (!message.content && (messageStatus(message) === "started" || messageStatus(message) === "running")) return "status";
-  return "text";
-};
-
-const normalizeToolCall = (toolCall: AiToolResult, fallbackId: string, fallbackTime: number): AiToolResult => {
-  const status = toolCall.status ?? (toolCall.exitCode === 0 ? "completed" : "error");
-  const startedAt = toolCall.startedAt ?? fallbackTime;
-  const updatedAt = toolCall.updatedAt ?? toolCall.completedAt ?? startedAt;
-  return {
-    ...toolCall,
-    id: toolCall.id || toolCall.callId || fallbackId,
-    status,
-    startedAt,
-    updatedAt,
-    completedAt: toolCall.completedAt ?? (status === "completed" || status === "error" ? updatedAt : undefined),
-  };
-};
-
-const reasoningsForMessage = (message: AiMessage): AiReasoning[] => {
-  const reasonings = message.reasonings?.filter((reasoning) => reasoning.id && reasoning.content.trim());
-  if (reasonings?.length) return reasonings;
-  return message.reasoning?.trim()
-    ? [{ id: `${message.id}-reasoning-legacy`, content: message.reasoning }]
-    : [];
-};
+const reasoningsForMessage = (message: AiMessage): AiReasoning[] => message.reasonings ?? [];
 
 const mergeReasoning = (reasonings: AiReasoning[], id: string, content: string, sequence?: number): AiReasoning[] => {
   if (!content.trim()) return reasonings;
@@ -222,24 +190,8 @@ const isApprovalPlaceholder = (toolCall: AiToolResult, approval?: AiApproval) =>
   );
 
 const toolCallsForMessage = (message: AiMessage): AiToolResult[] => {
-  const toolCalls = message.toolCalls?.length
-    ? message.toolCalls
-    : !message.command
-      ? []
-      : [{
-          tool: message.toolName ?? "execute_command",
-          command: message.command,
-          output: message.commandOutput ?? "",
-          exitCode: 0,
-          id: `${message.id}-legacy-tool`,
-          status: "completed" as const,
-          startedAt: message.createdAt,
-          updatedAt: message.completedAt ?? message.updatedAt ?? message.createdAt,
-          completedAt: message.completedAt ?? message.updatedAt ?? message.createdAt,
-      }];
-  return toolCalls
+  return (message.toolCalls ?? [])
     .filter((toolCall) => !isApprovalPlaceholder(toolCall, message.approval))
-    .map((toolCall, index) => normalizeToolCall(toolCall, `${message.id}-tool-${index}`, message.createdAt));
 };
 
 type AiTimelineItem =
@@ -266,41 +218,37 @@ const mergeStreamedToolCall = (
   update: NonNullable<AiStreamDelta["toolCall"]>,
   sequence?: number,
 ) => {
-  const updateId = update.id || update.callId || uid("ai-action");
-  const existingIndex = toolCalls.findIndex((toolCall) => toolCall.id === updateId || toolCall.callId === update.callId);
+  const existingIndex = toolCalls.findIndex((toolCall) => toolCall.id === update.id);
   const existing = existingIndex >= 0 ? toolCalls[existingIndex] : undefined;
-  const updatedAt = update.updatedAt ?? Date.now();
-  const status = update.status
-    ?? (update.phase === "started" ? "started" : update.phase === "running" ? "running" : update.phase === "error" || update.exitCode ? "error" : "completed");
+  const updatedAt = update.updatedAt;
   const next: AiToolResult = {
-    id: updateId,
-    callId: update.callId ?? existing?.callId,
+    id: update.id,
     sequence: existing?.sequence ?? sequence,
-    tool: update.tool || existing?.tool || "execute_command",
-    command: update.command || existing?.command || update.tool,
+    tool: update.tool,
+    command: update.command,
     output: update.output ?? existing?.output ?? "",
-    exitCode: update.exitCode ?? existing?.exitCode ?? (status === "error" ? 1 : 0),
-    status,
+    exitCode: update.exitCode ?? existing?.exitCode ?? 0,
+    status: update.status,
     startedAt: update.startedAt ?? existing?.startedAt ?? updatedAt,
     updatedAt,
-    completedAt: update.completedAt ?? existing?.completedAt ?? (status === "completed" || status === "error" ? updatedAt : undefined),
+    completedAt: update.completedAt ?? existing?.completedAt,
   };
   if (existingIndex < 0) return [...toolCalls, next];
   return toolCalls.map((toolCall, index) => index === existingIndex ? next : toolCall);
 };
 
 const mergeToolCalls = (current: AiToolResult[] = [], updates: AiToolResult[] = []) =>
-  updates.reduce((merged, update, index) => {
-    const normalized = normalizeToolCall(update, `ai-action-${index}`, update.startedAt ?? Date.now());
-    const existingIndex = merged.findIndex((toolCall) => toolCall.id === normalized.id);
-    if (existingIndex < 0) return [...merged, normalized];
+  updates.reduce((merged, update) => {
+    const existingIndex = merged.findIndex((toolCall) => toolCall.id === update.id);
+    if (existingIndex < 0) return [...merged, update];
     return merged.map((toolCall, toolCallIndex) => toolCallIndex === existingIndex ? {
       ...toolCall,
-      ...normalized,
-      output: normalized.output || toolCall.output,
-      startedAt: Math.min(toolCall.startedAt, normalized.startedAt),
-      updatedAt: Math.max(toolCall.updatedAt, normalized.updatedAt),
-      completedAt: normalized.completedAt ?? toolCall.completedAt,
+      ...update,
+      sequence: update.sequence ?? toolCall.sequence,
+      output: update.output || toolCall.output,
+      startedAt: Math.min(toolCall.startedAt, update.startedAt),
+      updatedAt: Math.max(toolCall.updatedAt, update.updatedAt),
+      completedAt: update.completedAt ?? toolCall.completedAt,
     } : toolCall);
   }, [...current]);
 
@@ -308,7 +256,7 @@ const mergeMessageById = (messages: AiMessage[], messageId: string, patch: Parti
   messages.map((message) => message.id === messageId ? {
     ...message,
     ...patch,
-    toolCalls: patch.toolCalls ? mergeToolCalls(toolCallsForMessage(message), patch.toolCalls) : message.toolCalls,
+    toolCalls: patch.toolCalls ? mergeToolCalls(message.toolCalls, patch.toolCalls) : message.toolCalls,
   } : message);
 
 function CopyAction({ text, label, className }: { text: string; label: string; className: string }) {
@@ -666,7 +614,6 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         ? {
           ...message,
           approvalState: "rejected",
-          commandOutput: "该审批请求缺少原始工具参数，已拒绝执行。",
           messageType: "error",
           status: "error",
           updatedAt: completedAt,
@@ -704,10 +651,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         actionId,
       });
       updateMessage(messageId, {
-        toolCalls: [normalizeToolCall(result, actionId, startedAt)],
-        command: result.command,
-        commandOutput: result.output,
-        toolName: result.tool,
+        toolCalls: [result],
         approvalState: "approved",
         messageType: "approval",
         status: result.status,
@@ -726,9 +670,6 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
       };
       updateMessage(messageId, {
         toolCalls: [failedToolCall],
-        command: approval.command,
-        commandOutput: String(reason),
-        toolName: approval.tool,
         approvalState: "approved",
         messageType: "error",
         status: "error",
@@ -849,9 +790,6 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           messageType: "command",
           content: result.exitCode === 0 ? "命令已执行完成。" : "命令执行失败，请检查输出。",
           toolCalls: streamedToolCalls,
-          toolName: "execute_command",
-          command,
-          commandOutput: `${result.stdout}${result.stderr}`,
           status,
           updatedAt: completedAt,
           completedAt,
@@ -880,8 +818,6 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             updatedAt: completedAt,
             completedAt,
           }],
-          command: "df -h / && free -h",
-          commandOutput: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        80G   32G   44G  42% /\nMem:            7.7G  2.1G  4.8G",
           status: "completed",
           updatedAt: completedAt,
           completedAt,
@@ -926,7 +862,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         };
         const unlisten = await listen<AiStreamDelta>(`ai-stream:${streamId}`, ({ payload }) => {
           if (requestVersionRef.current !== requestVersion) return;
-          const eventType = payload.eventType ?? (payload.toolCall ? "action_update" : "message_delta");
+          const eventType = payload.eventType;
           if (eventType === "message_delta") {
             streamedContent += payload.content ?? "";
             const reasoningDelta = payload.reasoning ?? "";
@@ -988,16 +924,14 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         const approval = response.approval;
         const responseToolCalls = response.toolCalls
           .filter((toolCall) => !isApprovalPlaceholder(toolCall, approval))
-          .map((toolCall, index) => {
-            const normalized = normalizeToolCall(toolCall, `${assistantMessageId}-tool-${index}`, assistantCreatedAt);
-            if (streamedToolCalls.some((streamedToolCall) => streamedToolCall.id === normalized.id)) return normalized;
-            const sequenced = { ...normalized, sequence: nextTimelineSequence };
+          .map((toolCall) => {
+            if (streamedToolCalls.some((streamedToolCall) => streamedToolCall.id === toolCall.id)) return toolCall;
+            const sequenced = { ...toolCall, sequence: nextTimelineSequence };
             nextTimelineSequence += 1;
             return sequenced;
           });
         streamedToolCalls = mergeToolCalls(streamedToolCalls, responseToolCalls);
         const toolCalls = streamedToolCalls;
-        const lastTool = toolCalls[toolCalls.length - 1];
         const lastReasoning = streamedReasonings[streamedReasonings.length - 1];
         if (response.reasoning && lastReasoning?.content.trim() !== response.reasoning.trim()) {
           if (!responseReasoningId) {
@@ -1013,11 +947,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           messageType: approval ? "approval" : toolCalls.length ? "tool" : "text",
           content: response.content,
           reasonings: streamedReasonings.length ? streamedReasonings : undefined,
-          reasoning: undefined,
           toolCalls,
-          toolName: lastTool?.tool,
-          command: lastTool?.command,
-          commandOutput: lastTool?.output,
           approval: approval ? { tool: approval.tool, command: approval.command, reason: approval.reason } : undefined,
           approvalState: approval ? "pending" : undefined,
           usage: response.usage,
@@ -1097,9 +1027,9 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           </div>
         )}
         {session.aiMessages.map((message) => {
-          const status = messageStatus(message);
-          const type = resolveMessageType(message);
-          const updatedAt = message.updatedAt ?? message.completedAt ?? message.createdAt;
+          const status = message.status;
+          const type = message.messageType;
+          const updatedAt = message.updatedAt;
           const toolCalls = toolCallsForMessage(message);
           const reasonings = reasoningsForMessage(message);
           const timeline = timelineForMessage(reasonings, toolCalls);

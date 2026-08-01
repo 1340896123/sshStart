@@ -10,7 +10,7 @@ export interface AiConversation {
   updatedAt: number;
 }
 
-export const AI_HISTORY_STORAGE_KEY = "portico.ai-history.v1";
+export const AI_HISTORY_STORAGE_KEY = "portico.ai-history.v2";
 export const AI_HISTORY_UPDATED_EVENT = "portico:ai-history-updated";
 
 const MAX_CONVERSATIONS_PER_SERVER = 30;
