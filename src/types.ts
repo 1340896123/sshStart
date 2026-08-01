@@ -127,12 +127,18 @@ export type AiActionStatus = "started" | "running" | "completed" | "error";
 export type AiMessageType = "text" | "command" | "tool" | "approval" | "status" | "error";
 export type AiStreamEventType = "message_delta" | "action_update";
 
+export interface AiReasoning {
+  id: string;
+  content: string;
+}
+
 export interface AiMessage {
   id: string;
   role: MessageRole;
   messageType: AiMessageType;
   content: string;
   attachments?: AiImageAttachment[];
+  reasonings?: AiReasoning[];
   reasoning?: string;
   toolCalls?: AiToolResult[];
   command?: string;

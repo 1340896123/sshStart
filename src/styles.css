@@ -2393,6 +2393,12 @@ body.is-resizing-rows .system-dock {
   white-space: nowrap;
 }
 
+.message-copy-button {
+  width: 18px;
+  height: 18px;
+  margin-left: 1px;
+}
+
 .message-copy {
   color: var(--fg);
   font-size: 12px;
@@ -2781,6 +2787,16 @@ body.is-resizing-rows .system-dock {
   margin-left: auto;
 }
 
+.reasoning-block > button code {
+  color: var(--muted-2);
+  font-size: 9px;
+}
+
+.reasoning-block + .reasoning-block {
+  margin-top: 0;
+  border-top: 0;
+}
+
 .reasoning-block p {
   margin: -1px 0 9px;
   color: var(--muted);
@@ -2873,7 +2889,7 @@ body.is-resizing-rows .system-dock {
   to { transform: rotate(360deg); }
 }
 
-.tool-call-copy {
+.copy-action {
   flex: 0 0 auto;
   width: 21px;
   height: 21px;
@@ -2887,13 +2903,13 @@ body.is-resizing-rows .system-dock {
 }
 
 .tool-call-toggle:hover,
-.tool-call-copy:hover {
+.copy-action:hover {
   color: var(--fg);
   background: var(--surface-hover);
 }
 
 .tool-call-toggle:focus-visible,
-.tool-call-copy:focus-visible {
+.copy-action:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }

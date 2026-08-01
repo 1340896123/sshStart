@@ -32,7 +32,7 @@ import {
   type AiConversation,
 } from "../aiHistory";
 import { formatBytes, isTauri, uid } from "../lib";
-import type { AiActionStatus, AiApproval, AiConfig, AiImageAttachment, AiMessage, AiMessageType, AiResponse, AiStreamDelta, AiTokenUsage, AiToolResult, ServerProfile, SessionState } from "../types";
+import type { AiActionStatus, AiApproval, AiConfig, AiImageAttachment, AiMessage, AiMessageType, AiReasoning, AiResponse, AiStreamDelta, AiTokenUsage, AiToolResult, ServerProfile, SessionState } from "../types";
 import { AiHistoryPopover } from "./AiHistoryPopover";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage").then((module) => ({ default: module.MarkdownMessage })));
@@ -169,6 +169,23 @@ const normalizeToolCall = (toolCall: AiToolResult, fallbackId: string, fallbackT
   };
 };
 
+const reasoningsForMessage = (message: AiMessage): AiReasoning[] => {
+  const reasonings = message.reasonings?.filter((reasoning) => reasoning.id && reasoning.content.trim());
+  if (reasonings?.length) return reasonings;
+  return message.reasoning?.trim()
+    ? [{ id: `${message.id}-reasoning-legacy`, content: message.reasoning }]
+    : [];
+};
+
+const mergeReasoning = (reasonings: AiReasoning[], id: string, content: string): AiReasoning[] => {
+  if (!content.trim()) return reasonings;
+  const existingIndex = reasonings.findIndex((reasoning) => reasoning.id === id);
+  if (existingIndex >= 0) {
+    return reasonings.map((reasoning, index) => index === existingIndex ? { ...reasoning, content } : reasoning);
+  }
+  return [...reasonings, { id, content }];
+};
+
 function presentStreamedResponse(content: string, providerReasoning: string) {
   const start = content.indexOf(REASONING_OPEN);
   if (start < 0) {
@@ -271,12 +288,48 @@ const mergeMessageById = (messages: AiMessage[], messageId: string, patch: Parti
     toolCalls: patch.toolCalls ? mergeToolCalls(toolCallsForMessage(message), patch.toolCalls) : message.toolCalls,
   } : message);
 
+function CopyAction({ text, label, className }: { text: string; label: string; className: string }) {
+  const [copied, setCopied] = useState(false);
+  const resetTimerRef = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => {
+    if (resetTimerRef.current) window.clearTimeout(resetTimerRef.current);
+  }, []);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      return;
+    }
+    setCopied(true);
+    if (resetTimerRef.current) window.clearTimeout(resetTimerRef.current);
+    resetTimerRef.current = window.setTimeout(() => setCopied(false), 1200);
+  };
+
+  return (
+    <button
+      className={`copy-action ${className}`}
+      type="button"
+      title={copied ? "已复制" : label}
+      aria-label={copied ? "已复制" : label}
+      onClick={() => void copy()}
+    >
+      {copied ? <Check size={11} /> : <Copy size={11} />}
+    </button>
+  );
+}
+
 function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(toolCall.status !== "completed");
   const contentId = useId();
   const running = toolCall.status === "started" || toolCall.status === "running";
   const failed = toolCall.status === "error";
   const duration = formatActionDuration(toolCall.startedAt, toolCall.completedAt);
+
+  useEffect(() => {
+    if (toolCall.status === "completed") setExpanded(false);
+  }, [toolCall.status]);
 
   return (
     <div className={`tool-call ${expanded ? "expanded" : "collapsed"} status-${toolCall.status}`}>
@@ -302,15 +355,7 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
               : <Check className="tool-call-status" size={12} aria-label="执行完成" />}
           <span className={`tool-call-status-label ${toolCall.status}`}>{ACTION_STATUS_LABELS[toolCall.status]}</span>
         </button>
-        <button
-          className="tool-call-copy"
-          type="button"
-          title="复制命令"
-          aria-label="复制命令"
-          onClick={() => navigator.clipboard.writeText(toolCall.command)}
-        >
-          <Copy size={11} />
-        </button>
+        <CopyAction className="tool-call-copy" label="复制命令" text={toolCall.command} />
       </div>
       <div className="tool-call-body" id={contentId} aria-hidden={!expanded}>
         <div className="tool-call-content">
@@ -757,7 +802,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           messageType: "command",
           status: "running",
           updatedAt: actionStartedAt,
-          reasoning: "识别到显式 /run 指令，跳过模型推理并在当前 SSH 会话直接执行。",
+          reasonings: [{
+            id: uid("ai-reasoning"),
+            content: "识别到显式 /run 指令，跳过模型推理并在当前 SSH 会话直接执行。",
+          }],
           toolCalls: streamedToolCalls,
         });
         const result = await runDirectCommand(command);
@@ -790,7 +838,10 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         updateMessage(assistantMessageId, {
           messageType: "tool",
           content: "当前服务器运行状态正常。磁盘根分区使用率 42%，内存仍有充足余量，没有发现需要立即处理的告警。建议继续检查最近 30 分钟的服务错误日志。",
-          reasoning: "先确认请求目标，再读取当前会话上下文；浏览器预览未连接真实 SSH，因此返回演示分析，未执行远程命令。",
+          reasonings: [{
+            id: uid("ai-reasoning"),
+            content: "先确认请求目标，再读取当前会话上下文；浏览器预览未连接真实 SSH，因此返回演示分析，未执行远程命令。",
+          }],
           toolCalls: [{
             id: uid("ai-action"),
             tool: "execute_command",
@@ -812,16 +863,24 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         const streamId = uid("ai-stream");
         let streamedContent = "";
         let streamedReasoning = "";
+        let streamedReasonings: AiReasoning[] = [];
+        let activeReasoningId: string | undefined;
+        let responseReasoningId: string | undefined;
         let streamFrame: number | undefined;
         let latestStreamUpdatedAt = assistantCreatedAt;
         const flushStream = () => {
           streamFrame = undefined;
           const visible = presentStreamedResponse(streamedContent, streamedReasoning);
-          if (!visible.content && !visible.reasoning && streamedToolCalls.length === 0) return;
+          let visibleReasonings = streamedReasonings;
+          if (visibleReasonings.length === 0 && visible.reasoning) {
+            responseReasoningId ??= uid("ai-reasoning");
+            visibleReasonings = mergeReasoning(visibleReasonings, responseReasoningId, visible.reasoning);
+          }
+          if (!visible.content && visibleReasonings.length === 0 && streamedToolCalls.length === 0) return;
           updateMessage(assistantMessageId, {
-            messageType: streamedToolCalls.length ? "tool" : visible.content || visible.reasoning ? "text" : "status",
+            messageType: streamedToolCalls.length ? "tool" : visible.content || visibleReasonings.length ? "text" : "status",
             content: visible.content,
-            reasoning: visible.reasoning,
+            reasonings: visibleReasonings.length ? visibleReasonings : undefined,
             toolCalls: streamedToolCalls.length ? [...streamedToolCalls] : undefined,
             status: "running",
             updatedAt: latestStreamUpdatedAt,
@@ -836,9 +895,20 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           const eventType = payload.eventType ?? (payload.toolCall ? "action_update" : "message_delta");
           if (eventType === "message_delta") {
             streamedContent += payload.content ?? "";
-            streamedReasoning += payload.reasoning ?? "";
+            const reasoningDelta = payload.reasoning ?? "";
+            streamedReasoning += reasoningDelta;
+            if (reasoningDelta) {
+              activeReasoningId ??= uid("ai-reasoning");
+              const currentReasoning = streamedReasonings.find((reasoning) => reasoning.id === activeReasoningId);
+              streamedReasonings = mergeReasoning(
+                streamedReasonings,
+                activeReasoningId,
+                `${currentReasoning?.content ?? ""}${reasoningDelta}`,
+              );
+            }
           }
           if (eventType === "action_update" && payload.toolCall) {
+            activeReasoningId = undefined;
             streamedToolCalls = mergeStreamedToolCall(streamedToolCalls, payload.toolCall);
           }
           latestStreamUpdatedAt = Math.max(latestStreamUpdatedAt, payload.toolCall?.updatedAt ?? Date.now());
@@ -880,12 +950,18 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         streamedToolCalls = mergeToolCalls(streamedToolCalls, responseToolCalls);
         const toolCalls = streamedToolCalls;
         const lastTool = toolCalls[toolCalls.length - 1];
+        const lastReasoning = streamedReasonings[streamedReasonings.length - 1];
+        if (response.reasoning && lastReasoning?.content.trim() !== response.reasoning.trim()) {
+          responseReasoningId ??= uid("ai-reasoning");
+          streamedReasonings = mergeReasoning(streamedReasonings, responseReasoningId, response.reasoning);
+        }
         if (approval?.arguments) approvalArgumentsRef.current.set(assistantMessageId, approval.arguments);
         const completedAt = Date.now();
         updateMessage(assistantMessageId, {
           messageType: approval ? "approval" : toolCalls.length ? "tool" : "text",
           content: response.content,
-          reasoning: response.reasoning,
+          reasonings: streamedReasonings.length ? streamedReasonings : undefined,
+          reasoning: undefined,
           toolCalls,
           toolName: lastTool?.tool,
           command: lastTool?.command,
@@ -973,6 +1049,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           const type = resolveMessageType(message);
           const updatedAt = message.updatedAt ?? message.completedAt ?? message.createdAt;
           const toolCalls = toolCallsForMessage(message);
+          const reasonings = reasoningsForMessage(message);
           return (
           <article className={`ai-message ${message.role} status-${status} ${streamingMessageId === message.id ? "streaming" : ""}`} data-message-type={type} key={message.id}>
             <div className="message-meta">
@@ -982,6 +1059,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
               <span className={`message-status ${status}`}>{ACTION_STATUS_LABELS[status]}</span>
               <time dateTime={new Date(updatedAt).toISOString()}>{formatActionTime(updatedAt)}</time>
               <code title={message.id}>{shortActionId(message.id)}</code>
+              {message.content.trim() && <CopyAction className="message-copy-button" label="复制消息" text={message.content} />}
             </div>
             {message.attachments?.length ? (
               <div className="message-attachments" aria-label="服务器临时文件引用">
@@ -997,23 +1075,35 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                 ))}
               </div>
             ) : null}
-            {message.reasoning && (
-              <div className="reasoning-block">
-                <button onClick={() => setThinkingOpen((current) => ({ ...current, [message.id]: !current[message.id] }))}>
-                  <BrainCircuit size={13} /><span>深度思考</span>{thinkingOpen[message.id] ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            {reasonings.map((reasoning, index) => (
+              <div className="reasoning-block" data-reasoning-id={reasoning.id} key={reasoning.id}>
+                <button
+                  aria-controls={`${reasoning.id}-content`}
+                  aria-expanded={Boolean(thinkingOpen[reasoning.id])}
+                  onClick={() => setThinkingOpen((current) => ({ ...current, [reasoning.id]: !current[reasoning.id] }))}
+                >
+                  <BrainCircuit size={13} />
+                  <span>{reasonings.length > 1 ? `深度思考 ${index + 1}` : "深度思考"}</span>
+                  <code title={reasoning.id}>{shortActionId(reasoning.id)}</code>
+                  {thinkingOpen[reasoning.id] ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                 </button>
-                {thinkingOpen[message.id] && <p>{message.reasoning}</p>}
+                {thinkingOpen[reasoning.id] && <p id={`${reasoning.id}-content`}>{reasoning.content}</p>}
               </div>
-            )}
+            ))}
             {toolCalls.map((toolCall) => (
               <ToolCallCard toolCall={toolCall} key={toolCall.id} />
             ))}
-            {message.role === "assistant" && !message.content && !message.reasoning && toolCalls.length === 0 && (status === "started" || status === "running") && (
+            {message.role === "assistant" && !message.content && reasonings.length === 0 && toolCalls.length === 0 && (status === "started" || status === "running") && (
               <div className="thinking-progress"><span className="thinking-pulse" /><span>{status === "started" ? "开始分析当前会话" : "正在分析当前会话"}</span></div>
             )}
             {message.approval && message.approvalState === "pending" && (
               <div className="approval-call">
-                <div className="approval-call-heading"><ShieldAlert size={14} /><span>需要人工确认</span><small>高危命令已暂停</small></div>
+                <div className="approval-call-heading">
+                  <ShieldAlert size={14} />
+                  <span>需要人工确认</span>
+                  <small>高危命令已暂停</small>
+                  <CopyAction className="approval-command-copy" label="复制命令" text={message.approval.command} />
+                </div>
                 <code>$ {message.approval.command}</code>
                 <p>{message.approval.reason}</p>
                 <div className="approval-call-actions">
