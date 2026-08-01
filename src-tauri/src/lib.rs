@@ -265,13 +265,7 @@ fn ai_input_message_content(message: &AiInputMessage) -> String {
 }
 
 fn ai_input_message_cost(message: &AiInputMessage) -> usize {
-    estimate_tokens(&ai_input_message_content(message))
-        + message
-            .reasoning_content
-            .as_deref()
-            .map(estimate_tokens)
-            .unwrap_or_default()
-        + 4
+    estimate_tokens(&ai_input_message_content(message)) + 4
 }
 
 fn ai_input_message_transcript(message: &AiInputMessage) -> String {
@@ -279,17 +273,7 @@ fn ai_input_message_transcript(message: &AiInputMessage) -> String {
 }
 
 fn ai_input_message_to_api(message: &AiInputMessage) -> Value {
-    let mut payload = json!({ "role": message.role, "content": ai_input_message_content(message) });
-    if message.role == "assistant" {
-        if let Some(reasoning_content) = message
-            .reasoning_content
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            payload["reasoning_content"] = json!(reasoning_content);
-        }
-    }
-    payload
+    json!({ "role": message.role, "content": ai_input_message_content(message) })
 }
 
 #[derive(Debug, Serialize)]
@@ -501,9 +485,6 @@ impl AiStreamCompletion {
             json!(self.content)
         };
         let mut message = json!({ "role": "assistant", "content": content });
-        if !self.reasoning.is_empty() {
-            message["reasoning_content"] = json!(self.reasoning);
-        }
         if !self.tool_calls.is_empty() {
             message["tool_calls"] = Value::Array(
                 self.tool_calls
@@ -2692,9 +2673,9 @@ fn apply_ai_stream_payload(
     else {
         return Ok(AiStreamDelta::default());
     };
-    let content = delta
-        .get("content")
-        .and_then(Value::as_str)
+    let content = ["content", "refusal"]
+        .iter()
+        .find_map(|key| delta.get(key).and_then(Value::as_str))
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let reasoning = ["reasoning_content", "reasoning", "thinking"]
@@ -2720,6 +2701,13 @@ fn apply_ai_stream_payload(
                 completion.tool_calls.push(AiStreamToolCall::default());
             }
             let target = &mut completion.tool_calls[index];
+            if let Some(id) = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                target.id = id.to_string();
+            }
             if let Some(name) = tool_call.pointer("/function/name").and_then(Value::as_str) {
                 target.name.push_str(name);
             }
@@ -2892,6 +2880,40 @@ fn ai_endpoint(endpoint: &str, path: &str) -> String {
     format!("{base}/{path}")
 }
 
+fn is_openai_api_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+}
+
+fn set_chat_completion_token_limit(body: &mut Value, endpoint: &str, limit: usize) {
+    let field = if is_openai_api_endpoint(endpoint) {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    body[field] = json!(limit);
+}
+
+fn ai_prompt_cache_key(model: &str, system_prompt: &str, tools: &[Value]) -> String {
+    let mut hasher = DefaultHasher::new();
+    model.hash(&mut hasher);
+    system_prompt.hash(&mut hasher);
+    for tool in tools {
+        tool.to_string().hash(&mut hasher);
+    }
+    format!("portico-ssh-{:016x}", hasher.finish())
+}
+
+fn apply_chat_completion_tools(body: &mut Value, tools: &[Value]) {
+    if tools.is_empty() {
+        return;
+    }
+    body["tools"] = Value::Array(tools.to_vec());
+    body["tool_choice"] = json!("auto");
+}
+
 fn estimate_tokens(value: &str) -> usize {
     let (ascii, non_ascii) =
         value
@@ -2977,16 +2999,23 @@ async fn compact_messages_with_model(
     let transcript_budget = input_token_budget(context_window).min(12_000);
     let transcript = truncate_to_token_budget(&transcript, transcript_budget);
     let summary_prompt = "你负责压缩一段 SSH 运维助手对话，以便会话继续工作。只输出 plain text 交接摘要，不要调用工具、不要回答原问题、不要披露隐藏思维链。按时间顺序保留：用户目标、已确认事实、关键命令及结果、文件路径和函数、已作决策、约束/风险、错误与修复、已完成事项和待办事项。若信息不确定，明确标注不确定。摘要要短而具体，不能遗漏后续工作所需的技术细节。";
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": [
             { "role": "system", "content": summary_prompt },
             { "role": "user", "content": transcript }
         ],
         "temperature": 0.1,
-        "max_tokens": max_output_tokens.clamp(256, 2_048),
         "stream": false
     });
+    set_chat_completion_token_limit(
+        &mut body,
+        endpoint,
+        max_output_tokens.clamp(256, 2_048) as usize,
+    );
+    if is_openai_api_endpoint(endpoint) {
+        body["prompt_cache_key"] = json!(ai_prompt_cache_key(model, summary_prompt, &[]));
+    }
     let response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -4067,6 +4096,13 @@ async fn ai_chat(
             .into_iter()
             .map(|message| ai_input_message_to_api(&message)),
     );
+    let tools = if allow_execute {
+        ai_tool_definitions(&config.tools)
+    } else {
+        Vec::new()
+    };
+    let prompt_cache_key = is_openai_api_endpoint(&endpoint)
+        .then(|| ai_prompt_cache_key(&config.model, &system, &tools));
     let mut executed_tools = Vec::new();
     let stream_event_name = format!("ai-stream:{stream_id}");
 
@@ -4084,16 +4120,13 @@ async fn ai_chat(
             "model": config.model,
             "messages": api_messages,
             "temperature": config.temperature,
-            "max_tokens": output_budget,
             "stream": true,
             "stream_options": { "include_usage": true }
         });
-        if allow_execute {
-            let tools = ai_tool_definitions(&config.tools);
-            if !tools.is_empty() {
-                body["tools"] = Value::Array(tools);
-            }
-            body["tool_choice"] = json!("auto");
+        set_chat_completion_token_limit(&mut body, &endpoint, output_budget);
+        apply_chat_completion_tools(&mut body, &tools);
+        if let Some(prompt_cache_key) = &prompt_cache_key {
+            body["prompt_cache_key"] = json!(prompt_cache_key);
         }
 
         let response = client
@@ -4707,10 +4740,9 @@ mod tests {
 
         let message = completion.message();
         assert_eq!(message["content"], "状态正常");
-        assert_eq!(message["reasoning_content"], "已检查");
+        assert!(message.get("reasoning_content").is_none());
         let first_id = message["tool_calls"][0]["id"].as_str().unwrap();
-        assert!(first_id.starts_with("ai-action-"));
-        assert_ne!(first_id, "call-1");
+        assert_eq!(first_id, "call-1");
         assert_eq!(
             message["tool_calls"][0]["function"]["arguments"],
             r#"{"command":"df -h"}"#
@@ -4723,7 +4755,19 @@ mod tests {
         )
         .unwrap();
         let next_message = next_completion.message();
-        assert_ne!(next_message["tool_calls"][0]["id"], first_id);
+        assert_eq!(next_message["tool_calls"][0]["id"], first_id);
+    }
+
+    #[test]
+    fn parses_streamed_refusal_as_visible_content() {
+        let mut completion = AiStreamCompletion::default();
+        let delta = apply_ai_stream_payload(
+            r#"{"choices":[{"delta":{"refusal":"无法协助该请求。"}}]}"#,
+            &mut completion,
+        )
+        .unwrap();
+        assert_eq!(delta.content.as_deref(), Some("无法协助该请求。"));
+        assert_eq!(completion.content, "无法协助该请求。");
     }
 
     #[test]
@@ -4984,7 +5028,45 @@ mod tests {
             attachments: Vec::new(),
         };
         let payload = super::ai_input_message_to_api(&message);
-        assert_eq!(payload["reasoning_content"], "已检查磁盘使用率。");
+        assert_eq!(payload["content"], "磁盘使用率正常。");
+        assert!(payload.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn builds_official_openai_token_and_cache_fields() {
+        let openai_endpoint = "https://api.openai.com/v1/chat/completions";
+        let mut openai_body = json!({});
+        super::set_chat_completion_token_limit(&mut openai_body, openai_endpoint, 4096);
+        assert_eq!(openai_body["max_completion_tokens"], 4096);
+        assert!(openai_body.get("max_tokens").is_none());
+
+        let tools = vec![json!({ "type": "function" })];
+        let first_key = super::ai_prompt_cache_key("gpt-test", "stable system prompt", &tools);
+        let second_key = super::ai_prompt_cache_key("gpt-test", "stable system prompt", &tools);
+        assert_eq!(first_key, second_key);
+        assert!(first_key.len() <= 64);
+
+        let mut compatible_body = json!({});
+        super::set_chat_completion_token_limit(
+            &mut compatible_body,
+            "https://api.example.com/v1/chat/completions",
+            4096,
+        );
+        assert_eq!(compatible_body["max_tokens"], 4096);
+        assert!(compatible_body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn omits_tool_choice_when_no_tools_are_available() {
+        let mut body = json!({});
+        super::apply_chat_completion_tools(&mut body, &[]);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+
+        let tools = vec![json!({ "type": "function" })];
+        super::apply_chat_completion_tools(&mut body, &tools);
+        assert_eq!(body["tools"], Value::Array(tools));
+        assert_eq!(body["tool_choice"], "auto");
     }
 
     #[test]
