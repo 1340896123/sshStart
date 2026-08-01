@@ -738,7 +738,13 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     const pendingMessages = [...session.aiMessages, userMessage];
     const compactionState = config.autoCompress ? compactionStateRef.current : undefined;
     const contextMessages = compactionState
-      ? [{ role: "assistant" as const, content: compactionState.summary, attachments: undefined }, ...session.aiMessages.slice(compactionState.cutoff), userMessage]
+      ? [{
+          role: "system" as const,
+          content: compactionState.summary,
+          attachments: undefined,
+          reasoningContent: undefined,
+          reasonings: undefined,
+        }, ...session.aiMessages.slice(compactionState.cutoff), userMessage]
       : pendingMessages;
     setMessages(pendingMessages);
     setMessages([...pendingMessages, assistantMessage], false);
@@ -897,11 +903,18 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           response = await invoke<AiResponse>("ai_chat", {
             config,
             server,
-            messages: contextMessages.map(({ role, content, attachments: messageAttachments }) => ({
-              role,
-              content,
-              attachments: messageAttachments?.map(({ kind, name, remotePath, mimeType, size }) => ({ kind, name, remotePath, mimeType, size })),
-            })),
+            messages: contextMessages
+              .filter((message) => !("status" in message) || message.status !== "error")
+              .map(({ role, content, attachments: messageAttachments, reasoningContent, reasonings }) => {
+                const historicalReasoning = reasoningContent
+                  ?? reasonings?.map((reasoning) => reasoning.content).filter(Boolean).join("\n\n");
+                return {
+                  role,
+                  content,
+                  reasoning_content: role === "assistant" && historicalReasoning ? historicalReasoning : undefined,
+                  attachments: messageAttachments?.map(({ kind, name, remotePath, mimeType, size }) => ({ kind, name, remotePath, mimeType, size })),
+                };
+              }),
             allowExecute: autoExecute,
             streamId,
           });
@@ -947,6 +960,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           messageType: approval ? "approval" : toolCalls.length ? "tool" : "text",
           content: response.content,
           reasonings: streamedReasonings.length ? streamedReasonings : undefined,
+          reasoningContent: response.reasoningContent,
           toolCalls,
           approval: approval ? { tool: approval.tool, command: approval.command, reason: approval.reason } : undefined,
           approvalState: approval ? "pending" : undefined,

@@ -140,6 +140,7 @@ export interface AiMessage {
   content: string;
   attachments?: AiImageAttachment[];
   reasonings?: AiReasoning[];
+  reasoningContent?: string;
   toolCalls?: AiToolResult[];
   approval?: AiApproval;
   approvalState?: "pending" | "approved" | "rejected";
@@ -249,6 +250,7 @@ export interface AiConfig {
 export interface AiResponse {
   content: string;
   reasoning?: string;
+  reasoningContent?: string;
   approval?: AiApproval;
   toolCalls: AiToolResult[];
   usage?: AiTokenUsage;

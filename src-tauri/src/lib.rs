@@ -232,6 +232,8 @@ struct AiInputMessage {
     role: String,
     content: String,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     attachments: Vec<AiAttachmentReference>,
 }
 
@@ -263,7 +265,13 @@ fn ai_input_message_content(message: &AiInputMessage) -> String {
 }
 
 fn ai_input_message_cost(message: &AiInputMessage) -> usize {
-    estimate_tokens(&ai_input_message_content(message)) + 4
+    estimate_tokens(&ai_input_message_content(message))
+        + message
+            .reasoning_content
+            .as_deref()
+            .map(estimate_tokens)
+            .unwrap_or_default()
+        + 4
 }
 
 fn ai_input_message_transcript(message: &AiInputMessage) -> String {
@@ -271,7 +279,17 @@ fn ai_input_message_transcript(message: &AiInputMessage) -> String {
 }
 
 fn ai_input_message_to_api(message: &AiInputMessage) -> Value {
-    json!({ "role": message.role, "content": ai_input_message_content(message) })
+    let mut payload = json!({ "role": message.role, "content": ai_input_message_content(message) });
+    if message.role == "assistant" {
+        if let Some(reasoning_content) = message
+            .reasoning_content
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            payload["reasoning_content"] = json!(reasoning_content);
+        }
+    }
+    payload
 }
 
 #[derive(Debug, Serialize)]
@@ -418,6 +436,7 @@ impl AiTokenUsage {
 struct AiResponse {
     content: String,
     reasoning: Option<String>,
+    reasoning_content: Option<String>,
     approval: Option<AiApproval>,
     tool_calls: Vec<AiToolResult>,
     usage: AiTokenUsage,
@@ -2990,8 +3009,9 @@ async fn compact_messages_with_model(
     let (summary, usage) = parse_compaction_response(&payload)?;
     Ok(Some((
         AiInputMessage {
-            role: "assistant".to_string(),
+            role: "system".to_string(),
             content: format!("[自动压缩摘要]\n会话已继续。以下摘要替代较早的对话记录；最近几轮消息仍保留。\n\n{summary}"),
+            reasoning_content: None,
             attachments: Vec::new(),
         },
         split_index,
@@ -4116,7 +4136,8 @@ async fn ai_chat(
                 (!completion.reasoning.is_empty()).then_some(completion.reasoning);
             return Ok(AiResponse {
                 content,
-                reasoning: summary.or(provider_reasoning),
+                reasoning: summary.or_else(|| provider_reasoning.clone()),
+                reasoning_content: provider_reasoning,
                 approval: None,
                 tool_calls: executed_tools,
                 usage,
@@ -4243,6 +4264,8 @@ async fn ai_chat(
                         return Ok(AiResponse {
                             content: "已暂停高风险操作，等待人工确认后再执行。".to_string(),
                             reasoning: Some(format!("风险检查命中：{reason}")),
+                            reasoning_content: (!completion.reasoning.is_empty())
+                                .then(|| completion.reasoning.clone()),
                             approval: Some(AiApproval {
                                 tool: tool_name,
                                 command,
@@ -4286,6 +4309,8 @@ async fn ai_chat(
                             return Ok(AiResponse {
                                 content: "已阻止写入受保护系统路径。".to_string(),
                                 reasoning: Some("/etc、/boot、/usr、/lib 和 /var/lib 等路径需要通过人工终端操作。".to_string()),
+                                reasoning_content: (!completion.reasoning.is_empty())
+                                    .then(|| completion.reasoning.clone()),
                                 approval: None,
                                 tool_calls: executed_tools,
                                 usage,
@@ -4833,21 +4858,25 @@ mod tests {
             AiInputMessage {
                 role: "user".into(),
                 content: "old goal ".repeat(160),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "old result ".repeat(160),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "user".into(),
                 content: "recent request ".repeat(160),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "recent answer ".repeat(160),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
         ];
@@ -4863,11 +4892,13 @@ mod tests {
             AiInputMessage {
                 role: "user".into(),
                 content: "hello".into(),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "hello back".into(),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
         ];
@@ -4877,11 +4908,13 @@ mod tests {
             AiInputMessage {
                 role: "user".into(),
                 content: "request ".repeat(2_000),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "response ".repeat(2_000),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
         ];
@@ -4924,6 +4957,7 @@ mod tests {
         let message = AiInputMessage {
             role: "user".into(),
             content: "检查这张图".into(),
+            reasoning_content: None,
             attachments: vec![super::AiAttachmentReference {
                 kind: "image".into(),
                 name: "clipboard.png".into(),
@@ -4939,6 +4973,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("/tmp/portico-ai-root/pasted-clipboard.png"));
+    }
+
+    #[test]
+    fn serializes_reasoning_content_for_assistant_history() {
+        let message = AiInputMessage {
+            role: "assistant".into(),
+            content: "磁盘使用率正常。".into(),
+            reasoning_content: Some("已检查磁盘使用率。".into()),
+            attachments: Vec::new(),
+        };
+        let payload = super::ai_input_message_to_api(&message);
+        assert_eq!(payload["reasoning_content"], "已检查磁盘使用率。");
     }
 
     #[test]
@@ -4960,11 +5006,13 @@ mod tests {
             AiInputMessage {
                 role: "user".into(),
                 content: "a".repeat(4_000),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "recent".into(),
+                reasoning_content: None,
                 attachments: Vec::new(),
             },
         ];
@@ -4978,6 +5026,7 @@ mod tests {
         let messages = vec![AiInputMessage {
             role: "user".into(),
             content: "a".repeat(4_000),
+            reasoning_content: None,
             attachments: Vec::new(),
         }];
         let error = trim_messages_for_context(messages, 1_024, "system").unwrap_err();
