@@ -276,10 +276,48 @@ fn ai_input_message_to_api(message: &AiInputMessage) -> Value {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiToolResult {
+    id: String,
     tool: String,
     command: String,
     output: String,
     exit_code: i32,
+    status: String,
+    started_at: u64,
+    updated_at: u64,
+    completed_at: Option<u64>,
+}
+
+fn ai_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn completed_ai_tool_result(
+    id: String,
+    tool: String,
+    command: String,
+    output: String,
+    exit_code: i32,
+    started_at: u64,
+) -> AiToolResult {
+    let completed_at = ai_timestamp_ms();
+    AiToolResult {
+        id,
+        tool,
+        command,
+        output,
+        exit_code,
+        status: if exit_code == 0 {
+            "completed".to_string()
+        } else {
+            "error".to_string()
+        },
+        started_at,
+        updated_at: completed_at,
+        completed_at: Some(completed_at),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -385,6 +423,7 @@ struct AiResponse {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiStreamDelta {
+    event_type: Option<String>,
     content: Option<String>,
     reasoning: Option<String>,
     tool_call: Option<AiToolStreamUpdate>,
@@ -393,12 +432,17 @@ struct AiStreamDelta {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiToolStreamUpdate {
+    id: String,
     call_id: String,
     phase: String,
+    status: String,
     tool: String,
     command: String,
     output: Option<String>,
     exit_code: Option<i32>,
+    started_at: Option<u64>,
+    updated_at: u64,
+    completed_at: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -2664,6 +2708,7 @@ fn apply_ai_stream_payload(
     }
 
     Ok(AiStreamDelta {
+        event_type: Some("message_delta".to_string()),
         content,
         reasoning,
         ..AiStreamDelta::default()
@@ -2678,14 +2723,29 @@ fn ai_tool_stream_delta(
     output: Option<&str>,
     exit_code: Option<i32>,
 ) -> AiStreamDelta {
+    let updated_at = ai_timestamp_ms();
+    let status = match phase {
+        "started" => "started",
+        "running" => "running",
+        "error" => "error",
+        "finished" if exit_code.unwrap_or_default() != 0 => "error",
+        "finished" => "completed",
+        _ => "running",
+    };
     AiStreamDelta {
+        event_type: Some("action_update".to_string()),
         tool_call: Some(AiToolStreamUpdate {
+            id: call_id.to_string(),
             call_id: call_id.to_string(),
             phase: phase.to_string(),
+            status: status.to_string(),
             tool: tool.to_string(),
             command: command.to_string(),
             output: output.map(str::to_string),
             exit_code,
+            started_at: (status == "started").then_some(updated_at),
+            updated_at,
+            completed_at: matches!(status, "completed" | "error").then_some(updated_at),
         }),
         ..AiStreamDelta::default()
     }
@@ -3880,6 +3940,7 @@ async fn approve_ai_tool(
     tool: String,
     arguments: Value,
     settings: AiToolSettings,
+    action_id: String,
 ) -> Result<AiToolResult, String> {
     if !ai_tool_enabled(&settings, &tool) {
         return Err(format!("AI 工具 {tool} 未在设置中启用"));
@@ -3894,17 +3955,20 @@ async fn approve_ai_tool(
     {
         return Err("已阻止写入受保护系统路径".to_string());
     }
+    let started_at = ai_timestamp_ms();
     let execution = execute_ai_tool(&tool, &arguments, &server, &settings).await?;
     let output = truncate_to_token_budget(
         &format!("{}{}", execution.result.stdout, execution.result.stderr),
         settings.max_output_chars / 4,
     );
-    Ok(AiToolResult {
+    Ok(completed_ai_tool_result(
+        action_id,
         tool,
-        command: execution.display_command,
+        execution.display_command,
         output,
-        exit_code: execution.result.exit_code,
-    })
+        execution.result.exit_code,
+        started_at,
+    ))
 }
 
 #[tauri::command]
@@ -4092,6 +4156,19 @@ async fn ai_chat(
             if !ai_tool_enabled(&config.tools, &tool_name) {
                 return Err(format!("AI 工具 {tool_name} 未在设置中启用"));
             }
+            let pending_command =
+                ai_tool_command_for_risk(&tool_name, &parsed).unwrap_or_else(|| tool_name.clone());
+            let started_at = ai_timestamp_ms();
+            emit_ai_tool_stream_update(
+                &app,
+                &stream_event_name,
+                id,
+                "started",
+                &tool_name,
+                &pending_command,
+                None,
+                None,
+            );
 
             if !ai_tool_mutation_is_authorized(&config.tools, &tool_name, &parsed) {
                 let result = ai_blocked_result(
@@ -4101,12 +4178,25 @@ async fn ai_chat(
                     &format!("{}{}", result.stdout, result.stderr),
                     output_budget,
                 );
-                executed_tools.push(AiToolResult {
-                    tool: tool_name.clone(),
-                    command: format!("{tool_name} (blocked)"),
-                    output: output.clone(),
-                    exit_code: result.exit_code,
-                });
+                let tool_result = completed_ai_tool_result(
+                    id.to_string(),
+                    tool_name.clone(),
+                    format!("{tool_name} (blocked)"),
+                    output.clone(),
+                    result.exit_code,
+                    started_at,
+                );
+                emit_ai_tool_stream_update(
+                    &app,
+                    &stream_event_name,
+                    id,
+                    "error",
+                    &tool_result.tool,
+                    &tool_result.command,
+                    Some(&tool_result.output),
+                    Some(tool_result.exit_code),
+                );
+                executed_tools.push(tool_result);
                 api_messages.push(json!({
                     "role": "tool",
                     "tool_call_id": id,
@@ -4126,12 +4216,25 @@ async fn ai_chat(
                             &format!("{}{}", result.stdout, result.stderr),
                             output_budget,
                         );
-                        executed_tools.push(AiToolResult {
-                            tool: tool_name.clone(),
-                            command: command.clone(),
+                        let tool_result = completed_ai_tool_result(
+                            id.to_string(),
+                            tool_name.clone(),
+                            command.clone(),
                             output,
-                            exit_code: result.exit_code,
-                        });
+                            result.exit_code,
+                            started_at,
+                        );
+                        emit_ai_tool_stream_update(
+                            &app,
+                            &stream_event_name,
+                            id,
+                            "error",
+                            &tool_result.tool,
+                            &tool_result.command,
+                            Some(&tool_result.output),
+                            Some(tool_result.exit_code),
+                        );
+                        executed_tools.push(tool_result);
                         return Ok(AiResponse {
                             content: "已暂停高风险操作，等待人工确认后再执行。".to_string(),
                             reasoning: Some(format!("风险检查命中：{reason}")),
@@ -4151,6 +4254,30 @@ async fn ai_chat(
                 if tool_name == "write_file" {
                     if let Ok(path) = required_ai_arg(&parsed, "path") {
                         if protected_write_path(path) {
+                            let result = ai_blocked_result("BLOCKED: 已阻止写入受保护系统路径");
+                            let output = truncate_to_token_budget(
+                                &format!("{}{}", result.stdout, result.stderr),
+                                output_budget,
+                            );
+                            let tool_result = completed_ai_tool_result(
+                                id.to_string(),
+                                tool_name.clone(),
+                                pending_command.clone(),
+                                output,
+                                result.exit_code,
+                                started_at,
+                            );
+                            emit_ai_tool_stream_update(
+                                &app,
+                                &stream_event_name,
+                                id,
+                                "error",
+                                &tool_result.tool,
+                                &tool_result.command,
+                                Some(&tool_result.output),
+                                Some(tool_result.exit_code),
+                            );
+                            executed_tools.push(tool_result);
                             return Ok(AiResponse {
                                 content: "已阻止写入受保护系统路径。".to_string(),
                                 reasoning: Some("/etc、/boot、/usr、/lib 和 /var/lib 等路径需要通过人工终端操作。".to_string()),
@@ -4165,13 +4292,11 @@ async fn ai_chat(
                 }
             }
 
-            let pending_command =
-                ai_tool_command_for_risk(&tool_name, &parsed).unwrap_or_else(|| tool_name.clone());
             emit_ai_tool_stream_update(
                 &app,
                 &stream_event_name,
                 id,
-                "started",
+                "running",
                 &tool_name,
                 &pending_command,
                 None,
@@ -4185,7 +4310,7 @@ async fn ai_chat(
                         &app,
                         &stream_event_name,
                         id,
-                        "finished",
+                        "error",
                         &tool_name,
                         &pending_command,
                         Some(&error),
@@ -4199,12 +4324,14 @@ async fn ai_chat(
                 &format!("{}{}", result.stdout, result.stderr),
                 output_budget.min(config.tools.max_output_chars / 4),
             );
-            let tool_result = AiToolResult {
-                tool: tool_name,
-                command: execution.display_command,
+            let tool_result = completed_ai_tool_result(
+                id.to_string(),
+                tool_name,
+                execution.display_command,
                 output,
-                exit_code: result.exit_code,
-            };
+                result.exit_code,
+                started_at,
+            );
             emit_ai_tool_stream_update(
                 &app,
                 &stream_event_name,
@@ -4585,6 +4712,68 @@ mod tests {
         assert_eq!(finished["toolCall"]["phase"], "finished");
         assert_eq!(finished["toolCall"]["output"], "disk output");
         assert_eq!(finished["toolCall"]["exitCode"], 0);
+    }
+
+    #[test]
+    fn serializes_tool_stream_lifecycle_metadata() {
+        let started = serde_json::to_value(super::ai_tool_stream_delta(
+            "call-lifecycle",
+            "started",
+            "execute_command",
+            "uptime",
+            None,
+            None,
+        ))
+        .unwrap();
+        let running = serde_json::to_value(super::ai_tool_stream_delta(
+            "call-lifecycle",
+            "running",
+            "execute_command",
+            "uptime",
+            None,
+            None,
+        ))
+        .unwrap();
+        let failed = serde_json::to_value(super::ai_tool_stream_delta(
+            "call-lifecycle",
+            "error",
+            "execute_command",
+            "uptime",
+            Some("connection lost"),
+            Some(1),
+        ))
+        .unwrap();
+
+        assert_eq!(started["toolCall"]["id"], "call-lifecycle");
+        assert_eq!(started["toolCall"]["status"], "started");
+        assert!(started["toolCall"]["startedAt"].as_u64().is_some());
+        assert_eq!(running["toolCall"]["status"], "running");
+        assert!(running["toolCall"]["updatedAt"].as_u64().is_some());
+        assert_eq!(failed["toolCall"]["status"], "error");
+        assert!(failed["toolCall"]["completedAt"].as_u64().is_some());
+    }
+
+    #[test]
+    fn serializes_ai_stream_event_types() {
+        let mut completion = AiStreamCompletion::default();
+        let message_delta = apply_ai_stream_payload(
+            r#"{"choices":[{"delta":{"content":"hello"}}]}"#,
+            &mut completion,
+        )
+        .unwrap();
+        let message_delta = serde_json::to_value(message_delta).unwrap();
+        let action_update = serde_json::to_value(super::ai_tool_stream_delta(
+            "call-type",
+            "running",
+            "execute_command",
+            "uptime",
+            None,
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(message_delta["eventType"], "message_delta");
+        assert_eq!(action_update["eventType"], "action_update");
     }
 
     #[test]

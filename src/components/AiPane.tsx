@@ -32,7 +32,7 @@ import {
   type AiConversation,
 } from "../aiHistory";
 import { formatBytes, isTauri, uid } from "../lib";
-import type { AiApproval, AiConfig, AiImageAttachment, AiMessage, AiResponse, AiStreamDelta, AiTokenUsage, AiToolResult, ServerProfile, SessionState } from "../types";
+import type { AiActionStatus, AiApproval, AiConfig, AiImageAttachment, AiMessage, AiMessageType, AiResponse, AiStreamDelta, AiTokenUsage, AiToolResult, ServerProfile, SessionState } from "../types";
 import { AiHistoryPopover } from "./AiHistoryPopover";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage").then((module) => ({ default: module.MarkdownMessage })));
@@ -72,6 +72,20 @@ const LARGE_PASTE_THRESHOLD = 32_000;
 const MAX_PASTED_IMAGE_BYTES = 4 * 1024 * 1024;
 const MAX_PASTED_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MAX_PASTED_ATTACHMENTS = 4;
+const ACTION_STATUS_LABELS: Record<AiActionStatus, string> = {
+  started: "开始",
+  running: "执行中",
+  completed: "已完成",
+  error: "错误",
+};
+const MESSAGE_TYPE_LABELS: Record<AiMessageType, string> = {
+  text: "文本",
+  command: "命令",
+  tool: "工具",
+  approval: "审批",
+  status: "状态",
+  error: "错误消息",
+};
 
 interface DraftAiAttachment extends Omit<AiImageAttachment, "remotePath"> {
   remotePath?: string;
@@ -116,6 +130,45 @@ const formatTokenCount = (value: number, compact = false) =>
 
 const formatUsagePercent = (value: number) => `${value < 0.1 && value > 0 ? "<0.1" : value.toFixed(1)}%`;
 
+const formatActionTime = (timestamp: number) => {
+  const value = new Date(timestamp);
+  return `${value.toLocaleTimeString("zh-CN", { hour12: false })}.${String(value.getMilliseconds()).padStart(3, "0")}`;
+};
+
+const formatActionDuration = (startedAt: number, completedAt?: number) => {
+  if (!completedAt) return undefined;
+  const duration = Math.max(0, completedAt - startedAt);
+  return duration < 1_000 ? `${duration}ms` : `${(duration / 1_000).toFixed(duration < 10_000 ? 2 : 1)}s`;
+};
+
+const shortActionId = (id: string) => id.length > 14 ? `${id.slice(0, 6)}…${id.slice(-6)}` : id;
+
+const messageStatus = (message: AiMessage): AiActionStatus => message.status ?? "completed";
+
+const resolveMessageType = (message: AiMessage): AiMessageType => {
+  if (message.messageType) return message.messageType;
+  if (messageStatus(message) === "error") return "error";
+  if (message.approval) return "approval";
+  if (message.role === "user" && message.content.trim().startsWith("/run ")) return "command";
+  if (message.toolCalls?.length || message.command) return "tool";
+  if (!message.content && (messageStatus(message) === "started" || messageStatus(message) === "running")) return "status";
+  return "text";
+};
+
+const normalizeToolCall = (toolCall: AiToolResult, fallbackId: string, fallbackTime: number): AiToolResult => {
+  const status = toolCall.status ?? (toolCall.exitCode === 0 ? "completed" : "error");
+  const startedAt = toolCall.startedAt ?? fallbackTime;
+  const updatedAt = toolCall.updatedAt ?? toolCall.completedAt ?? startedAt;
+  return {
+    ...toolCall,
+    id: toolCall.id || toolCall.callId || fallbackId,
+    status,
+    startedAt,
+    updatedAt,
+    completedAt: toolCall.completedAt ?? (status === "completed" || status === "error" ? updatedAt : undefined),
+  };
+};
+
 function presentStreamedResponse(content: string, providerReasoning: string) {
   const start = content.indexOf(REASONING_OPEN);
   if (start < 0) {
@@ -159,36 +212,74 @@ const toolCallsForMessage = (message: AiMessage): AiToolResult[] => {
           command: message.command,
           output: message.commandOutput ?? "",
           exitCode: 0,
+          id: `${message.id}-legacy-tool`,
+          status: "completed" as const,
+          startedAt: message.createdAt,
+          updatedAt: message.completedAt ?? message.updatedAt ?? message.createdAt,
+          completedAt: message.completedAt ?? message.updatedAt ?? message.createdAt,
       }];
-  return toolCalls.filter((toolCall) => !isApprovalPlaceholder(toolCall, message.approval));
+  return toolCalls
+    .filter((toolCall) => !isApprovalPlaceholder(toolCall, message.approval))
+    .map((toolCall, index) => normalizeToolCall(toolCall, `${message.id}-tool-${index}`, message.createdAt));
 };
 
 const mergeStreamedToolCall = (
   toolCalls: AiToolResult[],
   update: NonNullable<AiStreamDelta["toolCall"]>,
 ) => {
-  const existingIndex = toolCalls.findIndex((toolCall) => toolCall.callId === update.callId);
+  const updateId = update.id || update.callId || uid("ai-action");
+  const existingIndex = toolCalls.findIndex((toolCall) => toolCall.id === updateId || toolCall.callId === update.callId);
   const existing = existingIndex >= 0 ? toolCalls[existingIndex] : undefined;
+  const updatedAt = update.updatedAt ?? Date.now();
+  const status = update.status
+    ?? (update.phase === "started" ? "started" : update.phase === "running" ? "running" : update.phase === "error" || update.exitCode ? "error" : "completed");
   const next: AiToolResult = {
-    callId: update.callId,
+    id: updateId,
+    callId: update.callId ?? existing?.callId,
     tool: update.tool || existing?.tool || "execute_command",
     command: update.command || existing?.command || update.tool,
     output: update.output ?? existing?.output ?? "",
-    exitCode: update.exitCode ?? existing?.exitCode ?? 0,
-    status: update.phase === "started" ? "running" : "completed",
+    exitCode: update.exitCode ?? existing?.exitCode ?? (status === "error" ? 1 : 0),
+    status,
+    startedAt: update.startedAt ?? existing?.startedAt ?? updatedAt,
+    updatedAt,
+    completedAt: update.completedAt ?? existing?.completedAt ?? (status === "completed" || status === "error" ? updatedAt : undefined),
   };
   if (existingIndex < 0) return [...toolCalls, next];
   return toolCalls.map((toolCall, index) => index === existingIndex ? next : toolCall);
 };
 
+const mergeToolCalls = (current: AiToolResult[] = [], updates: AiToolResult[] = []) =>
+  updates.reduce((merged, update, index) => {
+    const normalized = normalizeToolCall(update, `ai-action-${index}`, update.startedAt ?? Date.now());
+    const existingIndex = merged.findIndex((toolCall) => toolCall.id === normalized.id);
+    if (existingIndex < 0) return [...merged, normalized];
+    return merged.map((toolCall, toolCallIndex) => toolCallIndex === existingIndex ? {
+      ...toolCall,
+      ...normalized,
+      output: normalized.output || toolCall.output,
+      startedAt: Math.min(toolCall.startedAt, normalized.startedAt),
+      updatedAt: Math.max(toolCall.updatedAt, normalized.updatedAt),
+      completedAt: normalized.completedAt ?? toolCall.completedAt,
+    } : toolCall);
+  }, [...current]);
+
+const mergeMessageById = (messages: AiMessage[], messageId: string, patch: Partial<AiMessage>) =>
+  messages.map((message) => message.id === messageId ? {
+    ...message,
+    ...patch,
+    toolCalls: patch.toolCalls ? mergeToolCalls(toolCallsForMessage(message), patch.toolCalls) : message.toolCalls,
+  } : message);
+
 function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
   const [expanded, setExpanded] = useState(true);
   const contentId = useId();
-  const running = toolCall.status === "running";
-  const failed = !running && toolCall.exitCode !== 0;
+  const running = toolCall.status === "started" || toolCall.status === "running";
+  const failed = toolCall.status === "error";
+  const duration = formatActionDuration(toolCall.startedAt, toolCall.completedAt);
 
   return (
-    <div className={`tool-call ${expanded ? "expanded" : "collapsed"}`}>
+    <div className={`tool-call ${expanded ? "expanded" : "collapsed"} status-${toolCall.status}`}>
       <div className="tool-call-header">
         <button
           className="tool-call-toggle"
@@ -201,12 +292,15 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
         >
           {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           <TerminalSquare size={12} />
-          <span>{TOOL_LABELS[toolCall.tool] ?? toolCall.tool}</span>
-          {running
+          <span className="tool-call-name">{TOOL_LABELS[toolCall.tool] ?? toolCall.tool}</span>
+          {toolCall.status === "started"
+            ? <Play className="tool-call-status started" size={12} aria-label="开始" />
+            : running
             ? <CircleGauge className="tool-call-status running" size={12} aria-label="执行中" />
             : failed
               ? <X className="tool-call-status failed" size={12} aria-label="执行失败" />
               : <Check className="tool-call-status" size={12} aria-label="执行完成" />}
+          <span className={`tool-call-status-label ${toolCall.status}`}>{ACTION_STATUS_LABELS[toolCall.status]}</span>
         </button>
         <button
           className="tool-call-copy"
@@ -220,11 +314,18 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
       </div>
       <div className="tool-call-body" id={contentId} aria-hidden={!expanded}>
         <div className="tool-call-content">
+          <div className="tool-call-metadata">
+            <code title={toolCall.id}>ID {shortActionId(toolCall.id)}</code>
+            <time dateTime={new Date(toolCall.startedAt).toISOString()}>{formatActionTime(toolCall.startedAt)}</time>
+            {duration && <span>{duration}</span>}
+          </div>
           <code>$ {toolCall.command}</code>
           {toolCall.output
             ? <pre>{toolCall.output}</pre>
             : running
-              ? <pre>正在执行…</pre>
+              ? <pre>{toolCall.status === "started" ? "等待执行…" : "正在执行…"}</pre>
+              : failed
+                ? <pre>执行失败</pre>
               : null}
         </div>
       </div>
@@ -337,6 +438,9 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
       setActiveConversationId(conversationId);
     }
     replaceConversations(upsertAiConversation(conversationsRef.current, conversationId, server, messages));
+  };
+  const updateMessage = (messageId: string, patch: Partial<AiMessage>, persist = false) => {
+    setMessages(mergeMessageById(messagesRef.current, messageId, patch), persist);
   };
 
   const insertPastedText = (textarea: HTMLTextAreaElement, text: string) => {
@@ -488,46 +592,81 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     if (approvalLoading) return;
     const approvalArguments = approvalArgumentsRef.current.get(messageId);
     if (!approvalArguments) {
+      const completedAt = Date.now();
       approvalArgumentsRef.current.delete(messageId);
       setMessages(messagesRef.current.map((message) => message.id === messageId
-        ? { ...message, approvalState: "rejected", commandOutput: "该审批请求缺少原始工具参数，已拒绝执行。" }
+        ? {
+          ...message,
+          approvalState: "rejected",
+          commandOutput: "该审批请求缺少原始工具参数，已拒绝执行。",
+          messageType: "error",
+          status: "error",
+          updatedAt: completedAt,
+          completedAt,
+        }
         : message));
       return;
     }
+    const actionId = uid("ai-action");
+    const startedAt = Date.now();
+    const pendingToolCall: AiToolResult = {
+      id: actionId,
+      tool: approval.tool,
+      command: approval.command,
+      output: "",
+      exitCode: 0,
+      status: "running",
+      startedAt,
+      updatedAt: startedAt,
+    };
     setApprovalLoading(messageId);
+    updateMessage(messageId, {
+      messageType: "approval",
+      status: "running",
+      updatedAt: startedAt,
+      completedAt: undefined,
+      toolCalls: [pendingToolCall],
+    });
     try {
       const result = await invoke<AiToolResult>("approve_ai_tool", {
         server,
         tool: approval.tool,
         arguments: approvalArguments,
         settings: config.tools,
+        actionId,
       });
-      setMessages(messagesRef.current.map((message) => message.id === messageId
-        ? {
-          ...message,
-          toolCalls: [...toolCallsForMessage(message), result],
-          command: result.command,
-          commandOutput: result.output,
-          toolName: result.tool,
-          approvalState: "approved",
-        }
-        : message));
+      updateMessage(messageId, {
+        toolCalls: [normalizeToolCall(result, actionId, startedAt)],
+        command: result.command,
+        commandOutput: result.output,
+        toolName: result.tool,
+        approvalState: "approved",
+        messageType: "approval",
+        status: result.status,
+        updatedAt: result.updatedAt,
+        completedAt: result.completedAt,
+      }, true);
     } catch (reason) {
-      setMessages(messagesRef.current.map((message) => message.id === messageId
-        ? {
-          ...message,
-          toolCalls: [...toolCallsForMessage(message), {
-            tool: approval.tool,
-            command: approval.command,
-            output: String(reason),
-            exitCode: 1,
-          }],
-          command: approval.command,
-          commandOutput: String(reason),
-          toolName: approval.tool,
-          approvalState: "approved",
-        }
-        : message));
+      const completedAt = Date.now();
+      const failedToolCall: AiToolResult = {
+        ...pendingToolCall,
+        output: String(reason),
+        exitCode: 1,
+        status: "error",
+        updatedAt: completedAt,
+        completedAt,
+      };
+      updateMessage(messageId, {
+        toolCalls: [failedToolCall],
+        command: approval.command,
+        commandOutput: String(reason),
+        toolName: approval.tool,
+        approvalState: "approved",
+        messageType: "error",
+        status: "error",
+        updatedAt: completedAt,
+        completedAt,
+      }, true);
     } finally {
       approvalArgumentsRef.current.delete(messageId);
       setApprovalLoading(undefined);
@@ -564,67 +703,146 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setPasteNotice(undefined);
     const requestVersion = requestVersionRef.current + 1;
     requestVersionRef.current = requestVersion;
+    const userCreatedAt = Date.now();
     const userMessage: AiMessage = {
       id: uid("message"),
       role: "user",
+      messageType: text.startsWith("/run ") ? "command" : "text",
       content: text || "请分析我上传到服务器临时目录的附件。",
       attachments: attachments.length ? attachments : undefined,
-      createdAt: Date.now(),
+      createdAt: userCreatedAt,
+      updatedAt: userCreatedAt,
+      completedAt: userCreatedAt,
+      status: "completed",
     };
     const assistantMessageId = uid("message");
     const assistantCreatedAt = Date.now();
+    const assistantMessage: AiMessage = {
+      id: assistantMessageId,
+      role: "assistant",
+      messageType: "status",
+      content: "",
+      createdAt: assistantCreatedAt,
+      updatedAt: assistantCreatedAt,
+      status: "started",
+    };
     const pendingMessages = [...session.aiMessages, userMessage];
     const compactionState = config.autoCompress ? compactionStateRef.current : undefined;
     const contextMessages = compactionState
       ? [{ role: "assistant" as const, content: compactionState.summary, attachments: undefined }, ...session.aiMessages.slice(compactionState.cutoff), userMessage]
       : pendingMessages;
     setMessages(pendingMessages);
+    setMessages([...pendingMessages, assistantMessage], false);
     setLoading(true);
+    setStreamingMessageId(assistantMessageId);
     let streamedToolCalls: AiToolResult[] = [];
 
     try {
       if (text.startsWith("/run ")) {
         const command = text.slice(5).trim();
+        const actionStartedAt = Date.now();
+        const actionId = uid("ai-action");
+        const runningToolCall: AiToolResult = {
+          id: actionId,
+          tool: "execute_command",
+          command,
+          output: "",
+          exitCode: 0,
+          status: "running",
+          startedAt: actionStartedAt,
+          updatedAt: actionStartedAt,
+        };
+        streamedToolCalls = [runningToolCall];
+        updateMessage(assistantMessageId, {
+          messageType: "command",
+          status: "running",
+          updatedAt: actionStartedAt,
+          reasoning: "识别到显式 /run 指令，跳过模型推理并在当前 SSH 会话直接执行。",
+          toolCalls: streamedToolCalls,
+        });
         const result = await runDirectCommand(command);
         if (requestVersionRef.current !== requestVersion) return;
-        setMessages([...pendingMessages, {
-          id: assistantMessageId, role: "assistant", content: result.exitCode === 0 ? "命令已执行完成。" : "命令执行失败，请检查输出。",
-          reasoning: "识别到显式 /run 指令，跳过模型推理并在当前 SSH 会话直接执行。",
-          toolCalls: [{ tool: "execute_command", command, output: `${result.stdout}${result.stderr}`, exitCode: result.exitCode }],
-          toolName: "execute_command", command, commandOutput: `${result.stdout}${result.stderr}`, createdAt: assistantCreatedAt,
-        }]);
+        const completedAt = Date.now();
+        const status: AiActionStatus = result.exitCode === 0 ? "completed" : "error";
+        streamedToolCalls = [{
+          ...runningToolCall,
+          output: `${result.stdout}${result.stderr}`,
+          exitCode: result.exitCode,
+          status,
+          updatedAt: completedAt,
+          completedAt,
+        }];
+        updateMessage(assistantMessageId, {
+          messageType: "command",
+          content: result.exitCode === 0 ? "命令已执行完成。" : "命令执行失败，请检查输出。",
+          toolCalls: streamedToolCalls,
+          toolName: "execute_command",
+          command,
+          commandOutput: `${result.stdout}${result.stderr}`,
+          status,
+          updatedAt: completedAt,
+          completedAt,
+        }, true);
       } else if (!isTauri()) {
         await new Promise((resolve) => setTimeout(resolve, 850));
         if (requestVersionRef.current !== requestVersion) return;
-        setMessages([...pendingMessages, {
-          id: assistantMessageId, role: "assistant",
+        const completedAt = Date.now();
+        updateMessage(assistantMessageId, {
+          messageType: "tool",
           content: "当前服务器运行状态正常。磁盘根分区使用率 42%，内存仍有充足余量，没有发现需要立即处理的告警。建议继续检查最近 30 分钟的服务错误日志。",
           reasoning: "先确认请求目标，再读取当前会话上下文；浏览器预览未连接真实 SSH，因此返回演示分析，未执行远程命令。",
-          toolCalls: [{ tool: "execute_command", command: "df -h / && free -h", output: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        80G   32G   44G  42% /\nMem:            7.7G  2.1G  4.8G", exitCode: 0 }],
+          toolCalls: [{
+            id: uid("ai-action"),
+            tool: "execute_command",
+            command: "df -h / && free -h",
+            output: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        80G   32G   44G  42% /\nMem:            7.7G  2.1G  4.8G",
+            exitCode: 0,
+            status: "completed",
+            startedAt: assistantCreatedAt,
+            updatedAt: completedAt,
+            completedAt,
+          }],
           command: "df -h / && free -h",
           commandOutput: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        80G   32G   44G  42% /\nMem:            7.7G  2.1G  4.8G",
-          createdAt: assistantCreatedAt,
-        }]);
+          status: "completed",
+          updatedAt: completedAt,
+          completedAt,
+        }, true);
       } else {
         const streamId = uid("ai-stream");
         let streamedContent = "";
         let streamedReasoning = "";
-        const unlisten = await listen<AiStreamDelta>(`ai-stream:${streamId}`, ({ payload }) => {
-          if (requestVersionRef.current !== requestVersion) return;
-          streamedContent += payload.content ?? "";
-          streamedReasoning += payload.reasoning ?? "";
-          if (payload.toolCall) streamedToolCalls = mergeStreamedToolCall(streamedToolCalls, payload.toolCall);
+        let streamFrame: number | undefined;
+        let latestStreamUpdatedAt = assistantCreatedAt;
+        const flushStream = () => {
+          streamFrame = undefined;
           const visible = presentStreamedResponse(streamedContent, streamedReasoning);
           if (!visible.content && !visible.reasoning && streamedToolCalls.length === 0) return;
-          setStreamingMessageId(assistantMessageId);
-          setMessages([...pendingMessages, {
-            id: assistantMessageId,
-            role: "assistant",
+          updateMessage(assistantMessageId, {
+            messageType: streamedToolCalls.length ? "tool" : visible.content || visible.reasoning ? "text" : "status",
             content: visible.content,
             reasoning: visible.reasoning,
             toolCalls: streamedToolCalls.length ? [...streamedToolCalls] : undefined,
-            createdAt: assistantCreatedAt,
-          }], false);
+            status: "running",
+            updatedAt: latestStreamUpdatedAt,
+          });
+        };
+        const scheduleStreamFlush = () => {
+          if (streamFrame !== undefined) return;
+          streamFrame = requestAnimationFrame(flushStream);
+        };
+        const unlisten = await listen<AiStreamDelta>(`ai-stream:${streamId}`, ({ payload }) => {
+          if (requestVersionRef.current !== requestVersion) return;
+          const eventType = payload.eventType ?? (payload.toolCall ? "action_update" : "message_delta");
+          if (eventType === "message_delta") {
+            streamedContent += payload.content ?? "";
+            streamedReasoning += payload.reasoning ?? "";
+          }
+          if (eventType === "action_update" && payload.toolCall) {
+            streamedToolCalls = mergeStreamedToolCall(streamedToolCalls, payload.toolCall);
+          }
+          latestStreamUpdatedAt = Math.max(latestStreamUpdatedAt, payload.toolCall?.updatedAt ?? Date.now());
+          scheduleStreamFlush();
         });
         let response: AiResponse;
         try {
@@ -641,6 +859,8 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           });
         } finally {
           unlisten();
+          if (streamFrame !== undefined) cancelAnimationFrame(streamFrame);
+          flushStream();
         }
         if (requestVersionRef.current !== requestVersion) return;
         if (response.compactionSummary && typeof response.compactionMessagesRemoved === "number") {
@@ -654,48 +874,50 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           };
         }
         const approval = response.approval;
-        const unmatchedStreamedToolCalls = [...streamedToolCalls];
-        const toolCalls = response.toolCalls
+        const responseToolCalls = response.toolCalls
           .filter((toolCall) => !isApprovalPlaceholder(toolCall, approval))
-          .map((toolCall) => {
-            const streamedIndex = unmatchedStreamedToolCalls.findIndex((streamed) =>
-              streamed.tool === toolCall.tool && streamed.command === toolCall.command,
-            );
-            const [streamed] = streamedIndex >= 0
-              ? unmatchedStreamedToolCalls.splice(streamedIndex, 1)
-              : [];
-            return {
-              ...toolCall,
-              callId: streamed?.callId,
-              status: "completed" as const,
-            };
-          });
+          .map((toolCall, index) => normalizeToolCall(toolCall, `${assistantMessageId}-tool-${index}`, assistantCreatedAt));
+        streamedToolCalls = mergeToolCalls(streamedToolCalls, responseToolCalls);
+        const toolCalls = streamedToolCalls;
         const lastTool = toolCalls[toolCalls.length - 1];
         if (approval?.arguments) approvalArgumentsRef.current.set(assistantMessageId, approval.arguments);
-        setMessages([...pendingMessages, {
-          id: assistantMessageId, role: "assistant", content: response.content,
-          reasoning: response.reasoning, toolCalls, toolName: lastTool?.tool, command: lastTool?.command, commandOutput: lastTool?.output,
+        const completedAt = Date.now();
+        updateMessage(assistantMessageId, {
+          messageType: approval ? "approval" : toolCalls.length ? "tool" : "text",
+          content: response.content,
+          reasoning: response.reasoning,
+          toolCalls,
+          toolName: lastTool?.tool,
+          command: lastTool?.command,
+          commandOutput: lastTool?.output,
           approval: approval ? { tool: approval.tool, command: approval.command, reason: approval.reason } : undefined,
           approvalState: approval ? "pending" : undefined,
-          usage: response.usage, createdAt: assistantCreatedAt,
-        }]);
+          usage: response.usage,
+          status: "completed",
+          updatedAt: completedAt,
+          completedAt,
+        }, true);
       }
     } catch (reason) {
       if (requestVersionRef.current !== requestVersion) return;
       const error = String(reason);
-      const toolCalls = streamedToolCalls.map((toolCall) => toolCall.status === "running" ? {
+      const completedAt = Date.now();
+      const toolCalls = streamedToolCalls.map((toolCall) => toolCall.status === "started" || toolCall.status === "running" ? {
         ...toolCall,
         output: toolCall.output || error,
         exitCode: toolCall.exitCode || 1,
-        status: "completed" as const,
+        status: "error" as const,
+        updatedAt: completedAt,
+        completedAt,
       } : toolCall);
-      setMessages([...pendingMessages, {
-        id: assistantMessageId,
-        role: "assistant",
+      updateMessage(assistantMessageId, {
+        messageType: "error",
         content: `请求失败：${error}`,
         toolCalls: toolCalls.length ? toolCalls : undefined,
-        createdAt: assistantCreatedAt,
-      }]);
+        status: "error",
+        updatedAt: completedAt,
+        completedAt,
+      }, true);
     } finally {
       if (requestVersionRef.current === requestVersion) {
         setLoading(false);
@@ -746,9 +968,21 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             </div>
           </div>
         )}
-        {session.aiMessages.map((message) => (
-          <article className={`ai-message ${message.role}`} key={message.id}>
-            <div className="message-meta">{message.role === "user" ? <User size={12} /> : <Bot size={12} />}<span>{message.role === "user" ? "你" : "Portico AI"}</span></div>
+        {session.aiMessages.map((message) => {
+          const status = messageStatus(message);
+          const type = resolveMessageType(message);
+          const updatedAt = message.updatedAt ?? message.completedAt ?? message.createdAt;
+          const toolCalls = toolCallsForMessage(message);
+          return (
+          <article className={`ai-message ${message.role} status-${status} ${streamingMessageId === message.id ? "streaming" : ""}`} data-message-type={type} key={message.id}>
+            <div className="message-meta">
+              {message.role === "user" ? <User size={12} /> : <Bot size={12} />}
+              <span>{message.role === "user" ? "你" : "Portico AI"}</span>
+              <span>{MESSAGE_TYPE_LABELS[type]}</span>
+              <span className={`message-status ${status}`}>{ACTION_STATUS_LABELS[status]}</span>
+              <time dateTime={new Date(updatedAt).toISOString()}>{formatActionTime(updatedAt)}</time>
+              <code title={message.id}>{shortActionId(message.id)}</code>
+            </div>
             {message.attachments?.length ? (
               <div className="message-attachments" aria-label="服务器临时文件引用">
                 {message.attachments.map((attachment) => (
@@ -771,9 +1005,12 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                 {thinkingOpen[message.id] && <p>{message.reasoning}</p>}
               </div>
             )}
-            {toolCallsForMessage(message).map((toolCall, index) => (
-              <ToolCallCard toolCall={toolCall} key={`${message.id}-tool-${toolCall.callId ?? index}`} />
+            {toolCalls.map((toolCall) => (
+              <ToolCallCard toolCall={toolCall} key={toolCall.id} />
             ))}
+            {message.role === "assistant" && !message.content && !message.reasoning && toolCalls.length === 0 && (status === "started" || status === "running") && (
+              <div className="thinking-progress"><span className="thinking-pulse" /><span>{status === "started" ? "开始分析当前会话" : "正在分析当前会话"}</span></div>
+            )}
             {message.approval && message.approvalState === "pending" && (
               <div className="approval-call">
                 <div className="approval-call-heading"><ShieldAlert size={14} /><span>需要人工确认</span><small>高危命令已暂停</small></div>
@@ -790,14 +1027,8 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
               ? <Suspense fallback={<div className="message-copy plain-text">{message.content}</div>}><MarkdownMessage content={message.content} /></Suspense>
               : <div className="message-copy plain-text">{message.content}</div>}
           </article>
-        ))}
-        {loading && !streamingMessageId && (
-          <article className="ai-message assistant thinking-message">
-            <div className="message-meta"><Bot size={12} /><span>Portico AI</span></div>
-            <div className="thinking-progress"><span className="thinking-pulse" /><span>正在分析当前会话</span></div>
-            <div className="thinking-steps"><span>读取上下文</span><span>评估命令风险</span><span>准备响应</span></div>
-          </article>
-        )}
+          );
+        })}
       </div>
 
       <div className="ai-composer-wrap">

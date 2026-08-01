@@ -2353,6 +2353,46 @@ body.is-resizing-rows .system-dock {
   letter-spacing: 0.02em;
 }
 
+.message-meta .message-status {
+  margin-left: auto;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  color: var(--muted);
+}
+
+.message-meta .message-status.started,
+.message-meta .message-status.running {
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  color: var(--accent);
+}
+
+.message-meta .message-status.completed {
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+  color: var(--success);
+}
+
+.message-meta .message-status.error {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.message-meta time,
+.message-meta code {
+  color: color-mix(in srgb, var(--muted) 78%, transparent);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 450;
+  letter-spacing: 0;
+}
+
+.message-meta code {
+  max-width: 86px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .message-copy {
   color: var(--fg);
   font-size: 12px;
@@ -2784,7 +2824,7 @@ body.is-resizing-rows .system-dock {
   cursor: pointer;
 }
 
-.tool-call-toggle span {
+.tool-call-toggle .tool-call-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2801,7 +2841,31 @@ body.is-resizing-rows .system-dock {
   animation: tool-call-status-spin 900ms linear infinite;
 }
 
+.tool-call-toggle .tool-call-status.started {
+  color: var(--accent);
+}
+
 .tool-call-toggle .tool-call-status.failed {
+  color: var(--danger);
+}
+
+.tool-call-status-label {
+  flex: 0 0 auto;
+  min-width: 34px;
+  color: var(--muted);
+  text-align: right;
+}
+
+.tool-call-status-label.started,
+.tool-call-status-label.running {
+  color: var(--accent);
+}
+
+.tool-call-status-label.completed {
+  color: var(--success);
+}
+
+.tool-call-status-label.error {
   color: var(--danger);
 }
 
@@ -2847,6 +2911,29 @@ body.is-resizing-rows .system-dock {
 .tool-call-content {
   min-height: 0;
   overflow: hidden;
+}
+
+.tool-call-metadata {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 8px;
+}
+
+.tool-call-metadata code {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-call-metadata time {
+  margin-left: auto;
 }
 
 .tool-call-content > code,

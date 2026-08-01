@@ -123,9 +123,14 @@ export interface AiImageAttachment {
   size: number;
 }
 
+export type AiActionStatus = "started" | "running" | "completed" | "error";
+export type AiMessageType = "text" | "command" | "tool" | "approval" | "status" | "error";
+export type AiStreamEventType = "message_delta" | "action_update";
+
 export interface AiMessage {
   id: string;
   role: MessageRole;
+  messageType: AiMessageType;
   content: string;
   attachments?: AiImageAttachment[];
   reasoning?: string;
@@ -137,6 +142,9 @@ export interface AiMessage {
   approvalState?: "pending" | "approved" | "rejected";
   usage?: AiTokenUsage;
   createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+  status: AiActionStatus;
 }
 
 export interface AiApproval {
@@ -147,12 +155,16 @@ export interface AiApproval {
 }
 
 export interface AiToolResult {
+  id: string;
   callId?: string;
   tool: string;
   command: string;
   output: string;
   exitCode: number;
-  status?: "running" | "completed";
+  status: AiActionStatus;
+  startedAt: number;
+  updatedAt: number;
+  completedAt?: number;
 }
 
 export type AiToolKey =
@@ -242,15 +254,21 @@ export interface AiResponse {
 }
 
 export interface AiStreamDelta {
+  eventType: AiStreamEventType;
   content?: string;
   reasoning?: string;
   toolCall?: {
-    callId: string;
-    phase: "started" | "finished";
+    id: string;
+    callId?: string;
+    phase?: "started" | "running" | "finished" | "error";
+    status: AiActionStatus;
     tool: string;
     command: string;
     output?: string;
     exitCode?: number;
+    startedAt?: number;
+    updatedAt: number;
+    completedAt?: number;
   };
 }
 
