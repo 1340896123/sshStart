@@ -369,6 +369,10 @@ export default function App() {
   };
 
   const selectSidebar = (view: "servers" | "transfers") => {
+    if (view === "servers" && sidebarOpen && sidebarView === view) {
+      setSidebarOpen(false);
+      return;
+    }
     setSidebarView(view);
     setSidebarOpen(true);
   };
@@ -459,7 +463,17 @@ export default function App() {
       >
         <nav className="activity-rail" aria-label="主导航">
           <div className="activity-main">
-            <button className={`activity-button ${sidebarView === "servers" ? "active" : ""}`} title="服务器" onClick={() => selectSidebar("servers")}><SquareTerminal size={18} /></button>
+            <button
+              className={`activity-button ${sidebarOpen && sidebarView === "servers" ? "active" : ""}`}
+              type="button"
+              title={sidebarOpen && sidebarView === "servers" ? "隐藏服务器列表" : "显示服务器列表"}
+              aria-label={sidebarOpen && sidebarView === "servers" ? "隐藏服务器列表" : "显示服务器列表"}
+              aria-expanded={sidebarOpen && sidebarView === "servers"}
+              aria-controls="server-sidebar"
+              onClick={() => selectSidebar("servers")}
+            >
+              <SquareTerminal size={18} />
+            </button>
             <button className="activity-button" title="命令片段"><Braces size={18} /></button>
             <button className="activity-button" title="AI 助手" onClick={() => setAiOpen((open) => !open)}><Sparkles size={18} /></button>
           </div>
@@ -474,7 +488,7 @@ export default function App() {
         </nav>
 
         {sidebarOpen && sidebarView === "servers" && (
-          <aside className="server-sidebar">
+          <aside id="server-sidebar" className="server-sidebar">
             <ServerTree
               servers={servers}
               savedGroups={savedGroups}

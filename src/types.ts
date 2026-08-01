@@ -114,10 +114,20 @@ export interface AiTokenUsage {
   requests: number;
 }
 
+export interface AiImageAttachment {
+  id: string;
+  kind: "image" | "text";
+  remotePath: string;
+  mimeType: string;
+  name: string;
+  size: number;
+}
+
 export interface AiMessage {
   id: string;
   role: MessageRole;
   content: string;
+  attachments?: AiImageAttachment[];
   reasoning?: string;
   toolCalls?: AiToolResult[];
   command?: string;
@@ -137,10 +147,12 @@ export interface AiApproval {
 }
 
 export interface AiToolResult {
+  callId?: string;
   tool: string;
   command: string;
   output: string;
   exitCode: number;
+  status?: "running" | "completed";
 }
 
 export type AiToolKey =
@@ -232,6 +244,14 @@ export interface AiResponse {
 export interface AiStreamDelta {
   content?: string;
   reasoning?: string;
+  toolCall?: {
+    callId: string;
+    phase: "started" | "finished";
+    tool: string;
+    command: string;
+    output?: string;
+    exitCode?: number;
+  };
 }
 
 export type WorkspaceView = "terminal" | "files" | "split";

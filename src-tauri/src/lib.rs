@@ -1,8 +1,9 @@
 mod system_icons;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use ssh2::{CheckResult, KnownHostFileKind, RenameFlags, Session};
+use ssh2::{CheckResult, KnownHostFileKind, OpenFlags, OpenType, RenameFlags, Session, Sftp};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env,
@@ -216,9 +217,60 @@ struct AiConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiAttachmentReference {
+    kind: String,
+    name: String,
+    remote_path: String,
+    mime_type: String,
+    size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct AiInputMessage {
     role: String,
     content: String,
+    #[serde(default)]
+    attachments: Vec<AiAttachmentReference>,
+}
+
+fn ai_input_message_content(message: &AiInputMessage) -> String {
+    if message.attachments.is_empty() {
+        return message.content.clone();
+    }
+    let references = message
+        .attachments
+        .iter()
+        .map(|attachment| {
+            let label = if attachment.kind == "text" {
+                "大文本"
+            } else {
+                "图片"
+            };
+            format!(
+                "- {label} `{}`（{}，{} 字节）：`{}`",
+                attachment.name, attachment.mime_type, attachment.size, attachment.remote_path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if message.content.is_empty() {
+        format!("[服务器临时文件引用]\n{references}")
+    } else {
+        format!("{}\n\n[服务器临时文件引用]\n{references}", message.content)
+    }
+}
+
+fn ai_input_message_cost(message: &AiInputMessage) -> usize {
+    estimate_tokens(&ai_input_message_content(message)) + 4
+}
+
+fn ai_input_message_transcript(message: &AiInputMessage) -> String {
+    format!("{}: {}", message.role, ai_input_message_content(message))
+}
+
+fn ai_input_message_to_api(message: &AiInputMessage) -> Value {
+    json!({ "role": message.role, "content": ai_input_message_content(message) })
 }
 
 #[derive(Debug, Serialize)]
@@ -335,6 +387,18 @@ struct AiResponse {
 struct AiStreamDelta {
     content: Option<String>,
     reasoning: Option<String>,
+    tool_call: Option<AiToolStreamUpdate>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiToolStreamUpdate {
+    call_id: String,
+    phase: String,
+    tool: String,
+    command: String,
+    output: Option<String>,
+    exit_code: Option<i32>,
 }
 
 #[derive(Debug, Default)]
@@ -1515,6 +1579,127 @@ async fn upload_file(
     upload_file_impl(server, local_path, remote_path, None, None).await
 }
 
+const MAX_AI_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiUploadedAttachment {
+    remote_path: String,
+    size: u64,
+}
+
+fn sanitize_ai_attachment_component(value: &str, fallback: &str, max_chars: usize) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(max_chars)
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches(['.', '_']).to_string();
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn sanitize_ai_attachment_name(name: &str) -> String {
+    let basename = name
+        .rsplit(|character| matches!(character, '/' | '\\'))
+        .next()
+        .unwrap_or(name);
+    sanitize_ai_attachment_component(basename, "attachment.bin", 96)
+}
+
+fn ai_attachment_temp_directory(username: &str) -> String {
+    format!(
+        "/tmp/portico-ai-{}",
+        sanitize_ai_attachment_component(username, "user", 48)
+    )
+}
+
+fn ensure_ai_attachment_temp_directory(sftp: &Sftp, directory: &str) -> Result<(), String> {
+    let path = Path::new(directory);
+    if sftp.stat(path).is_ok() {
+        return Ok(());
+    }
+    if let Err(error) = sftp.mkdir(path, 0o700) {
+        if sftp.stat(path).is_err() {
+            return Err(format!("创建远程附件临时目录失败: {error}"));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn upload_ai_attachment(
+    server: ServerProfile,
+    attachment_id: String,
+    name: String,
+    content_base64: String,
+) -> Result<AiUploadedAttachment, String> {
+    let max_encoded_length = MAX_AI_ATTACHMENT_BYTES * 4 / 3 + 8;
+    if content_base64.len() > max_encoded_length {
+        return Err(format!(
+            "附件不能超过 {} MiB",
+            MAX_AI_ATTACHMENT_BYTES / 1024 / 1024
+        ));
+    }
+    let content = BASE64_STANDARD
+        .decode(content_base64)
+        .map_err(|error| format!("附件数据不是有效的 Base64: {error}"))?;
+    if content.len() > MAX_AI_ATTACHMENT_BYTES {
+        return Err(format!(
+            "附件不能超过 {} MiB",
+            MAX_AI_ATTACHMENT_BYTES / 1024 / 1024
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = connect_ssh(&server)?;
+        let sftp = session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
+        let directory = ai_attachment_temp_directory(&server.username);
+        ensure_ai_attachment_temp_directory(&sftp, &directory)?;
+        let suffix = transfer_suffix(Some(&attachment_id));
+        let remote_path = format!(
+            "{directory}/{suffix}-{}",
+            sanitize_ai_attachment_name(&name)
+        );
+        let result = (|| -> Result<(), String> {
+            let mut target = sftp
+                .open_mode(
+                    Path::new(&remote_path),
+                    OpenFlags::WRITE | OpenFlags::EXCLUSIVE,
+                    0o600,
+                    OpenType::File,
+                )
+                .map_err(|error| format!("创建远程附件失败: {error}"))?;
+            target
+                .write_all(&content)
+                .map_err(|error| format!("上传附件失败: {error}"))?;
+            target
+                .flush()
+                .map_err(|error| format!("提交远程附件失败: {error}"))
+        })();
+        if result.is_err() {
+            sftp.unlink(Path::new(&remote_path)).ok();
+        }
+        result?;
+        Ok(AiUploadedAttachment {
+            remote_path,
+            size: content.len() as u64,
+        })
+    })
+    .await
+    .map_err(|error| format!("附件上传任务失败: {error}"))?
+}
+
 #[tauri::command]
 async fn download_file(
     server: ServerProfile,
@@ -2478,7 +2663,49 @@ fn apply_ai_stream_payload(
         }
     }
 
-    Ok(AiStreamDelta { content, reasoning })
+    Ok(AiStreamDelta {
+        content,
+        reasoning,
+        ..AiStreamDelta::default()
+    })
+}
+
+fn ai_tool_stream_delta(
+    call_id: &str,
+    phase: &str,
+    tool: &str,
+    command: &str,
+    output: Option<&str>,
+    exit_code: Option<i32>,
+) -> AiStreamDelta {
+    AiStreamDelta {
+        tool_call: Some(AiToolStreamUpdate {
+            call_id: call_id.to_string(),
+            phase: phase.to_string(),
+            tool: tool.to_string(),
+            command: command.to_string(),
+            output: output.map(str::to_string),
+            exit_code,
+        }),
+        ..AiStreamDelta::default()
+    }
+}
+
+fn emit_ai_tool_stream_update(
+    app: &tauri::AppHandle,
+    event_name: &str,
+    call_id: &str,
+    phase: &str,
+    tool: &str,
+    command: &str,
+    output: Option<&str>,
+    exit_code: Option<i32>,
+) {
+    app.emit(
+        event_name,
+        ai_tool_stream_delta(call_id, phase, tool, command, output, exit_code),
+    )
+    .ok();
 }
 
 fn process_ai_stream_line(
@@ -2608,10 +2835,7 @@ fn compaction_split_index(
     if messages.len() < 2 {
         return None;
     }
-    let total_cost = messages
-        .iter()
-        .map(|message| estimate_tokens(&message.content) + 4)
-        .sum::<usize>();
+    let total_cost = messages.iter().map(ai_input_message_cost).sum::<usize>();
     let effective_window =
         (context_window as usize).saturating_sub((max_output_tokens as usize).min(20_000));
     let reserve = (effective_window / 4).clamp(256, 13_000);
@@ -2625,7 +2849,7 @@ fn compaction_split_index(
     let mut recent_cost = 0usize;
     let mut fallback = None;
     for index in (1..messages.len()).rev() {
-        let cost = estimate_tokens(&messages[index].content) + 4;
+        let cost = ai_input_message_cost(&messages[index]);
         recent_cost = recent_cost.saturating_add(cost);
         if messages[index].role == "user" {
             fallback.get_or_insert(index);
@@ -2663,7 +2887,7 @@ async fn compact_messages_with_model(
     };
     let transcript = messages[..split_index]
         .iter()
-        .map(|message| format!("{}: {}", message.role, message.content))
+        .map(ai_input_message_transcript)
         .collect::<Vec<_>>()
         .join("\n\n");
     let transcript_budget = input_token_budget(context_window).min(12_000);
@@ -2703,6 +2927,7 @@ async fn compact_messages_with_model(
         AiInputMessage {
             role: "assistant".to_string(),
             content: format!("[自动压缩摘要]\n会话已继续。以下摘要替代较早的对话记录；最近几轮消息仍保留。\n\n{summary}"),
+            attachments: Vec::new(),
         },
         split_index,
         usage,
@@ -2721,7 +2946,7 @@ fn trim_messages_for_context(
     let mut retained = Vec::new();
 
     for message in messages.into_iter().rev() {
-        let cost = estimate_tokens(&message.content) + 4;
+        let cost = ai_input_message_cost(&message);
         if cost > remaining {
             if retained.is_empty() {
                 return Err("最新消息超过可用上下文，请缩短内容或增大上下文大小".to_string());
@@ -2737,10 +2962,24 @@ fn trim_messages_for_context(
 
 fn api_message_cost(message: &Value) -> usize {
     let mut cost = 4;
-    for key in ["role", "content", "tool_call_id"] {
-        if let Some(value) = message.get(key).and_then(Value::as_str) {
+    if let Some(role) = message.get("role").and_then(Value::as_str) {
+        cost += estimate_tokens(role);
+    }
+    if let Some(content) = message.get("content") {
+        if let Some(value) = content.as_str() {
             cost += estimate_tokens(value);
+        } else if let Some(parts) = content.as_array() {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    cost += estimate_tokens(text);
+                } else if part.get("type").and_then(Value::as_str) == Some("image_url") {
+                    cost += 256;
+                }
+            }
         }
+    }
+    if let Some(tool_call_id) = message.get("tool_call_id").and_then(Value::as_str) {
+        cost += estimate_tokens(tool_call_id);
     }
     if let Some(tool_calls) = message.get("tool_calls") {
         cost += estimate_tokens(&tool_calls.to_string());
@@ -3698,7 +3937,7 @@ async fn ai_chat(
         .build()
         .map_err(|error| format!("AI 客户端初始化失败: {error}"))?;
     let system = format!(
-        "{}\n当前 SSH 目标为 {}@{}:{}。客户端当前不支持图片输入。已启用的工具由本地设置决定；变更型工具允许状态为{}。先调用 risk_checker 检查高风险动作，命中后必须等待客户端人工确认。最终回答开头必须使用 <reasoning_summary>...</reasoning_summary> 给出简明的判断依据与执行计划；不要披露隐藏思维链。",
+        "{}\n当前 SSH 目标为 {}@{}:{}。用户消息中的附件以服务器临时文件路径引用，通常位于 /tmp/portico-ai-*；大文本可用 read_file 读取，图片必须通过可用的服务器工具检查，未实际读取时不要声称看过附件。已启用的工具由本地设置决定；变更型工具允许状态为{}。先调用 risk_checker 检查高风险动作，命中后必须等待客户端人工确认。最终回答开头必须使用 <reasoning_summary>...</reasoning_summary> 给出简明的判断依据与执行计划；不要披露隐藏思维链。",
         config.system_prompt,
         server.username,
         server.host,
@@ -3737,7 +3976,7 @@ async fn ai_chat(
     api_messages.extend(
         trim_messages_for_context(conversation_messages, config.context_window, &system)?
             .into_iter()
-            .map(|message| json!(message)),
+            .map(|message| ai_input_message_to_api(&message)),
     );
     let mut executed_tools = Vec::new();
     let stream_event_name = format!("ai-stream:{stream_id}");
@@ -3926,23 +4165,62 @@ async fn ai_chat(
                 }
             }
 
-            let execution = execute_ai_tool(&tool_name, &parsed, &server, &config.tools).await?;
+            let pending_command =
+                ai_tool_command_for_risk(&tool_name, &parsed).unwrap_or_else(|| tool_name.clone());
+            emit_ai_tool_stream_update(
+                &app,
+                &stream_event_name,
+                id,
+                "started",
+                &tool_name,
+                &pending_command,
+                None,
+                None,
+            );
+            let execution = match execute_ai_tool(&tool_name, &parsed, &server, &config.tools).await
+            {
+                Ok(execution) => execution,
+                Err(error) => {
+                    emit_ai_tool_stream_update(
+                        &app,
+                        &stream_event_name,
+                        id,
+                        "finished",
+                        &tool_name,
+                        &pending_command,
+                        Some(&error),
+                        Some(1),
+                    );
+                    return Err(error);
+                }
+            };
             let result = execution.result;
             let output = truncate_to_token_budget(
                 &format!("{}{}", result.stdout, result.stderr),
                 output_budget.min(config.tools.max_output_chars / 4),
             );
-            executed_tools.push(AiToolResult {
+            let tool_result = AiToolResult {
                 tool: tool_name,
                 command: execution.display_command,
-                output: output.clone(),
+                output,
                 exit_code: result.exit_code,
-            });
+            };
+            emit_ai_tool_stream_update(
+                &app,
+                &stream_event_name,
+                id,
+                "finished",
+                &tool_result.tool,
+                &tool_result.command,
+                Some(&tool_result.output),
+                Some(tool_result.exit_code),
+            );
             api_messages.push(json!({
                 "role": "tool",
                 "tool_call_id": id,
-                "content": format!("exit_code={}\n{}", result.exit_code, output)
+                "content": format!("exit_code={}\n{}", tool_result.exit_code, tool_result.output)
             }));
+            executed_tools.push(tool_result);
         }
     }
 
@@ -3971,6 +4249,7 @@ pub fn run() {
             list_network_interfaces,
             list_directory,
             upload_file,
+            upload_ai_attachment,
             download_file,
             start_upload_file,
             start_download_file,
@@ -4280,6 +4559,35 @@ mod tests {
     }
 
     #[test]
+    fn serializes_started_and_finished_tool_stream_updates() {
+        let started = serde_json::to_value(super::ai_tool_stream_delta(
+            "call-1",
+            "started",
+            "execute_command",
+            "df -h",
+            None,
+            None,
+        ))
+        .unwrap();
+        let finished = serde_json::to_value(super::ai_tool_stream_delta(
+            "call-1",
+            "finished",
+            "execute_command",
+            "df -h",
+            Some("disk output"),
+            Some(0),
+        ))
+        .unwrap();
+
+        assert_eq!(started["toolCall"]["callId"], "call-1");
+        assert_eq!(started["toolCall"]["phase"], "started");
+        assert!(started["toolCall"]["output"].is_null());
+        assert_eq!(finished["toolCall"]["phase"], "finished");
+        assert_eq!(finished["toolCall"]["output"], "disk output");
+        assert_eq!(finished["toolCall"]["exitCode"], 0);
+    }
+
+    #[test]
     fn captures_streamed_usage_cache_and_reasoning_tokens() {
         let mut completion = AiStreamCompletion::default();
         apply_ai_stream_payload(
@@ -4320,18 +4628,22 @@ mod tests {
             AiInputMessage {
                 role: "user".into(),
                 content: "old goal ".repeat(160),
+                attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "old result ".repeat(160),
+                attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "user".into(),
                 content: "recent request ".repeat(160),
+                attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "recent answer ".repeat(160),
+                attachments: Vec::new(),
             },
         ];
         let split = super::compaction_split_index(&messages, 2_048, 256)
@@ -4346,10 +4658,12 @@ mod tests {
             AiInputMessage {
                 role: "user".into(),
                 content: "hello".into(),
+                attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "hello back".into(),
+                attachments: Vec::new(),
             },
         ];
         assert!(super::compaction_split_index(&short_history, 8_192, 4_096).is_none());
@@ -4358,10 +4672,12 @@ mod tests {
             AiInputMessage {
                 role: "user".into(),
                 content: "request ".repeat(2_000),
+                attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "response ".repeat(2_000),
+                attachments: Vec::new(),
             },
         ];
         assert!(super::compaction_split_index(&oversized_single_turn, 8_192, 4_096).is_none());
@@ -4399,16 +4715,52 @@ mod tests {
     }
 
     #[test]
+    fn serializes_remote_attachment_references_as_text() {
+        let message = AiInputMessage {
+            role: "user".into(),
+            content: "检查这张图".into(),
+            attachments: vec![super::AiAttachmentReference {
+                kind: "image".into(),
+                name: "clipboard.png".into(),
+                remote_path: "/tmp/portico-ai-root/pasted-clipboard.png".into(),
+                mime_type: "image/png".into(),
+                size: 128,
+            }],
+        };
+        let payload = super::ai_input_message_to_api(&message);
+        assert_eq!(payload["role"], "user");
+        assert!(payload["content"].as_str().unwrap().contains("检查这张图"));
+        assert!(payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/portico-ai-root/pasted-clipboard.png"));
+    }
+
+    #[test]
+    fn sanitizes_remote_attachment_names_and_user_directories() {
+        assert_eq!(
+            super::sanitize_ai_attachment_name("../../日志?.txt"),
+            "日志_.txt"
+        );
+        assert_eq!(
+            super::ai_attachment_temp_directory("ops/user"),
+            "/tmp/portico-ai-ops_user"
+        );
+    }
+
+    #[test]
     fn estimates_and_trims_ai_context_from_the_oldest_message() {
         assert_eq!(estimate_tokens("abcd你好"), 3);
         let messages = vec![
             AiInputMessage {
                 role: "user".into(),
                 content: "a".repeat(4_000),
+                attachments: Vec::new(),
             },
             AiInputMessage {
                 role: "assistant".into(),
                 content: "recent".into(),
+                attachments: Vec::new(),
             },
         ];
         let retained = trim_messages_for_context(messages, 1_024, "system").unwrap();
@@ -4421,6 +4773,7 @@ mod tests {
         let messages = vec![AiInputMessage {
             role: "user".into(),
             content: "a".repeat(4_000),
+            attachments: Vec::new(),
         }];
         let error = trim_messages_for_context(messages, 1_024, "system").unwrap_err();
         assert!(error.contains("最新消息超过可用上下文"));

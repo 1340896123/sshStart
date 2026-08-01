@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -10,7 +10,9 @@ import {
   CircleGauge,
   CircleStop,
   Copy,
+  FileText,
   History,
+  ImageIcon,
   MessageSquarePlus,
   Play,
   Send,
@@ -29,8 +31,8 @@ import {
   upsertAiConversation,
   type AiConversation,
 } from "../aiHistory";
-import { isTauri, uid } from "../lib";
-import type { AiApproval, AiConfig, AiMessage, AiResponse, AiStreamDelta, AiTokenUsage, AiToolResult, ServerProfile, SessionState } from "../types";
+import { formatBytes, isTauri, uid } from "../lib";
+import type { AiApproval, AiConfig, AiImageAttachment, AiMessage, AiResponse, AiStreamDelta, AiTokenUsage, AiToolResult, ServerProfile, SessionState } from "../types";
 import { AiHistoryPopover } from "./AiHistoryPopover";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage").then((module) => ({ default: module.MarkdownMessage })));
@@ -66,6 +68,48 @@ const REASONING_OPEN = "<reasoning_summary>";
 const REASONING_CLOSE = "</reasoning_summary>";
 const TOKEN_NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN");
 const TOKEN_COMPACT_FORMATTER = new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 });
+const LARGE_PASTE_THRESHOLD = 32_000;
+const MAX_PASTED_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_PASTED_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_PASTED_ATTACHMENTS = 4;
+
+interface DraftAiAttachment extends Omit<AiImageAttachment, "remotePath"> {
+  remotePath?: string;
+  status: "uploading" | "ready" | "failed";
+  error?: string;
+}
+
+interface AiUploadedAttachment {
+  remotePath: string;
+  size: number;
+}
+
+interface PastedAttachmentSource {
+  kind: AiImageAttachment["kind"];
+  name: string;
+  mimeType: string;
+  blob: Blob;
+}
+
+const readBlobAsBase64 = (blob: Blob) => new Promise<string>((resolve, reject) => {
+  const reader = new FileReader();
+  reader.addEventListener("load", () => {
+    const dataUrl = String(reader.result);
+    const separator = dataUrl.indexOf(",");
+    if (separator < 0) reject(new Error("无法编码附件"));
+    else resolve(dataUrl.slice(separator + 1));
+  });
+  reader.addEventListener("error", () => reject(reader.error ?? new Error("无法读取附件")));
+  reader.readAsDataURL(blob);
+});
+
+const pastedImageName = (file: File) => {
+  if (file.name) return file.name;
+  const extension = file.type === "image/jpeg" ? "jpg" : file.type === "image/webp" ? "webp" : file.type === "image/gif" ? "gif" : "png";
+  return `pasted-image.${extension}`;
+};
+
+const pastedTextName = () => `pasted-text-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
 
 const formatTokenCount = (value: number, compact = false) =>
   (compact ? TOKEN_COMPACT_FORMATTER : TOKEN_NUMBER_FORMATTER).format(value);
@@ -119,8 +163,79 @@ const toolCallsForMessage = (message: AiMessage): AiToolResult[] => {
   return toolCalls.filter((toolCall) => !isApprovalPlaceholder(toolCall, message.approval));
 };
 
+const mergeStreamedToolCall = (
+  toolCalls: AiToolResult[],
+  update: NonNullable<AiStreamDelta["toolCall"]>,
+) => {
+  const existingIndex = toolCalls.findIndex((toolCall) => toolCall.callId === update.callId);
+  const existing = existingIndex >= 0 ? toolCalls[existingIndex] : undefined;
+  const next: AiToolResult = {
+    callId: update.callId,
+    tool: update.tool || existing?.tool || "execute_command",
+    command: update.command || existing?.command || update.tool,
+    output: update.output ?? existing?.output ?? "",
+    exitCode: update.exitCode ?? existing?.exitCode ?? 0,
+    status: update.phase === "started" ? "running" : "completed",
+  };
+  if (existingIndex < 0) return [...toolCalls, next];
+  return toolCalls.map((toolCall, index) => index === existingIndex ? next : toolCall);
+};
+
+function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
+  const [expanded, setExpanded] = useState(true);
+  const contentId = useId();
+  const running = toolCall.status === "running";
+  const failed = !running && toolCall.exitCode !== 0;
+
+  return (
+    <div className={`tool-call ${expanded ? "expanded" : "collapsed"}`}>
+      <div className="tool-call-header">
+        <button
+          className="tool-call-toggle"
+          type="button"
+          title={expanded ? "折叠命令执行区域" : "展开命令执行区域"}
+          aria-label={expanded ? "折叠命令执行区域" : "展开命令执行区域"}
+          aria-expanded={expanded}
+          aria-controls={contentId}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <TerminalSquare size={12} />
+          <span>{TOOL_LABELS[toolCall.tool] ?? toolCall.tool}</span>
+          {running
+            ? <CircleGauge className="tool-call-status running" size={12} aria-label="执行中" />
+            : failed
+              ? <X className="tool-call-status failed" size={12} aria-label="执行失败" />
+              : <Check className="tool-call-status" size={12} aria-label="执行完成" />}
+        </button>
+        <button
+          className="tool-call-copy"
+          type="button"
+          title="复制命令"
+          aria-label="复制命令"
+          onClick={() => navigator.clipboard.writeText(toolCall.command)}
+        >
+          <Copy size={11} />
+        </button>
+      </div>
+      <div className="tool-call-body" id={contentId} aria-hidden={!expanded}>
+        <div className="tool-call-content">
+          <code>$ {toolCall.command}</code>
+          {toolCall.output
+            ? <pre>{toolCall.output}</pre>
+            : running
+              ? <pre>正在执行…</pre>
+              : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Props) {
   const [input, setInput] = useState("");
+  const [pastedImages, setPastedImages] = useState<DraftAiAttachment[]>([]);
+  const [pasteNotice, setPasteNotice] = useState<string>();
   const [loading, setLoading] = useState(false);
   const [autoExecute, setAutoExecute] = useState(true);
   const [thinkingOpen, setThinkingOpen] = useState<Record<string, boolean>>({});
@@ -135,6 +250,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   const messagesRef = useRef(session.aiMessages);
   const compactionStateRef = useRef<{ summary: string; cutoff: number }>();
   const approvalArgumentsRef = useRef(new Map<string, Record<string, unknown>>());
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   messagesRef.current = session.aiMessages;
   const historyControlRef = useRef<HTMLDivElement>(null);
 
@@ -223,12 +339,114 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     replaceConversations(upsertAiConversation(conversationsRef.current, conversationId, server, messages));
   };
 
+  const insertPastedText = (textarea: HTMLTextAreaElement, text: string) => {
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    setInput((current) => `${current.slice(0, start)}${text}${current.slice(end)}`);
+    window.requestAnimationFrame(() => {
+      const caret = start + text.length;
+      textarea.focus();
+      textarea.setSelectionRange(caret, caret);
+    });
+  };
+
+  const addPastedImages = async (files: File[], largeText?: string) => {
+    const sources: PastedAttachmentSource[] = files
+      .filter((file) => file.size <= MAX_PASTED_IMAGE_BYTES)
+      .map((file) => ({
+        kind: "image",
+        name: pastedImageName(file),
+        mimeType: file.type || "image/png",
+        blob: file,
+      }));
+    let rejectedCount = files.length - sources.length;
+    if (largeText) {
+      const textBlob = new Blob([largeText], { type: "text/plain;charset=utf-8" });
+      if (textBlob.size <= MAX_PASTED_ATTACHMENT_BYTES) {
+        sources.push({ kind: "text", name: pastedTextName(), mimeType: textBlob.type, blob: textBlob });
+      } else {
+        rejectedCount += 1;
+      }
+    }
+    const availableSlots = Math.max(0, MAX_PASTED_ATTACHMENTS - pastedImages.length);
+    const selected = sources.slice(0, availableSlots);
+    if (selected.length === 0) {
+      setPasteNotice(
+        availableSlots === 0
+          ? `每条消息最多引用 ${MAX_PASTED_ATTACHMENTS} 个临时文件。`
+          : `图片不能超过 ${MAX_PASTED_IMAGE_BYTES / 1024 / 1024} MiB，大文本不能超过 ${MAX_PASTED_ATTACHMENT_BYTES / 1024 / 1024} MiB。`,
+      );
+      return;
+    }
+    const pending = selected.map((source): DraftAiAttachment => ({
+      id: uid("pasted-attachment"),
+      kind: source.kind,
+      mimeType: source.mimeType,
+      name: source.name,
+      size: source.blob.size,
+      status: "uploading",
+    }));
+    setPastedImages((current) => [...current, ...pending]);
+    setPasteNotice(`正在上传 ${pending.length} 个附件到服务器临时目录…`);
+    const results = await Promise.all(pending.map(async (attachment, index) => {
+      try {
+        if (!isTauri()) throw new Error("仅桌面应用可上传到 SSH 服务器");
+        const uploaded = await invoke<AiUploadedAttachment>("upload_ai_attachment", {
+          server,
+          attachmentId: attachment.id,
+          name: attachment.name,
+          contentBase64: await readBlobAsBase64(selected[index].blob),
+        });
+        setPastedImages((current) => current.map((item) => item.id === attachment.id
+          ? { ...item, remotePath: uploaded.remotePath, size: uploaded.size, status: "ready", error: undefined }
+          : item));
+        return true;
+      } catch (reason) {
+        setPastedImages((current) => current.map((item) => item.id === attachment.id
+          ? { ...item, status: "failed", error: String(reason) }
+          : item));
+        return false;
+      }
+    }));
+    const uploadedCount = results.filter(Boolean).length;
+    const failedCount = results.length - uploadedCount;
+    const skippedCount = rejectedCount + sources.length - selected.length;
+    setPasteNotice(
+      uploadedCount
+        ? `已上传 ${uploadedCount} 个临时文件${failedCount ? `；${failedCount} 个失败` : ""}${skippedCount ? `；${skippedCount} 个未添加` : ""}。`
+        : `附件上传失败${skippedCount ? `；${skippedCount} 个未添加` : ""}。`,
+    );
+  };
+
+  const handlePaste = (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const clipboard = event.clipboardData;
+    const imageFiles = Array.from(clipboard.items)
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file));
+    const text = clipboard.getData("text/plain");
+    if (imageFiles.length === 0 && text.length < LARGE_PASTE_THRESHOLD) return;
+
+    event.preventDefault();
+    const largeText = text.length >= LARGE_PASTE_THRESHOLD ? text : undefined;
+    if (text && !largeText) insertPastedText(event.currentTarget, text);
+    void addPastedImages(imageFiles, largeText);
+  };
+
+  const removePastedImage = (imageId: string) => {
+    setPastedImages((current) => current.filter((image) => image.id !== imageId));
+    setPasteNotice(undefined);
+    inputRef.current?.focus();
+  };
+
   const startNewConversation = () => {
     requestVersionRef.current += 1;
     activeConversationIdRef.current = undefined;
     setActiveConversationId(undefined);
     setHistoryOpen(false);
     setInput("");
+    setPastedImages([]);
+    setPasteNotice(undefined);
     setLoading(false);
     setStreamingMessageId(undefined);
     setApprovalLoading(undefined);
@@ -245,6 +463,8 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setActiveConversationId(conversation.id);
     setHistoryOpen(false);
     setInput("");
+    setPastedImages([]);
+    setPasteNotice(undefined);
     setLoading(false);
     setStreamingMessageId(undefined);
     setApprovalLoading(undefined);
@@ -321,21 +541,46 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
 
   const send = async (content = input) => {
     const text = content.trim();
-    if (!text || loading) return;
+    if (pastedImages.some((attachment) => attachment.status === "uploading")) {
+      setPasteNotice("请等待附件上传完成后再发送。");
+      return;
+    }
+    if (pastedImages.some((attachment) => attachment.status === "failed")) {
+      setPasteNotice("请移除上传失败的附件后再发送。");
+      return;
+    }
+    const attachments = pastedImages.flatMap((attachment): AiImageAttachment[] => attachment.remotePath ? [{
+      id: attachment.id,
+      kind: attachment.kind,
+      remotePath: attachment.remotePath,
+      mimeType: attachment.mimeType,
+      name: attachment.name,
+      size: attachment.size,
+    }] : []);
+    if ((!text && attachments.length === 0) || loading) return;
     setHistoryOpen(false);
     setInput("");
+    setPastedImages([]);
+    setPasteNotice(undefined);
     const requestVersion = requestVersionRef.current + 1;
     requestVersionRef.current = requestVersion;
-    const userMessage: AiMessage = { id: uid("message"), role: "user", content: text, createdAt: Date.now() };
+    const userMessage: AiMessage = {
+      id: uid("message"),
+      role: "user",
+      content: text || "请分析我上传到服务器临时目录的附件。",
+      attachments: attachments.length ? attachments : undefined,
+      createdAt: Date.now(),
+    };
     const assistantMessageId = uid("message");
     const assistantCreatedAt = Date.now();
     const pendingMessages = [...session.aiMessages, userMessage];
     const compactionState = config.autoCompress ? compactionStateRef.current : undefined;
     const contextMessages = compactionState
-      ? [{ role: "assistant" as const, content: compactionState.summary }, ...session.aiMessages.slice(compactionState.cutoff), userMessage]
+      ? [{ role: "assistant" as const, content: compactionState.summary, attachments: undefined }, ...session.aiMessages.slice(compactionState.cutoff), userMessage]
       : pendingMessages;
     setMessages(pendingMessages);
     setLoading(true);
+    let streamedToolCalls: AiToolResult[] = [];
 
     try {
       if (text.startsWith("/run ")) {
@@ -368,14 +613,16 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           if (requestVersionRef.current !== requestVersion) return;
           streamedContent += payload.content ?? "";
           streamedReasoning += payload.reasoning ?? "";
+          if (payload.toolCall) streamedToolCalls = mergeStreamedToolCall(streamedToolCalls, payload.toolCall);
           const visible = presentStreamedResponse(streamedContent, streamedReasoning);
-          if (!visible.content && !visible.reasoning) return;
+          if (!visible.content && !visible.reasoning && streamedToolCalls.length === 0) return;
           setStreamingMessageId(assistantMessageId);
           setMessages([...pendingMessages, {
             id: assistantMessageId,
             role: "assistant",
             content: visible.content,
             reasoning: visible.reasoning,
+            toolCalls: streamedToolCalls.length ? [...streamedToolCalls] : undefined,
             createdAt: assistantCreatedAt,
           }], false);
         });
@@ -384,7 +631,11 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           response = await invoke<AiResponse>("ai_chat", {
             config,
             server,
-            messages: contextMessages.map(({ role, content }) => ({ role, content })),
+            messages: contextMessages.map(({ role, content, attachments: messageAttachments }) => ({
+              role,
+              content,
+              attachments: messageAttachments?.map(({ kind, name, remotePath, mimeType, size }) => ({ kind, name, remotePath, mimeType, size })),
+            })),
             allowExecute: autoExecute,
             streamId,
           });
@@ -403,7 +654,22 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           };
         }
         const approval = response.approval;
-        const toolCalls = response.toolCalls.filter((toolCall) => !isApprovalPlaceholder(toolCall, approval));
+        const unmatchedStreamedToolCalls = [...streamedToolCalls];
+        const toolCalls = response.toolCalls
+          .filter((toolCall) => !isApprovalPlaceholder(toolCall, approval))
+          .map((toolCall) => {
+            const streamedIndex = unmatchedStreamedToolCalls.findIndex((streamed) =>
+              streamed.tool === toolCall.tool && streamed.command === toolCall.command,
+            );
+            const [streamed] = streamedIndex >= 0
+              ? unmatchedStreamedToolCalls.splice(streamedIndex, 1)
+              : [];
+            return {
+              ...toolCall,
+              callId: streamed?.callId,
+              status: "completed" as const,
+            };
+          });
         const lastTool = toolCalls[toolCalls.length - 1];
         if (approval?.arguments) approvalArgumentsRef.current.set(assistantMessageId, approval.arguments);
         setMessages([...pendingMessages, {
@@ -416,7 +682,20 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
       }
     } catch (reason) {
       if (requestVersionRef.current !== requestVersion) return;
-      setMessages([...pendingMessages, { id: assistantMessageId, role: "assistant", content: `请求失败：${String(reason)}`, createdAt: assistantCreatedAt }]);
+      const error = String(reason);
+      const toolCalls = streamedToolCalls.map((toolCall) => toolCall.status === "running" ? {
+        ...toolCall,
+        output: toolCall.output || error,
+        exitCode: toolCall.exitCode || 1,
+        status: "completed" as const,
+      } : toolCall);
+      setMessages([...pendingMessages, {
+        id: assistantMessageId,
+        role: "assistant",
+        content: `请求失败：${error}`,
+        toolCalls: toolCalls.length ? toolCalls : undefined,
+        createdAt: assistantCreatedAt,
+      }]);
     } finally {
       if (requestVersionRef.current === requestVersion) {
         setLoading(false);
@@ -470,6 +749,20 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         {session.aiMessages.map((message) => (
           <article className={`ai-message ${message.role}`} key={message.id}>
             <div className="message-meta">{message.role === "user" ? <User size={12} /> : <Bot size={12} />}<span>{message.role === "user" ? "你" : "Portico AI"}</span></div>
+            {message.attachments?.length ? (
+              <div className="message-attachments" aria-label="服务器临时文件引用">
+                {message.attachments.map((attachment) => (
+                  <div className="attachment-reference ready" key={attachment.id} title={attachment.remotePath}>
+                    {attachment.kind === "image" ? <ImageIcon size={13} aria-hidden="true" /> : <FileText size={13} aria-hidden="true" />}
+                    <span className="attachment-reference-copy">
+                      <strong>{attachment.name}</strong>
+                      <code>{attachment.remotePath}</code>
+                    </span>
+                    <small>{formatBytes(attachment.size)}</small>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             {message.reasoning && (
               <div className="reasoning-block">
                 <button onClick={() => setThinkingOpen((current) => ({ ...current, [message.id]: !current[message.id] }))}>
@@ -479,11 +772,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
               </div>
             )}
             {toolCallsForMessage(message).map((toolCall, index) => (
-              <div className="tool-call" key={`${message.id}-tool-${index}`}>
-                <div className="tool-call-header"><TerminalSquare size={12} /><span>{TOOL_LABELS[toolCall.tool] ?? toolCall.tool}</span><Check size={12} /><button title="复制命令" onClick={() => navigator.clipboard.writeText(toolCall.command)}><Copy size={11} /></button></div>
-                <code>$ {toolCall.command}</code>
-                {toolCall.output && <pre>{toolCall.output}</pre>}
-              </div>
+              <ToolCallCard toolCall={toolCall} key={`${message.id}-tool-${toolCall.callId ?? index}`} />
             ))}
             {message.approval && message.approvalState === "pending" && (
               <div className="approval-call">
@@ -565,17 +854,42 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           <small>{autoExecute ? "自动" : "仅建议"}</small>
         </div>
         <div className="ai-composer">
+          {pastedImages.length > 0 && (
+            <div className="composer-attachments" aria-label="待发送的服务器临时文件引用">
+              {pastedImages.map((attachment) => (
+                <div className={`attachment-reference ${attachment.status}`} key={attachment.id} title={attachment.error || attachment.remotePath}>
+                  {attachment.kind === "image" ? <ImageIcon size={13} aria-hidden="true" /> : <FileText size={13} aria-hidden="true" />}
+                  <span className="attachment-reference-copy">
+                    <strong>{attachment.name}</strong>
+                    <code>{attachment.status === "ready" ? attachment.remotePath : attachment.status === "uploading" ? "正在上传到服务器临时目录…" : "上传失败"}</code>
+                  </span>
+                  <small>{formatBytes(attachment.size)}</small>
+                  <button type="button" title={`移除 ${attachment.name}`} aria-label={`移除 ${attachment.name}`} onClick={() => removePastedImage(attachment.id)}>
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <textarea
+            ref={inputRef}
             rows={2}
             value={input}
             disabled={Boolean(approvalLoading)}
-            onChange={(event) => setInput(event.target.value)}
+            onChange={(event) => {
+              setInput(event.target.value);
+              setPasteNotice(undefined);
+            }}
+            onPaste={handlePaste}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); }
             }}
             placeholder="描述任务，或输入 /run 执行命令"
           />
-          <div className="composer-footer"><span>当前目录 {session.cwd}</span>{loading ? <button className="send-button stop" title="停止" onClick={() => { requestVersionRef.current += 1; setLoading(false); setStreamingMessageId(undefined); }}><CircleStop size={15} /></button> : <button className="send-button" title="发送" disabled={Boolean(approvalLoading) || !input.trim()} onClick={() => void send()}><Send size={15} /></button>}</div>
+          <div className="composer-footer">
+            <span className="composer-status">{pasteNotice || `当前目录 ${session.cwd}`}</span>
+            {loading ? <button className="send-button stop" title="停止" onClick={() => { requestVersionRef.current += 1; setLoading(false); setStreamingMessageId(undefined); }}><CircleStop size={15} /></button> : <button className="send-button" title="发送" disabled={Boolean(approvalLoading) || pastedImages.some((attachment) => attachment.status !== "ready") || (!input.trim() && pastedImages.length === 0)} onClick={() => void send()}><Send size={15} /></button>}
+          </div>
         </div>
       </div>
     </aside>

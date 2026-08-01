@@ -330,7 +330,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
             {visibleActiveSection === "model" && (
               <>
                 <section className="settings-panel">
-                  <header><strong>模型服务</strong><small>配置 OpenAI 兼容的大语言模型接入；当前仅支持文本输入</small></header>
+                  <header><strong>模型服务</strong><small>配置 OpenAI 兼容的大语言模型接入；支持文本与图片输入，具体取决于模型能力</small></header>
                   <div className="settings-config-row">
                     <span className="settings-row-copy"><strong>Provider</strong><small>当前版本固定使用 OpenAI 兼容 Chat Completions 接口</small></span>
                     <span className="settings-static-value">OpenAI 兼容</span>
