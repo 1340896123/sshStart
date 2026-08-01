@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, State};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -294,6 +295,10 @@ fn ai_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn ai_unique_id(prefix: &str) -> String {
+    format!("{prefix}-{}", Uuid::new_v4())
+}
+
 fn completed_ai_tool_result(
     id: String,
     tool: String,
@@ -445,11 +450,21 @@ struct AiToolStreamUpdate {
     completed_at: Option<u64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AiStreamToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+impl Default for AiStreamToolCall {
+    fn default() -> Self {
+        Self {
+            id: ai_unique_id("ai-action"),
+            name: String::new(),
+            arguments: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -475,14 +490,9 @@ impl AiStreamCompletion {
             message["tool_calls"] = Value::Array(
                 self.tool_calls
                     .iter()
-                    .enumerate()
-                    .map(|(index, tool_call)| {
+                    .map(|tool_call| {
                         json!({
-                            "id": if tool_call.id.is_empty() {
-                                format!("tool-call-{index}")
-                            } else {
-                                tool_call.id.clone()
-                            },
+                            "id": tool_call.id,
                             "type": "function",
                             "function": {
                                 "name": tool_call.name,
@@ -2692,9 +2702,6 @@ fn apply_ai_stream_payload(
                 completion.tool_calls.push(AiStreamToolCall::default());
             }
             let target = &mut completion.tool_calls[index];
-            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
-                target.id = id.to_string();
-            }
             if let Some(name) = tool_call.pointer("/function/name").and_then(Value::as_str) {
                 target.name.push_str(name);
             }
@@ -4678,11 +4685,22 @@ mod tests {
         let message = completion.message();
         assert_eq!(message["content"], "状态正常");
         assert_eq!(message["reasoning_content"], "已检查");
-        assert_eq!(message["tool_calls"][0]["id"], "call-1");
+        let first_id = message["tool_calls"][0]["id"].as_str().unwrap();
+        assert!(first_id.starts_with("ai-action-"));
+        assert_ne!(first_id, "call-1");
         assert_eq!(
             message["tool_calls"][0]["function"]["arguments"],
             r#"{"command":"df -h"}"#
         );
+
+        let mut next_completion = AiStreamCompletion::default();
+        apply_ai_stream_payload(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"run_ssh_command","arguments":"{}"}}]}}]}"#,
+            &mut next_completion,
+        )
+        .unwrap();
+        let next_message = next_completion.message();
+        assert_ne!(next_message["tool_calls"][0]["id"], first_id);
     }
 
     #[test]

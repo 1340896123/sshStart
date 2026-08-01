@@ -3,7 +3,7 @@ import type { ServerProfile } from "./types";
 export const isTauri = () => Boolean(window.__TAURI_INTERNALS__);
 
 export const uid = (prefix: string) =>
-  `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+  `${prefix}-${crypto.randomUUID()}`;
 
 export const formatBytes = (size: number) => {
   if (size === 0) return "0 B";
