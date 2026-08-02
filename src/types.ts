@@ -260,6 +260,39 @@ export interface AiConfig {
   tools: AiToolSettings;
 }
 
+type AiConfigInput = Omit<Partial<AiConfig>, "tools"> & {
+  tools?: Partial<AiToolSettings>;
+};
+
+export const DEFAULT_AI_CONFIG: AiConfig = {
+  apiMode: "chat-completions",
+  endpoint: "https://api.openai.com/v1",
+  apiKey: "",
+  model: "gpt-4.1-mini",
+  contextWindow: 128000,
+  maxOutputTokens: 4096,
+  autoCompress: true,
+  temperature: 0.2,
+  systemPrompt:
+    "你是一名谨慎的 Linux 运维助手。优先解释风险；先使用 risk_checker 评估动作，再调用合适的结构化工具。高风险操作必须等待人工确认，不要尝试绕过本地策略。",
+  tools: DEFAULT_AI_TOOL_SETTINGS,
+};
+
+export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig = DEFAULT_AI_CONFIG): AiConfig {
+  return {
+    apiMode: config.apiMode ?? fallback.apiMode,
+    endpoint: config.endpoint ?? fallback.endpoint,
+    apiKey: config.apiKey ?? fallback.apiKey,
+    model: config.model ?? fallback.model,
+    contextWindow: config.contextWindow ?? fallback.contextWindow,
+    maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,
+    autoCompress: config.autoCompress ?? fallback.autoCompress,
+    temperature: config.temperature ?? fallback.temperature,
+    systemPrompt: config.systemPrompt ?? fallback.systemPrompt,
+    tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...fallback.tools, ...(config.tools ?? {}) },
+  };
+}
+
 export interface AiResponse {
   content: string;
   reasoning?: string;

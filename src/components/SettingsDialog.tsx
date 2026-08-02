@@ -30,7 +30,7 @@ import {
   X,
 } from "lucide-react";
 import { isTauri } from "../lib";
-import { DEFAULT_AI_TOOL_SETTINGS, type AiConfig, type AiToolKey } from "../types";
+import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, type AiConfig, type AiToolKey } from "../types";
 
 interface Props {
   config: AiConfig;
@@ -107,20 +107,8 @@ const SETTINGS_SECTIONS: Array<{
 ];
 
 export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Props) {
-  const [value, setValue] = useState(() => ({
-    ...config,
-    apiMode: config.apiMode ?? "chat-completions",
-    maxOutputTokens: config.maxOutputTokens ?? 4096,
-    autoCompress: config.autoCompress ?? true,
-    tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...(config.tools ?? {}) },
-  }));
-  const [savedValue, setSavedValue] = useState(() => ({
-    ...config,
-    apiMode: config.apiMode ?? "chat-completions",
-    maxOutputTokens: config.maxOutputTokens ?? 4096,
-    autoCompress: config.autoCompress ?? true,
-    tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...(config.tools ?? {}) },
-  }));
+  const [value, setValue] = useState(() => normalizeAiConfig(config));
+  const [savedValue, setSavedValue] = useState(() => normalizeAiConfig(config));
   const [models, setModels] = useState<string[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
@@ -189,13 +177,13 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     setSaving(true);
     setError("");
     try {
-      const nextValue = {
+      const nextValue = normalizeAiConfig({
         ...value,
         endpoint: value.endpoint.trim(),
         apiKey: value.apiKey.trim(),
         model: value.model.trim(),
         tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...value.tools },
-      };
+      });
       await onSave(nextValue);
       setValue(nextValue);
       setSavedValue(nextValue);

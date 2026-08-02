@@ -28,22 +28,11 @@ import { SystemDock } from "./components/SystemDock";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
 import { DEMO_SERVER, isTauri, uid } from "./lib";
 import { normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
-import { DEFAULT_AI_TOOL_SETTINGS } from "./types";
+import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
 import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
 
-const DEFAULT_AI_CONFIG: AiConfig = {
-  apiMode: "chat-completions",
-  endpoint: "https://api.openai.com/v1",
-  apiKey: "",
-  model: "gpt-4.1-mini",
-  contextWindow: 128000,
-  maxOutputTokens: 4096,
-  autoCompress: true,
-  temperature: 0.2,
-  systemPrompt:
-    "你是一名谨慎的 Linux 运维助手。优先解释风险；先使用 risk_checker 评估动作，再调用合适的结构化工具。高风险操作必须等待人工确认，不要尝试绕过本地策略。",
-  tools: DEFAULT_AI_TOOL_SETTINGS,
-};
+const AI_CONFIG_STORAGE_KEY = "portico.ai";
+const serializeAiConfig = ({ apiKey: _apiKey, ...config }: AiConfig) => config;
 
 const SIDEBAR_MIN_WIDTH = 210;
 const SIDEBAR_MAX_WIDTH = 420;
@@ -65,15 +54,21 @@ const initialAiPaneWidth = () => {
   return clampWidth(window.innerWidth * 0.29, 330, 410);
 };
 
-function useStoredState<T>(key: string, initialValue: T, serialize: (value: T) => unknown = (value) => value) {
+function useStoredState<T>(
+  key: string,
+  initialValue: T,
+  serialize: (value: T) => unknown = (value) => value,
+  deserialize?: (value: unknown) => T,
+) {
   const [value, setValue] = useState<T>(() => {
     try {
       const stored = localStorage.getItem(key);
       if (!stored) return initialValue;
-      const parsed = JSON.parse(stored) as T;
+      const parsed = JSON.parse(stored) as unknown;
+      if (deserialize) return deserialize(parsed);
       return typeof initialValue === "object" && initialValue !== null && !Array.isArray(initialValue)
-        ? { ...initialValue, ...parsed }
-        : parsed;
+        ? { ...initialValue, ...(parsed as T) }
+        : parsed as T;
     } catch {
       return initialValue;
     }
@@ -87,6 +82,7 @@ function useStoredState<T>(key: string, initialValue: T, serialize: (value: T) =
 }
 
 export default function App() {
+  const hadStoredAiConfig = useRef(localStorage.getItem(AI_CONFIG_STORAGE_KEY) !== null);
   const [servers, setServers] = useStoredState<ServerProfile[]>("portico.servers", [DEMO_SERVER], (items) =>
     items.map(({ password: _password, passphrase: _passphrase, jumpHost, ...server }) => ({
       ...server,
@@ -94,7 +90,12 @@ export default function App() {
     })),
   );
   const [savedGroups, setSavedGroups] = useStoredState<string[]>("portico.server-groups", []);
-  const [aiConfig, setAiConfig] = useStoredState<AiConfig>("portico.ai", DEFAULT_AI_CONFIG, ({ apiKey: _apiKey, ...config }) => config);
+  const [aiConfig, setAiConfig] = useStoredState<AiConfig>(
+    AI_CONFIG_STORAGE_KEY,
+    DEFAULT_AI_CONFIG,
+    serializeAiConfig,
+    (stored) => normalizeAiConfig(stored as Partial<AiConfig>),
+  );
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -178,7 +179,9 @@ export default function App() {
       setSavedGroups((current) => bootstrapServers.reduce((groups, server) =>
         server.group && !groups.includes(server.group) ? [...groups, server.group] : groups, current));
     }
-    if (ai) setAiConfig((current) => ({ ...current, ...ai }));
+    if (ai && !hadStoredAiConfig.current) {
+      setAiConfig((current) => normalizeAiConfig(ai, current));
+    }
 
     if (!isTauri()) return;
     const writes: Promise<unknown>[] = [];
@@ -193,7 +196,9 @@ export default function App() {
         }));
       }
     });
-    if (ai?.apiKey) writes.push(invoke("store_ai_key", { apiKey: ai.apiKey }));
+    if (ai?.apiKey && !hadStoredAiConfig.current) {
+      writes.push(invoke("store_ai_key", { apiKey: ai.apiKey }));
+    }
     void Promise.all(writes).catch((error) => console.error("Failed to initialize development credentials", error));
   }, [setAiConfig, setSavedGroups, setServers]);
 
@@ -276,10 +281,12 @@ export default function App() {
   };
 
   const saveAiConfig = async (next: AiConfig) => {
-    if (isTauri() && next.apiKey.trim()) {
-      await invoke("store_ai_key", { apiKey: next.apiKey.trim() });
+    const nextConfig = normalizeAiConfig(next);
+    if (isTauri() && nextConfig.apiKey.trim()) {
+      await invoke("store_ai_key", { apiKey: nextConfig.apiKey.trim() });
     }
-    setAiConfig(next);
+    localStorage.setItem(AI_CONFIG_STORAGE_KEY, JSON.stringify(serializeAiConfig(nextConfig)));
+    setAiConfig(nextConfig);
   };
 
   const removeSavedAiKey = async () => {
