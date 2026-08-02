@@ -31,6 +31,7 @@ import { DEFAULT_AI_TOOL_SETTINGS } from "./types";
 import type { AiConfig, ServerProfile, SessionState, TransferRequest, TransferTask } from "./types";
 
 const DEFAULT_AI_CONFIG: AiConfig = {
+  apiMode: "chat-completions",
   endpoint: "https://api.openai.com/v1",
   apiKey: "",
   model: "gpt-4.1-mini",

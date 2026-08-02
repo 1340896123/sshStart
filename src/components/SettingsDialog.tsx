@@ -109,12 +109,14 @@ const SETTINGS_SECTIONS: Array<{
 export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Props) {
   const [value, setValue] = useState(() => ({
     ...config,
+    apiMode: config.apiMode ?? "chat-completions",
     maxOutputTokens: config.maxOutputTokens ?? 4096,
     autoCompress: config.autoCompress ?? true,
     tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...(config.tools ?? {}) },
   }));
   const [savedValue, setSavedValue] = useState(() => ({
     ...config,
+    apiMode: config.apiMode ?? "chat-completions",
     maxOutputTokens: config.maxOutputTokens ?? 4096,
     autoCompress: config.autoCompress ?? true,
     tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...(config.tools ?? {}) },
@@ -330,13 +332,20 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
             {visibleActiveSection === "model" && (
               <>
                 <section className="settings-panel">
-                  <header><strong>模型服务</strong><small>配置 OpenAI 兼容的大语言模型接入；支持文本与图片输入，具体取决于模型能力</small></header>
+                  <header><strong>模型服务</strong><small>配置 OpenAI 兼容的大语言模型接入；可选择 Chat Completions 或 Responses 接口</small></header>
                   <div className="settings-config-row">
-                    <span className="settings-row-copy"><strong>Provider</strong><small>当前版本固定使用 OpenAI 兼容 Chat Completions 接口</small></span>
+                    <span className="settings-row-copy"><strong>Provider</strong><small>使用 Bearer API Key 的 OpenAI 兼容服务</small></span>
                     <span className="settings-static-value">OpenAI 兼容</span>
                   </div>
                   <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>Base URL</strong><small>API 基础地址</small></span>
+                    <span className="settings-row-copy"><strong>接口模式</strong><small>Responses 使用 /responses 与类型化 SSE 事件；旧配置默认保持 Chat Completions</small></span>
+                    <select className="settings-input settings-mono-input" value={value.apiMode} onChange={(event) => setValue({ ...value, apiMode: event.target.value as AiConfig["apiMode"] })}>
+                      <option value="chat-completions">Chat Completions</option>
+                      <option value="responses">Responses</option>
+                    </select>
+                  </label>
+                  <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>Base URL</strong><small>可填写 API 基础地址，也可填写当前模式的完整接口地址</small></span>
                     <input className="settings-input settings-mono-input" value={value.endpoint} onChange={(event) => setValue({ ...value, endpoint: event.target.value })} />
                   </label>
                   <label className="settings-config-row">
@@ -362,7 +371,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                   </label>
                 </section>
 
-                <a className="settings-page-link" href="https://platform.openai.com/docs" target="_blank" rel="noreferrer">查看 OpenAI 兼容接口格式 <ExternalLink size={13} /></a>
+                <a className="settings-page-link" href={value.apiMode === "responses" ? "https://developers.openai.com/api/reference/resources/responses/methods/create" : "https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create"} target="_blank" rel="noreferrer">查看当前接口格式 <ExternalLink size={13} /></a>
               </>
             )}
 

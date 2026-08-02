@@ -901,7 +901,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         let response: AiResponse;
         try {
           response = await invoke<AiResponse>("ai_chat", {
-            config,
+            config: { ...config, apiMode: config.apiMode ?? "chat-completions" },
             server,
             messages: contextMessages
               .filter((message) => !("status" in message) || message.status !== "error")
@@ -1001,7 +1001,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   return (
     <aside className="ai-pane">
       <div className="ai-header">
-        <div className="pane-title"><Sparkles size={14} /><span>AI 助手</span><small>{config.model}</small></div>
+        <div className="pane-title"><Sparkles size={14} /><span>AI 助手</span><small>{config.model} · {(config.apiMode ?? "chat-completions") === "responses" ? "Responses" : "Chat Completions"}</small></div>
         <span className="header-spacer" />
         <button className="icon-button quiet" title="新建会话" aria-label="新建会话" onClick={startNewConversation}><MessageSquarePlus size={14} /></button>
         <div className="ai-history-control" ref={historyControlRef}>

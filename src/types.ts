@@ -235,7 +235,10 @@ export const DEFAULT_AI_TOOL_SETTINGS: AiToolSettings = {
   allowMutatingTools: true,
 };
 
+export type AiApiMode = "chat-completions" | "responses";
+
 export interface AiConfig {
+  apiMode: AiApiMode;
   endpoint: string;
   apiKey: string;
   model: string;

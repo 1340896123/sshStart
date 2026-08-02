@@ -198,9 +198,32 @@ impl Default for AiToolSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum AiApiMode {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
+impl AiApiMode {
+    fn endpoint_path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+        }
+    }
+
+    fn is_responses(self) -> bool {
+        self == Self::Responses
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AiConfig {
+    #[serde(default)]
+    api_mode: AiApiMode,
     endpoint: String,
     api_key: String,
     model: String,
@@ -454,6 +477,7 @@ struct AiToolStreamUpdate {
 
 #[derive(Debug)]
 struct AiStreamToolCall {
+    output_index: usize,
     id: String,
     name: String,
     arguments: String,
@@ -462,6 +486,7 @@ struct AiStreamToolCall {
 impl Default for AiStreamToolCall {
     fn default() -> Self {
         Self {
+            output_index: 0,
             id: ai_unique_id("ai-action"),
             name: String::new(),
             arguments: String::new(),
@@ -474,10 +499,66 @@ struct AiStreamCompletion {
     content: String,
     reasoning: String,
     tool_calls: Vec<AiStreamToolCall>,
+    response_output: Vec<Value>,
     usage: AiTokenUsage,
+    response_id: Option<String>,
 }
 
 impl AiStreamCompletion {
+    fn tool_call_mut(&mut self, output_index: usize) -> &mut AiStreamToolCall {
+        if let Some(position) = self
+            .tool_calls
+            .iter()
+            .position(|tool_call| tool_call.output_index == output_index)
+        {
+            return &mut self.tool_calls[position];
+        }
+        self.tool_calls.push(AiStreamToolCall {
+            output_index,
+            ..AiStreamToolCall::default()
+        });
+        self.tool_calls
+            .last_mut()
+            .expect("tool call was just inserted")
+    }
+
+    fn apply_response_output_item(&mut self, output_index: usize, item: &Value) {
+        while self.response_output.len() <= output_index {
+            self.response_output.push(Value::Null);
+        }
+        self.response_output[output_index] = item.clone();
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return;
+        }
+        let target = self.tool_call_mut(output_index);
+        if let Some(id) = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            target.id = id.to_string();
+        }
+        if let Some(name) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            target.name = name.to_string();
+        }
+        if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+            target.arguments = arguments.to_string();
+        }
+    }
+
+    fn response_output_items(&self) -> Vec<Value> {
+        self.response_output
+            .iter()
+            .filter(|item| !item.is_null())
+            .cloned()
+            .collect()
+    }
+
     fn message(&self) -> Value {
         let content = if self.content.is_empty() {
             Value::Null
@@ -2651,6 +2732,63 @@ fn extract_reasoning_summary(content: &str) -> (String, Option<String>) {
     (cleaned.trim().to_string(), Some(reasoning))
 }
 
+fn response_output_text(payload: &Value) -> Option<String> {
+    if let Some(output_text) = payload
+        .get("output_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(output_text.to_string());
+    }
+    let parts = payload
+        .get("output")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|part| {
+            part.get("text")
+                .or_else(|| part.get("refusal"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(""))
+}
+
+fn apply_response_object(response: &Value, completion: &mut AiStreamCompletion) -> AiStreamDelta {
+    if let Some(response_id) = response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        completion.response_id = Some(response_id.to_string());
+    }
+    if let Some(usage) = AiTokenUsage::from_payload(response) {
+        completion.usage = usage;
+    }
+    if let Some(output) = response.get("output").and_then(Value::as_array) {
+        for (output_index, item) in output.iter().enumerate() {
+            completion.apply_response_output_item(output_index, item);
+        }
+    }
+    let content = if completion.content.is_empty() {
+        response_output_text(response)
+    } else {
+        None
+    };
+    if let Some(value) = &content {
+        completion.content.push_str(value);
+    }
+    AiStreamDelta {
+        event_type: "message_delta".to_string(),
+        content,
+        ..AiStreamDelta::default()
+    }
+}
+
 fn apply_ai_stream_payload(
     data: &str,
     completion: &mut AiStreamCompletion,
@@ -2660,11 +2798,126 @@ fn apply_ai_stream_payload(
     }
     let payload: Value =
         serde_json::from_str(data).map_err(|error| format!("AI 流式响应解析失败: {error}"))?;
-    if let Some(detail) = payload.pointer("/error/message").and_then(Value::as_str) {
+    if payload.get("type").and_then(Value::as_str) == Some("error") {
+        let detail = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("未知流式接口错误");
         return Err(format!("AI 接口返回错误: {detail}"));
     }
-    if let Some(usage) = AiTokenUsage::from_payload(&payload) {
+    if let Some(detail) = payload
+        .pointer("/error/message")
+        .or_else(|| payload.pointer("/response/error/message"))
+        .and_then(Value::as_str)
+    {
+        return Err(format!("AI 接口返回错误: {detail}"));
+    }
+    if let Some(usage) = AiTokenUsage::from_payload(&payload)
+        .or_else(|| payload.get("response").and_then(AiTokenUsage::from_payload))
+    {
         completion.usage = usage;
+    }
+    if let Some(response_id) = payload
+        .get("response_id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/response/id").and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+    {
+        completion.response_id = Some(response_id.to_string());
+    }
+
+    match payload.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta" | "response.refusal.delta") => {
+            let content = payload
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if let Some(value) = &content {
+                completion.content.push_str(value);
+            }
+            return Ok(AiStreamDelta {
+                event_type: "message_delta".to_string(),
+                content,
+                ..AiStreamDelta::default()
+            });
+        }
+        Some("response.reasoning_summary_text.delta") => {
+            let reasoning = payload
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if let Some(value) = &reasoning {
+                completion.reasoning.push_str(value);
+            }
+            return Ok(AiStreamDelta {
+                event_type: "message_delta".to_string(),
+                reasoning,
+                ..AiStreamDelta::default()
+            });
+        }
+        Some("response.output_item.added" | "response.output_item.done") => {
+            if let (Some(output_index), Some(item)) = (
+                payload
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
+                payload.get("item"),
+            ) {
+                completion.apply_response_output_item(output_index, item);
+            }
+            return Ok(AiStreamDelta::default());
+        }
+        Some("response.function_call_arguments.delta") => {
+            if let Some(output_index) = payload
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+            {
+                if let Some(arguments) = payload.get("delta").and_then(Value::as_str) {
+                    completion
+                        .tool_call_mut(output_index)
+                        .arguments
+                        .push_str(arguments);
+                }
+            }
+            return Ok(AiStreamDelta::default());
+        }
+        Some("response.function_call_arguments.done") => {
+            if let Some(output_index) = payload
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+            {
+                if let Some(arguments) = payload.get("arguments").and_then(Value::as_str) {
+                    completion.tool_call_mut(output_index).arguments = arguments.to_string();
+                }
+            }
+            return Ok(AiStreamDelta::default());
+        }
+        Some("response.completed") => {
+            return Ok(payload
+                .get("response")
+                .map(|response| apply_response_object(response, completion))
+                .unwrap_or_default());
+        }
+        Some("response.incomplete") => {
+            let reason = payload
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown");
+            return Err(format!("AI 响应未完成: {reason}"));
+        }
+        Some(event_type) if event_type.starts_with("response.") || event_type == "error" => {
+            return Ok(AiStreamDelta::default());
+        }
+        _ => {}
+    }
+    if payload.get("object").and_then(Value::as_str) == Some("response") {
+        return Ok(apply_response_object(&payload, completion));
     }
 
     let Some(delta) = payload
@@ -2697,10 +2950,7 @@ fn apply_ai_stream_payload(
                 .and_then(Value::as_u64)
                 .map(|value| value as usize)
                 .unwrap_or(position);
-            while completion.tool_calls.len() <= index {
-                completion.tool_calls.push(AiStreamToolCall::default());
-            }
-            let target = &mut completion.tool_calls[index];
+            let target = completion.tool_call_mut(index);
             if let Some(id) = tool_call
                 .get("id")
                 .and_then(Value::as_str)
@@ -2876,7 +3126,10 @@ fn default_temperature() -> f32 {
 
 fn ai_endpoint(endpoint: &str, path: &str) -> String {
     let base = endpoint.trim().trim_end_matches('/');
-    let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+    let base = ["/chat/completions", "/responses"]
+        .into_iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+        .unwrap_or(base);
     format!("{base}/{path}")
 }
 
@@ -2914,6 +3167,67 @@ fn apply_chat_completion_tools(body: &mut Value, tools: &[Value]) {
     body["tool_choice"] = json!("auto");
 }
 
+fn responses_tool_definitions(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            Some(json!({
+                "type": "function",
+                "name": function.get("name")?.clone(),
+                "description": function.get("description").cloned().unwrap_or(Value::Null),
+                "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                "strict": false
+            }))
+        })
+        .collect()
+}
+
+fn responses_stream_body(
+    model: &str,
+    instructions: &str,
+    input: &[Value],
+    temperature: f32,
+    max_output_tokens: usize,
+    tools: &[Value],
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "temperature": temperature,
+        "max_output_tokens": max_output_tokens,
+        "stream": true,
+        "store": false
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.to_vec());
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
+fn append_ai_tool_output(
+    api_messages: &mut Vec<Value>,
+    response_inputs: &mut Vec<Value>,
+    api_mode: AiApiMode,
+    call_id: &str,
+    output: String,
+) {
+    api_messages.push(json!({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": output.clone()
+    }));
+    if api_mode.is_responses() {
+        response_inputs.push(json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output
+        }));
+    }
+}
+
 fn estimate_tokens(value: &str) -> usize {
     let (ascii, non_ascii) =
         value
@@ -2931,6 +3245,99 @@ fn estimate_tokens(value: &str) -> usize {
 fn input_token_budget(context_window: u32) -> usize {
     let context_window = context_window as usize;
     context_window.saturating_sub((context_window / 4).max(256))
+}
+
+fn response_input_cost(item: &Value) -> usize {
+    estimate_tokens(&item.to_string()) + 4
+}
+
+fn response_request_fixed_cost(instructions: &str, tools: &[Value]) -> usize {
+    estimate_tokens(instructions) + tools.iter().map(response_input_cost).sum::<usize>() + 8
+}
+
+fn response_request_cost(input: &[Value], instructions: &str, tools: &[Value]) -> usize {
+    response_request_fixed_cost(instructions, tools)
+        + input.iter().map(response_input_cost).sum::<usize>()
+}
+
+fn trim_response_inputs_for_context(
+    input: &mut Vec<Value>,
+    context_window: u32,
+    instructions: &str,
+    tools: &[Value],
+) -> Result<(), String> {
+    let mut remaining = input_token_budget(context_window)
+        .checked_sub(response_request_fixed_cost(instructions, tools))
+        .ok_or_else(|| {
+            "系统提示词或工具定义超过可用上下文，请缩短配置或增大上下文大小".to_string()
+        })?;
+    let mut groups: Vec<Vec<Value>> = Vec::new();
+
+    for item in input.iter().cloned() {
+        let starts_turn = item.get("role").and_then(Value::as_str) == Some("user");
+        if groups.is_empty() || starts_turn && groups.last().is_some_and(|group| !group.is_empty())
+        {
+            groups.push(Vec::new());
+        }
+        groups.last_mut().expect("input group exists").push(item);
+    }
+
+    let mut retained = Vec::new();
+    for group in groups.into_iter().rev() {
+        let cost = group.iter().map(response_input_cost).sum::<usize>();
+        if cost > remaining {
+            if retained.is_empty() {
+                return Err(
+                    "Responses 最近一轮超过可用上下文，请缩短内容或增大上下文大小".to_string(),
+                );
+            }
+            break;
+        }
+        remaining -= cost;
+        retained.push(group);
+    }
+
+    retained.reverse();
+    input.clear();
+    input.extend(retained.into_iter().flatten());
+    Ok(())
+}
+
+fn response_tool_output_budget(
+    input: &[Value],
+    context_window: u32,
+    instructions: &str,
+    tools: &[Value],
+    tool_call_id: &str,
+    future_tool_call_ids: &[String],
+) -> Result<usize, String> {
+    let latest_turn_start = input
+        .iter()
+        .rposition(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(0);
+    let current_turn_cost = input
+        .iter()
+        .skip(latest_turn_start)
+        .map(response_input_cost)
+        .sum::<usize>();
+    let tool_envelope_cost = |call_id: &str| {
+        response_input_cost(&json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": "exit_code=-2147483648\n"
+        }))
+    };
+    let fixed_cost = response_request_fixed_cost(instructions, tools)
+        + current_turn_cost
+        + tool_envelope_cost(tool_call_id)
+        + future_tool_call_ids
+            .iter()
+            .map(|call_id| tool_envelope_cost(call_id))
+            .sum::<usize>();
+    let available = input_token_budget(context_window)
+        .checked_sub(fixed_cost)
+        .ok_or_else(|| "Responses 工具调用超过可用上下文，请增大上下文大小".to_string())?;
+    Ok(available / (future_tool_call_ids.len() + 1))
 }
 
 fn compaction_split_index(
@@ -2971,16 +3378,19 @@ fn parse_compaction_response(payload: &Value) -> Result<(String, AiTokenUsage), 
     let summary = payload
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(str::to_string)
+        .or_else(|| response_output_text(payload))
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "上下文压缩接口未返回摘要".to_string())?;
     let usage = AiTokenUsage::from_payload(payload).unwrap_or_default();
-    Ok((summary.to_string(), usage))
+    Ok((summary, usage))
 }
 
 async fn compact_messages_with_model(
     client: &reqwest::Client,
     endpoint: &str,
+    api_mode: AiApiMode,
     api_key: &str,
     model: &str,
     messages: &[AiInputMessage],
@@ -2999,20 +3409,31 @@ async fn compact_messages_with_model(
     let transcript_budget = input_token_budget(context_window).min(12_000);
     let transcript = truncate_to_token_budget(&transcript, transcript_budget);
     let summary_prompt = "你负责压缩一段 SSH 运维助手对话，以便会话继续工作。只输出 plain text 交接摘要，不要调用工具、不要回答原问题、不要披露隐藏思维链。按时间顺序保留：用户目标、已确认事实、关键命令及结果、文件路径和函数、已作决策、约束/风险、错误与修复、已完成事项和待办事项。若信息不确定，明确标注不确定。摘要要短而具体，不能遗漏后续工作所需的技术细节。";
-    let mut body = json!({
-        "model": model,
-        "messages": [
-            { "role": "system", "content": summary_prompt },
-            { "role": "user", "content": transcript }
-        ],
-        "temperature": 0.1,
-        "stream": false
-    });
-    set_chat_completion_token_limit(
-        &mut body,
-        endpoint,
-        max_output_tokens.clamp(256, 2_048) as usize,
-    );
+    let output_limit = max_output_tokens.clamp(256, 2_048) as usize;
+    let mut body = if api_mode.is_responses() {
+        json!({
+            "model": model,
+            "instructions": summary_prompt,
+            "input": transcript,
+            "temperature": 0.1,
+            "max_output_tokens": output_limit,
+            "stream": false,
+            "store": false
+        })
+    } else {
+        json!({
+            "model": model,
+            "messages": [
+                { "role": "system", "content": summary_prompt },
+                { "role": "user", "content": transcript }
+            ],
+            "temperature": 0.1,
+            "stream": false
+        })
+    };
+    if !api_mode.is_responses() {
+        set_chat_completion_token_limit(&mut body, endpoint, output_limit);
+    }
     if is_openai_api_endpoint(endpoint) {
         body["prompt_cache_key"] = json!(ai_prompt_cache_key(model, summary_prompt, &[]));
     }
@@ -4049,7 +4470,7 @@ async fn ai_chat(
     } else {
         config.api_key.clone()
     };
-    let endpoint = ai_endpoint(&config.endpoint, "chat/completions");
+    let endpoint = ai_endpoint(&config.endpoint, config.api_mode.endpoint_path());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(90))
         .build()
@@ -4070,6 +4491,7 @@ async fn ai_chat(
         match compact_messages_with_model(
             &client,
             &endpoint,
+            config.api_mode,
             &api_key,
             &config.model,
             &conversation_messages,
@@ -4101,14 +4523,34 @@ async fn ai_chat(
     } else {
         Vec::new()
     };
+    let request_tools = if config.api_mode.is_responses() {
+        responses_tool_definitions(&tools)
+    } else {
+        tools.clone()
+    };
     let prompt_cache_key = is_openai_api_endpoint(&endpoint)
-        .then(|| ai_prompt_cache_key(&config.model, &system, &tools));
+        .then(|| ai_prompt_cache_key(&config.model, &system, &request_tools));
     let mut executed_tools = Vec::new();
+    let mut response_inputs = if config.api_mode.is_responses() {
+        api_messages.iter().skip(1).cloned().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let stream_event_name = format!("ai-stream:{stream_id}");
 
     for _ in 0..config.tools.max_tool_rounds.max(1) {
-        trim_api_messages_for_context(&mut api_messages, config.context_window)?;
-        let input_cost = api_messages.iter().map(api_message_cost).sum::<usize>();
+        let input_cost = if config.api_mode.is_responses() {
+            trim_response_inputs_for_context(
+                &mut response_inputs,
+                config.context_window,
+                &system,
+                &request_tools,
+            )?;
+            response_request_cost(&response_inputs, &system, &request_tools)
+        } else {
+            trim_api_messages_for_context(&mut api_messages, config.context_window)?;
+            api_messages.iter().map(api_message_cost).sum::<usize>()
+        };
         let output_budget = (config.context_window as usize)
             .saturating_sub(input_cost)
             .saturating_sub(64)
@@ -4116,15 +4558,27 @@ async fn ai_chat(
         if output_budget == 0 {
             return Err("当前上下文没有可用的输出空间，请缩短对话或增大上下文大小".to_string());
         }
-        let mut body = json!({
-            "model": config.model,
-            "messages": api_messages,
-            "temperature": config.temperature,
-            "stream": true,
-            "stream_options": { "include_usage": true }
-        });
-        set_chat_completion_token_limit(&mut body, &endpoint, output_budget);
-        apply_chat_completion_tools(&mut body, &tools);
+        let mut body = if config.api_mode.is_responses() {
+            responses_stream_body(
+                &config.model,
+                &system,
+                &response_inputs,
+                config.temperature,
+                output_budget,
+                &request_tools,
+            )
+        } else {
+            let mut body = json!({
+                "model": config.model,
+                "messages": api_messages,
+                "temperature": config.temperature,
+                "stream": true,
+                "stream_options": { "include_usage": true }
+            });
+            set_chat_completion_token_limit(&mut body, &endpoint, output_budget);
+            apply_chat_completion_tools(&mut body, &request_tools);
+            body
+        };
         if let Some(prompt_cache_key) = &prompt_cache_key {
             body["prompt_cache_key"] = json!(prompt_cache_key);
         }
@@ -4163,6 +4617,16 @@ async fn ai_chat(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        if config.api_mode.is_responses() && !tool_calls.is_empty() {
+            let output_items = completion.response_output_items();
+            if output_items.is_empty() {
+                let response_id = completion.response_id.as_deref().unwrap_or("unknown");
+                return Err(format!(
+                    "Responses 工具调用响应 {response_id} 缺少可重放的 output items"
+                ));
+            }
+            response_inputs.extend(output_items);
+        }
         if tool_calls.is_empty() {
             let (content, summary) = extract_reasoning_summary(&completion.content);
             let provider_reasoning =
@@ -4195,12 +4659,23 @@ async fn ai_chat(
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or("tool-call");
-            let output_budget = tool_output_budget(
-                &api_messages,
-                config.context_window,
-                id,
-                &tool_call_ids[index + 1..],
-            )?;
+            let output_budget = if config.api_mode.is_responses() {
+                response_tool_output_budget(
+                    &response_inputs,
+                    config.context_window,
+                    &system,
+                    &request_tools,
+                    id,
+                    &tool_call_ids[index + 1..],
+                )?
+            } else {
+                tool_output_budget(
+                    &api_messages,
+                    config.context_window,
+                    id,
+                    &tool_call_ids[index + 1..],
+                )?
+            };
             let arguments = tool_call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
@@ -4256,11 +4731,13 @@ async fn ai_chat(
                     Some(tool_result.exit_code),
                 );
                 executed_tools.push(tool_result);
-                api_messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": format!("exit_code={}\n{}", result.exit_code, output)
-                }));
+                append_ai_tool_output(
+                    &mut api_messages,
+                    &mut response_inputs,
+                    config.api_mode,
+                    id,
+                    format!("exit_code={}\n{}", result.exit_code, output),
+                );
                 continue;
             }
 
@@ -4405,11 +4882,16 @@ async fn ai_chat(
                 Some(&tool_result.output),
                 Some(tool_result.exit_code),
             );
-            api_messages.push(json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": format!("exit_code={}\n{}", tool_result.exit_code, tool_result.output)
-            }));
+            append_ai_tool_output(
+                &mut api_messages,
+                &mut response_inputs,
+                config.api_mode,
+                id,
+                format!(
+                    "exit_code={}\n{}",
+                    tool_result.exit_code, tool_result.output
+                ),
+            );
             executed_tools.push(tool_result);
         }
     }
@@ -4759,6 +5241,73 @@ mod tests {
     }
 
     #[test]
+    fn parses_responses_stream_text_tool_calls_and_usage() {
+        let mut completion = AiStreamCompletion::default();
+        apply_ai_stream_payload(
+            r#"{"type":"response.output_item.added","response_id":"resp-1","output_index":1,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"execute_command","arguments":""}}"#,
+            &mut completion,
+        )
+        .unwrap();
+        apply_ai_stream_payload(
+            r#"{"type":"response.function_call_arguments.delta","response_id":"resp-1","output_index":1,"item_id":"fc-1","delta":"{\"command\":\"uptime\"}"}"#,
+            &mut completion,
+        )
+        .unwrap();
+        let delta = apply_ai_stream_payload(
+            r#"{"type":"response.output_text.delta","response_id":"resp-1","output_index":2,"content_index":0,"item_id":"msg-1","delta":"检查完成"}"#,
+            &mut completion,
+        )
+        .unwrap();
+        apply_ai_stream_payload(
+            r#"{"type":"response.completed","response":{"id":"resp-1","object":"response","output":[{"type":"reasoning","id":"rs-1","summary":[]},{"type":"function_call","id":"fc-1","call_id":"call-1","name":"execute_command","arguments":"{\"command\":\"uptime\"}"}],"usage":{"input_tokens":120,"output_tokens":30,"total_tokens":150,"input_tokens_details":{"cached_tokens":80},"output_tokens_details":{"reasoning_tokens":10}}}}"#,
+            &mut completion,
+        )
+        .unwrap();
+
+        assert_eq!(delta.content.as_deref(), Some("检查完成"));
+        assert_eq!(completion.response_id.as_deref(), Some("resp-1"));
+        assert_eq!(completion.content, "检查完成");
+        assert_eq!(completion.usage.input_tokens, 120);
+        assert_eq!(completion.usage.cached_tokens, 80);
+        assert_eq!(completion.usage.reasoning_tokens, 10);
+        let output_items = completion.response_output_items();
+        assert_eq!(output_items.len(), 2);
+        assert_eq!(output_items[0]["type"], "reasoning");
+        assert_eq!(output_items[1]["call_id"], "call-1");
+        let message = completion.message();
+        assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(message["tool_calls"][0]["id"], "call-1");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["name"],
+            "execute_command"
+        );
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            r#"{"command":"uptime"}"#
+        );
+    }
+
+    #[test]
+    fn parses_responses_stream_error_events() {
+        let error = apply_ai_stream_payload(
+            r#"{"type":"error","code":"server_error","message":"temporary failure","param":null,"sequence_number":3}"#,
+            &mut AiStreamCompletion::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "AI 接口返回错误: temporary failure");
+    }
+
+    #[test]
+    fn rejects_incomplete_responses() {
+        let error = apply_ai_stream_payload(
+            r#"{"type":"response.incomplete","response":{"id":"resp-incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}"#,
+            &mut AiStreamCompletion::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "AI 响应未完成: max_output_tokens");
+    }
+
+    #[test]
     fn parses_streamed_refusal_as_visible_content() {
         let mut completion = AiStreamCompletion::default();
         let delta = apply_ai_stream_payload(
@@ -4985,6 +5534,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_responses_compaction_summary_and_usage() {
+        let payload = json!({
+            "id": "resp-summary",
+            "object": "response",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "  retained response facts  " }]
+            }],
+            "usage": {
+                "input_tokens": 280,
+                "output_tokens": 40,
+                "total_tokens": 320
+            }
+        });
+        let (summary, usage) = super::parse_compaction_response(&payload).unwrap();
+        assert_eq!(summary, "retained response facts");
+        assert_eq!(usage.input_tokens, 280);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.total_tokens, 320);
+    }
+
+    #[test]
     fn builds_ai_endpoints_from_base_or_chat_url() {
         assert_eq!(
             ai_endpoint("https://api.example.com/v1", "models"),
@@ -4994,6 +5565,65 @@ mod tests {
             ai_endpoint("https://api.example.com/v1/chat/completions", "models"),
             "https://api.example.com/v1/models"
         );
+    }
+
+    #[test]
+    fn builds_responses_endpoints_and_tool_definitions() {
+        assert_eq!(
+            ai_endpoint("https://api.example.com/v1", "responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            ai_endpoint("https://api.example.com/v1/responses", "models"),
+            "https://api.example.com/v1/models"
+        );
+
+        let chat_tools = ai_tool_definitions(&AiToolSettings::default());
+        let response_tools = super::responses_tool_definitions(&chat_tools);
+        assert!(!response_tools.is_empty());
+        assert_eq!(response_tools[0]["type"], "function");
+        assert!(response_tools[0].get("function").is_none());
+        assert!(response_tools[0]["name"].as_str().is_some());
+        assert_eq!(response_tools[0]["strict"], false);
+        assert_eq!(
+            response_tools[0]["parameters"]["additionalProperties"],
+            false
+        );
+
+        let input = vec![json!({ "role": "user", "content": "status" })];
+        let body = super::responses_stream_body(
+            "model",
+            "instructions",
+            &input,
+            0.2,
+            512,
+            &response_tools,
+        );
+        assert_eq!(body["store"], false);
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["input"], json!(input));
+    }
+
+    #[test]
+    fn trims_stateless_response_inputs_by_complete_turn() {
+        let mut input = vec![
+            json!({ "role": "user", "content": "old ".repeat(1_200) }),
+            json!({ "role": "assistant", "content": "old response" }),
+            json!({ "role": "user", "content": "latest request" }),
+            json!({ "type": "reasoning", "id": "rs-latest", "summary": [] }),
+            json!({ "type": "function_call", "call_id": "call-latest", "name": "execute_command", "arguments": "{}" }),
+            json!({ "type": "function_call_output", "call_id": "call-latest", "output": "ok" }),
+        ];
+
+        super::trim_response_inputs_for_context(&mut input, 1_024, "system", &[]).unwrap();
+
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "latest request");
+        assert!(input.iter().any(|item| item["type"] == "reasoning"));
+        assert!(input
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
+        assert!(!input.iter().any(|item| item["content"] == "old response"));
     }
 
     #[test]
