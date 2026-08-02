@@ -17,7 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1518,6 +1518,99 @@ async fn list_directory(server: ServerProfile, path: String) -> Result<Vec<Remot
 }
 
 const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
+const TRANSFER_PROGRESS_EVENT: &str = "transfer-progress";
+const TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferProgressEvent {
+    transfer_id: String,
+    transferred_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+}
+
+struct TransferProgressReporter {
+    app: AppHandle,
+    transfer_id: String,
+    total_bytes: Option<u64>,
+    last_emitted_at: Instant,
+    last_emitted_bytes: u64,
+}
+
+impl TransferProgressReporter {
+    fn new(app: AppHandle, transfer_id: String, total_bytes: Option<u64>) -> Self {
+        let mut reporter = Self {
+            app,
+            transfer_id,
+            total_bytes,
+            last_emitted_at: Instant::now(),
+            last_emitted_bytes: 0,
+        };
+        reporter.report(0, true);
+        reporter
+    }
+
+    fn report(&mut self, transferred_bytes: u64, force: bool) {
+        let transferred_bytes = self
+            .total_bytes
+            .map(|total_bytes| transferred_bytes.min(total_bytes))
+            .unwrap_or(transferred_bytes);
+        if !force
+            && (transferred_bytes == self.last_emitted_bytes
+                || self.last_emitted_at.elapsed() < TRANSFER_PROGRESS_INTERVAL)
+        {
+            return;
+        }
+        self.app
+            .emit(
+                TRANSFER_PROGRESS_EVENT,
+                TransferProgressEvent {
+                    transfer_id: self.transfer_id.clone(),
+                    transferred_bytes,
+                    total_bytes: self.total_bytes,
+                },
+            )
+            .ok();
+        self.last_emitted_at = Instant::now();
+        self.last_emitted_bytes = transferred_bytes;
+    }
+}
+
+struct TransferProgressWriter<W> {
+    inner: W,
+    reporter: Option<TransferProgressReporter>,
+    transferred_bytes: u64,
+}
+
+impl<W> TransferProgressWriter<W> {
+    fn new(inner: W, reporter: Option<TransferProgressReporter>) -> Self {
+        Self {
+            inner,
+            reporter,
+            transferred_bytes: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for TransferProgressWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.transferred_bytes = self.transferred_bytes.saturating_add(written as u64);
+        if let Some(reporter) = self.reporter.as_mut() {
+            reporter.report(self.transferred_bytes, false);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()?;
+        if let Some(reporter) = self.reporter.as_mut() {
+            reporter.report(self.transferred_bytes, true);
+        }
+        Ok(())
+    }
+}
 
 fn transfer_suffix(transfer_id: Option<&str>) -> String {
     let candidate = transfer_id
@@ -1620,6 +1713,7 @@ async fn upload_file_impl(
     remote_path: String,
     control: Option<Arc<TransferControl>>,
     transfer_id: Option<String>,
+    progress_app: Option<AppHandle>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let suffix = transfer_suffix(transfer_id.as_deref());
@@ -1631,9 +1725,22 @@ async fn upload_file_impl(
         let result = (|| -> Result<(), String> {
             let mut source =
                 File::open(&local_path).map_err(|error| format!("打开本地文件失败: {error}"))?;
-            let mut target = sftp
+            let total_bytes = source
+                .metadata()
+                .map_err(|error| format!("读取本地文件大小失败: {error}"))?
+                .len();
+            let target = sftp
                 .create(Path::new(&temp_path))
                 .map_err(|error| format!("创建远程临时文件失败: {error}"))?;
+            let reporter = match (progress_app.clone(), transfer_id.clone()) {
+                (Some(app), Some(transfer_id)) => Some(TransferProgressReporter::new(
+                    app,
+                    transfer_id,
+                    Some(total_bytes),
+                )),
+                _ => None,
+            };
+            let mut target = TransferProgressWriter::new(target, reporter);
             copy_transfer_bytes(
                 &mut source,
                 &mut target,
@@ -1667,6 +1774,7 @@ async fn download_file_impl(
     local_path: String,
     control: Option<Arc<TransferControl>>,
     transfer_id: Option<String>,
+    progress_app: Option<AppHandle>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let suffix = transfer_suffix(transfer_id.as_deref());
@@ -1677,11 +1785,22 @@ async fn download_file_impl(
             .sftp()
             .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
         let result = (|| -> Result<(), String> {
+            let total_bytes = sftp
+                .stat(Path::new(&remote_path))
+                .ok()
+                .and_then(|attributes| attributes.size);
             let mut source = sftp
                 .open(Path::new(&remote_path))
                 .map_err(|error| format!("打开远程文件失败: {error}"))?;
-            let mut target = File::create(&temp_path)
+            let target = File::create(&temp_path)
                 .map_err(|error| format!("创建本地临时文件失败: {error}"))?;
+            let reporter = match (progress_app.clone(), transfer_id.clone()) {
+                (Some(app), Some(transfer_id)) => {
+                    Some(TransferProgressReporter::new(app, transfer_id, total_bytes))
+                }
+                _ => None,
+            };
+            let mut target = TransferProgressWriter::new(target, reporter);
             copy_transfer_bytes(
                 &mut source,
                 &mut target,
@@ -1710,7 +1829,7 @@ async fn upload_file(
     local_path: String,
     remote_path: String,
 ) -> Result<(), String> {
-    upload_file_impl(server, local_path, remote_path, None, None).await
+    upload_file_impl(server, local_path, remote_path, None, None, None).await
 }
 
 const MAX_AI_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -1840,7 +1959,7 @@ async fn download_file(
     remote_path: String,
     local_path: String,
 ) -> Result<(), String> {
-    download_file_impl(server, remote_path, local_path, None, None).await
+    download_file_impl(server, remote_path, local_path, None, None, None).await
 }
 
 #[tauri::command]
@@ -1850,6 +1969,7 @@ async fn start_upload_file(
     remote_path: String,
     transfer_id: String,
     state: State<'_, TransferManager>,
+    app: AppHandle,
 ) -> Result<(), String> {
     let control = state.register(&transfer_id)?;
     let result = upload_file_impl(
@@ -1858,6 +1978,7 @@ async fn start_upload_file(
         remote_path,
         Some(control),
         Some(transfer_id.clone()),
+        Some(app),
     )
     .await;
     state.remove(&transfer_id);
@@ -1871,6 +1992,7 @@ async fn start_download_file(
     local_path: String,
     transfer_id: String,
     state: State<'_, TransferManager>,
+    app: AppHandle,
 ) -> Result<(), String> {
     let control = state.register(&transfer_id)?;
     let result = download_file_impl(
@@ -1879,6 +2001,7 @@ async fn start_download_file(
         local_path,
         Some(control),
         Some(transfer_id.clone()),
+        Some(app),
     )
     .await;
     state.remove(&transfer_id);

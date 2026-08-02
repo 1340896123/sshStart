@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Bell,
   Braces,
@@ -28,7 +29,7 @@ import { DEV_BOOTSTRAP } from "./devBootstrap";
 import { DEMO_SERVER, isTauri, uid } from "./lib";
 import { normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
 import { DEFAULT_AI_TOOL_SETTINGS } from "./types";
-import type { AiConfig, ServerProfile, SessionState, TransferRequest, TransferTask } from "./types";
+import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
 
 const DEFAULT_AI_CONFIG: AiConfig = {
   apiMode: "chat-completions",
@@ -109,10 +110,60 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
   const cancelledTransfers = useRef(new Set<string>());
+  const transferProgressSamples = useRef(new Map<string, {
+    transferredBytes: number;
+    sampledAt: number;
+    speedBytesPerSecond: number;
+  }>());
   const appBodyRef = useRef<HTMLDivElement>(null);
 
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const activeServer = servers.find((server) => server.id === activeSession?.serverId);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let dispose: () => void = () => undefined;
+    void listen<TransferProgressEvent>("transfer-progress", ({ payload }) => {
+      const sampledAt = Date.now();
+      const previous = transferProgressSamples.current.get(payload.transferId);
+      let speedBytesPerSecond = previous?.speedBytesPerSecond ?? 0;
+      if (previous && payload.transferredBytes > previous.transferredBytes) {
+        const elapsedSeconds = (sampledAt - previous.sampledAt) / 1000;
+        if (elapsedSeconds > 0) {
+          const currentSpeed = (payload.transferredBytes - previous.transferredBytes) / elapsedSeconds;
+          speedBytesPerSecond = previous.speedBytesPerSecond > 0
+            ? previous.speedBytesPerSecond * 0.65 + currentSpeed * 0.35
+            : currentSpeed;
+        }
+      }
+      transferProgressSamples.current.set(payload.transferId, {
+        transferredBytes: payload.transferredBytes,
+        sampledAt,
+        speedBytesPerSecond,
+      });
+      const remainingSeconds = payload.totalBytes !== undefined && speedBytesPerSecond > 0 && payload.totalBytes > payload.transferredBytes
+        ? (payload.totalBytes - payload.transferredBytes) / speedBytesPerSecond
+        : payload.totalBytes !== undefined && payload.transferredBytes >= payload.totalBytes ? 0 : undefined;
+      setTransfers((current) => current.map((item) => {
+        if (item.transferId !== payload.transferId || (item.status !== "queued" && item.status !== "running" && item.status !== "paused")) return item;
+        return {
+          ...item,
+          transferredBytes: payload.transferredBytes,
+          totalBytes: payload.totalBytes,
+          speedBytesPerSecond,
+          remainingSeconds,
+        };
+      }));
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else dispose = unlisten;
+    });
+    return () => {
+      disposed = true;
+      dispose();
+    };
+  }, []);
 
   useEffect(() => {
     if (!DEV_BOOTSTRAP) return;
@@ -256,6 +307,8 @@ export default function App() {
       serverHost: server.host,
       status: "queued",
       createdAt: Date.now(),
+      transferredBytes: 0,
+      speedBytesPerSecond: 0,
     };
     setTransfers((current) => [task, ...current]);
     const operationPromise = operation(transferId);
@@ -266,7 +319,14 @@ export default function App() {
         cancelledTransfers.current.delete(id);
         setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "cancelled", finishedAt: item.finishedAt ?? Date.now() } : item));
       } else {
-        setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "completed", finishedAt: Date.now() } : item));
+        setTransfers((current) => current.map((item) => item.id === id ? {
+          ...item,
+          status: "completed",
+          transferredBytes: item.totalBytes ?? item.transferredBytes,
+          speedBytesPerSecond: 0,
+          remainingSeconds: 0,
+          finishedAt: Date.now(),
+        } : item));
       }
     } catch (reason) {
       if (cancelledTransfers.current.has(id)) {
@@ -275,8 +335,17 @@ export default function App() {
         return;
       }
       const error = String(reason);
-      setTransfers((current) => current.map((item) => item.id === id ? { ...item, status: "failed", error, finishedAt: Date.now() } : item));
+      setTransfers((current) => current.map((item) => item.id === id ? {
+        ...item,
+        status: "failed",
+        speedBytesPerSecond: 0,
+        remainingSeconds: undefined,
+        error,
+        finishedAt: Date.now(),
+      } : item));
       throw reason;
+    } finally {
+      transferProgressSamples.current.delete(transferId);
     }
   };
 
@@ -295,7 +364,17 @@ export default function App() {
     const transferId = uid("transfer-run");
     cancelledTransfers.current.delete(task.id);
     setTransfers((current) => current.map((item) => item.id === task.id
-      ? { ...item, transferId, status: "queued", error: undefined, finishedAt: undefined }
+      ? {
+        ...item,
+        transferId,
+        status: "queued",
+        transferredBytes: 0,
+        totalBytes: undefined,
+        speedBytesPerSecond: 0,
+        remainingSeconds: undefined,
+        error: undefined,
+        finishedAt: undefined,
+      }
       : item));
     setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
 
@@ -310,7 +389,15 @@ export default function App() {
         setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, status: "cancelled", finishedAt: item.finishedAt ?? Date.now() } : item));
       } else {
         setTransfers((current) => current.map((item) => item.id === task.id
-          ? { ...item, status: "completed", error: undefined, finishedAt: Date.now() }
+          ? {
+            ...item,
+            status: "completed",
+            transferredBytes: item.totalBytes ?? item.transferredBytes,
+            speedBytesPerSecond: 0,
+            remainingSeconds: 0,
+            error: undefined,
+            finishedAt: Date.now(),
+          }
           : item));
       }
     } catch (reason) {
@@ -319,17 +406,27 @@ export default function App() {
         setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, status: "cancelled", error: undefined, finishedAt: item.finishedAt ?? Date.now() } : item));
       } else {
         setTransfers((current) => current.map((item) => item.id === task.id
-          ? { ...item, status: "failed", error: String(reason), finishedAt: Date.now() }
+          ? {
+            ...item,
+            status: "failed",
+            speedBytesPerSecond: 0,
+            remainingSeconds: undefined,
+            error: String(reason),
+            finishedAt: Date.now(),
+          }
           : item));
       }
+    } finally {
+      transferProgressSamples.current.delete(transferId);
     }
   };
 
   const pauseTransfer = async (task: TransferTask) => {
     try {
       await invoke("pause_transfer", { transferId: task.transferId });
+      transferProgressSamples.current.delete(task.transferId);
       setTransfers((current) => current.map((item) => item.id === task.id && (item.status === "queued" || item.status === "running")
-        ? { ...item, status: "paused", error: undefined }
+        ? { ...item, status: "paused", speedBytesPerSecond: 0, remainingSeconds: undefined, error: undefined }
         : item));
     } catch (reason) {
       setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, error: `暂停失败：${String(reason)}` } : item));
@@ -339,8 +436,9 @@ export default function App() {
   const resumeTransfer = async (task: TransferTask) => {
     try {
       await invoke("resume_transfer", { transferId: task.transferId });
+      transferProgressSamples.current.delete(task.transferId);
       setTransfers((current) => current.map((item) => item.id === task.id && item.status === "paused"
-        ? { ...item, status: "running", error: undefined }
+        ? { ...item, status: "running", speedBytesPerSecond: 0, remainingSeconds: undefined, error: undefined }
         : item));
     } catch (reason) {
       setTransfers((current) => current.map((item) => item.id === task.id ? { ...item, error: `继续失败：${String(reason)}` } : item));
@@ -351,8 +449,16 @@ export default function App() {
     const currentTask = transfers.find((item) => item.id === task.id);
     if (!currentTask || (currentTask.status !== "queued" && currentTask.status !== "running" && currentTask.status !== "paused")) return;
     cancelledTransfers.current.add(task.id);
+    transferProgressSamples.current.delete(task.transferId);
     setTransfers((current) => current.map((item) => item.id === task.id
-      ? { ...item, status: "cancelled", error: undefined, finishedAt: item.finishedAt ?? Date.now() }
+      ? {
+        ...item,
+        status: "cancelled",
+        speedBytesPerSecond: 0,
+        remainingSeconds: undefined,
+        error: undefined,
+        finishedAt: item.finishedAt ?? Date.now(),
+      }
       : item));
     try {
       await invoke("cancel_transfer", { transferId: task.transferId });

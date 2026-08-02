@@ -332,6 +332,7 @@ body.is-resizing-columns * {
 
 .transfer-sidebar {
   grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  container-type: inline-size;
 }
 
 .transfer-summary {
@@ -478,9 +479,11 @@ body.is-resizing-columns * {
 
 .transfer-state > span {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 3px;
   margin-right: auto;
+  white-space: nowrap;
 }
 
 .status-completed .transfer-state > span {
@@ -541,23 +544,84 @@ body.is-resizing-columns * {
   color: var(--muted-2) !important;
 }
 
-.transfer-progress {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 2px;
+.transfer-progress-block {
+  padding: 0 9px 8px 42px;
+}
+
+.transfer-progress-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-family: var(--font-mono);
+}
+
+.transfer-progress-heading strong {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.transfer-progress-heading span {
   overflow: hidden;
+  color: var(--muted-2);
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-progress-track {
+  height: 3px;
+  overflow: hidden;
+  border-radius: 2px;
   background: var(--surface-muted);
 }
 
-.transfer-progress::after {
-  position: absolute;
-  width: 42%;
+.transfer-progress-track > span {
+  display: block;
   height: 100%;
   background: var(--accent);
-  content: "";
-  animation: transfer-progress 1.2s cubic-bezier(0.2, 0, 0, 1) infinite;
+  transition: width 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.status-completed .transfer-progress-track > span {
+  background: var(--success);
+}
+
+.status-failed .transfer-progress-track > span,
+.status-cancelled .transfer-progress-track > span {
+  background: var(--muted-2);
+}
+
+.transfer-progress-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 10px;
+  margin-top: 7px;
+}
+
+.transfer-progress-details > span {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.transfer-progress-details small {
+  color: var(--muted-2);
+  font-size: 8px;
+  letter-spacing: 0.02em;
+}
+
+.transfer-progress-details strong {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .transfer-item > p {
@@ -598,6 +662,16 @@ body.is-resizing-columns * {
   color: var(--muted-2);
   font-size: 9px;
   text-align: center;
+}
+
+@container (max-width: 230px) {
+  .transfer-state {
+    gap: 4px;
+  }
+
+  .transfer-state time {
+    display: none;
+  }
 }
 
 .sidebar-heading {
@@ -4795,21 +4869,17 @@ body.is-resizing-rows .system-dock {
   to { transform: rotate(360deg); }
 }
 
-@keyframes transfer-progress {
-  from { transform: translateX(-100%); }
-  to { transform: translateX(340%); }
-}
-
 @keyframes context-menu-in {
   from { opacity: 0; transform: translateY(-3px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .transfer-progress::after,
+  .transfer-progress-track > span,
   .file-context-menu,
   .ai-history-popover {
     animation: none;
+    transition: none;
   }
 }
 

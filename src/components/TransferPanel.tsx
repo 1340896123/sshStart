@@ -46,6 +46,37 @@ function timeLabel(timestamp: number) {
   }).format(new Date(timestamp));
 }
 
+const byteUnits = ["B", "KB", "MB", "GB", "TB"] as const;
+
+function formatBytes(bytes: number | undefined) {
+  if (bytes === undefined) return "获取中";
+  if (bytes <= 0) return "0 B";
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), byteUnits.length - 1);
+  const value = bytes / 1024 ** unitIndex;
+  const digits = unitIndex === 0 || value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${byteUnits[unitIndex]}`;
+}
+
+function speedLabel(task: TransferTask) {
+  if (task.status === "queued") return "等待中";
+  if (task.status === "paused") return "0 B/s";
+  if (task.status !== "running") return "—";
+  return task.speedBytesPerSecond > 0 ? `${formatBytes(task.speedBytesPerSecond)}/s` : "计算中";
+}
+
+function remainingLabel(task: TransferTask) {
+  if (task.status === "queued") return "等待中";
+  if (task.status === "paused") return "已暂停";
+  if (task.status === "completed") return "已完成";
+  if (task.status !== "running" || task.remainingSeconds === undefined) return task.status === "running" ? "计算中" : "—";
+  const seconds = Math.max(0, Math.ceil(task.remainingSeconds));
+  if (seconds < 60) return `${Math.max(1, seconds)} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} 小时 ${minutes % 60} 分`;
+}
+
 export function TransferPanel({ transfers, onActivateSession, onClearFinished, onDismiss, onRetry, onCopyPath, onPause, onResume, onCancel }: Props) {
   const [filter, setFilter] = useState<TransferFilter>("active");
   const [copyState, setCopyState] = useState<{ id: string; status: "copied" | "failed" }>();
@@ -100,6 +131,12 @@ export function TransferPanel({ transfers, onActivateSession, onClearFinished, o
               : task.status === "paused" ? Pause
                 : task.status === "cancelled" ? Ban
                   : Clock3;
+          const progress = task.totalBytes === undefined
+            ? 0
+            : task.totalBytes === 0
+              ? task.status === "completed" ? 100 : 0
+              : Math.min(100, Math.max(0, task.transferredBytes / task.totalBytes * 100));
+          const progressText = task.totalBytes === undefined ? "—" : `${Math.round(progress)}%`;
           return (
             <div className={`transfer-item status-${task.status}`} key={task.id}>
               <button className="transfer-main" onClick={() => onActivateSession(task.sessionId)} title={`切换到 ${task.sessionTitle}`}>
@@ -137,7 +174,26 @@ export function TransferPanel({ transfers, onActivateSession, onClearFinished, o
                   )}
                 </div>
               </div>
-              {task.status === "running" && <span className="transfer-progress" />}
+              <div className="transfer-progress-block">
+                <div className="transfer-progress-heading">
+                  <strong>{progressText}</strong>
+                  <span>{formatBytes(task.transferredBytes)} / {formatBytes(task.totalBytes)}</span>
+                </div>
+                <div
+                  className="transfer-progress-track"
+                  role="progressbar"
+                  aria-label={`${task.fileName} 传输进度`}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={task.totalBytes === undefined ? undefined : Math.round(progress)}
+                ><span style={{ width: `${progress}%` }} /></div>
+                <div className="transfer-progress-details">
+                  <span><small>已传输</small><strong>{formatBytes(task.transferredBytes)}</strong></span>
+                  <span><small>总大小</small><strong>{formatBytes(task.totalBytes)}</strong></span>
+                  <span><small>当前速度</small><strong>{speedLabel(task)}</strong></span>
+                  <span><small>剩余时间</small><strong>{remainingLabel(task)}</strong></span>
+                </div>
+              </div>
               {task.error && <p title={task.error}>{task.error}</p>}
             </div>
           );

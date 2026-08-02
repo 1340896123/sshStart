@@ -88,6 +88,12 @@ export interface TransferRequest {
   destinationPath: string;
 }
 
+export interface TransferProgressEvent {
+  transferId: string;
+  transferredBytes: number;
+  totalBytes?: number;
+}
+
 export interface TransferTask extends TransferRequest {
   id: string;
   transferId: string;
@@ -97,6 +103,10 @@ export interface TransferTask extends TransferRequest {
   serverHost: string;
   status: TransferStatus;
   createdAt: number;
+  transferredBytes: number;
+  totalBytes?: number;
+  speedBytesPerSecond: number;
+  remainingSeconds?: number;
   finishedAt?: number;
   error?: string;
 }
