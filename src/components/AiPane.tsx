@@ -10,6 +10,7 @@ import {
   CircleGauge,
   CircleStop,
   Copy,
+  FileDown,
   FileText,
   History,
   ImageIcon,
@@ -349,6 +350,15 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
   );
 }
 
+interface AiDebugRequest {
+  timestamp: number;
+  round: number;
+  method: string;
+  endpoint: string;
+  logPath?: string;
+  body: unknown;
+}
+
 export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Props) {
   const [input, setInput] = useState("");
   const [pastedImages, setPastedImages] = useState<DraftAiAttachment[]>([]);
@@ -361,6 +371,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   const [activeConversationId, setActiveConversationId] = useState<string>();
   const [streamingMessageId, setStreamingMessageId] = useState<string>();
   const [approvalLoading, setApprovalLoading] = useState<string>();
+  const [debugRequests, setDebugRequests] = useState<AiDebugRequest[]>([]);
   const requestVersionRef = useRef(0);
   const activeConversationIdRef = useRef<string>();
   const conversationsRef = useRef(conversations);
@@ -687,6 +698,40 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setMessages(messagesRef.current.map((message) => message.id === messageId ? { ...message, approvalState: "rejected" } : message));
   };
 
+  const exportDebugRequests = () => {
+    if (debugRequests.length === 0) return;
+    const exportedAt = new Date();
+    const payload = {
+      schemaVersion: 1,
+      exportedAt: exportedAt.toISOString(),
+      warning: "调试数据包含完整对话、系统提示词、工具参数与工具输出，请勿公开分享；API Key 未包含在内。",
+      server: {
+        id: server.id,
+        name: server.name,
+        host: server.host,
+        port: server.port,
+        username: server.username,
+        cwd: session.cwd,
+      },
+      api: {
+        mode: config.apiMode ?? "chat-completions",
+        model: config.model,
+        endpoint: debugRequests[0]?.endpoint ?? config.endpoint,
+      },
+      backendLogPath: debugRequests.find((request) => request.logPath)?.logPath,
+      requests: debugRequests,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `portico-ai-requests-${exportedAt.toISOString().replace(/[:.]/g, "-")}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
   const send = async (content = input) => {
     const text = content.trim();
     if (pastedImages.some((attachment) => attachment.status === "uploading")) {
@@ -750,6 +795,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     setMessages([...pendingMessages, assistantMessage], false);
     setLoading(true);
     setStreamingMessageId(assistantMessageId);
+    setDebugRequests([]);
     let streamedToolCalls: AiToolResult[] = [];
 
     try {
@@ -830,6 +876,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         }, true);
       } else {
         const streamId = uid("ai-stream");
+        const capturedDebugRequests: AiDebugRequest[] = [];
         let streamedContent = "";
         let streamedReasoning = "";
         let streamedReasonings: AiReasoning[] = [];
@@ -866,6 +913,11 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           if (streamFrame !== undefined) return;
           streamFrame = requestAnimationFrame(flushStream);
         };
+        const unlistenDebug = await listen<AiDebugRequest>(`ai-debug:${streamId}`, ({ payload }) => {
+          if (requestVersionRef.current !== requestVersion) return;
+          capturedDebugRequests.push(payload);
+          setDebugRequests([...capturedDebugRequests]);
+        });
         const unlisten = await listen<AiStreamDelta>(`ai-stream:${streamId}`, ({ payload }) => {
           if (requestVersionRef.current !== requestVersion) return;
           const eventType = payload.eventType;
@@ -920,6 +972,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           });
         } finally {
           unlisten();
+          unlistenDebug();
           if (streamFrame !== undefined) cancelAnimationFrame(streamFrame);
           flushStream();
         }
@@ -1004,6 +1057,15 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         <div className="pane-title"><Sparkles size={14} /><span>AI 助手</span><small>{config.model} · {(config.apiMode ?? "chat-completions") === "responses" ? "Responses" : "Chat Completions"}</small></div>
         <span className="header-spacer" />
         <button className="icon-button quiet" title="新建会话" aria-label="新建会话" onClick={startNewConversation}><MessageSquarePlus size={14} /></button>
+        <button
+          className="icon-button quiet"
+          title={debugRequests.length > 0 ? `导出原始接口请求（${debugRequests.length} 轮，包含对话与工具输出）` : "完成一次 AI 请求后可导出原始接口数据"}
+          aria-label="导出原始接口请求"
+          disabled={debugRequests.length === 0}
+          onClick={exportDebugRequests}
+        >
+          <FileDown size={14} />
+        </button>
         <div className="ai-history-control" ref={historyControlRef}>
           <button
             className={`icon-button quiet ${historyOpen ? "active" : ""}`}

@@ -17,7 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4569,6 +4569,60 @@ async fn approve_ai_tool(
     ))
 }
 
+struct AiSessionLogger {
+    stream_id: String,
+    path: Option<PathBuf>,
+    file: Option<File>,
+}
+
+impl AiSessionLogger {
+    fn start_ai_log(app: &AppHandle, stream_id: &str) -> Self {
+        let directory = app.path().app_log_dir().unwrap_or_else(|error| {
+            eprintln!("AI 日志目录解析失败: {error}; 回退到临时目录");
+            env::temp_dir().join("portico-ssh").join("logs")
+        });
+        let path = directory.join(format!("ai-{}-{}.jsonl", ai_timestamp_ms(), Uuid::new_v4()));
+        let file = fs::create_dir_all(&directory)
+            .and_then(|_| File::create(&path))
+            .map_err(|error| {
+                eprintln!("AI 日志文件创建失败 {}: {error}", path.display());
+                error
+            })
+            .ok();
+        let mut logger = Self {
+            stream_id: stream_id.to_string(),
+            path: file.as_ref().map(|_| path),
+            file,
+        };
+        if let Some(path) = logger.log_path_string() {
+            eprintln!("AI 调试日志: {path}");
+            logger.write_event("log.opened", None, json!({ "path": path }));
+        }
+        logger
+    }
+
+    fn log_path_string(&self) -> Option<String> {
+        self.path.as_ref().map(|path| path.display().to_string())
+    }
+
+    fn write_event(&mut self, event: &str, round: Option<usize>, data: Value) {
+        let entry = json!({
+            "timestamp": ai_timestamp_ms(),
+            "streamId": self.stream_id,
+            "event": event,
+            "round": round,
+            "data": data,
+        });
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if let Err(error) = writeln!(file, "{entry}").and_then(|_| file.flush()) {
+            eprintln!("AI 日志写入失败: {error}");
+            self.file = None;
+        }
+    }
+}
+
 #[tauri::command]
 async fn ai_chat(
     app: tauri::AppHandle,
@@ -4606,6 +4660,26 @@ async fn ai_chat(
         server.port,
         if config.tools.allow_mutating_tools { "是" } else { "否" },
     );
+    let stream_event_name = format!("ai-stream:{stream_id}");
+    let debug_event_name = format!("ai-debug:{stream_id}");
+    let mut ai_logger = AiSessionLogger::start_ai_log(&app, &stream_id);
+    ai_logger.write_event(
+        "chat.started",
+        None,
+        json!({
+            "apiMode": if config.api_mode.is_responses() { "responses" } else { "chat-completions" },
+            "endpoint": &endpoint,
+            "model": &config.model,
+            "server": {
+                "id": &server.id,
+                "host": &server.host,
+                "port": server.port,
+                "username": &server.username,
+            },
+            "allowExecute": allow_execute,
+            "messages": &messages,
+        }),
+    );
     let mut usage = AiTokenUsage::default();
     let mut conversation_messages = messages;
     let mut compaction_summary = None;
@@ -4624,6 +4698,15 @@ async fn ai_chat(
         .await
         {
             Ok(Some((summary, split_index, compaction_usage))) => {
+                ai_logger.write_event(
+                    "context.compacted",
+                    None,
+                    json!({
+                        "messagesRemoved": split_index,
+                        "summary": &summary.content,
+                        "usage": compaction_usage,
+                    }),
+                );
                 usage.record(compaction_usage);
                 compaction_summary = Some(summary.content.clone());
                 compaction_messages_removed = Some(split_index);
@@ -4632,7 +4715,10 @@ async fn ai_chat(
                 conversation_messages = compacted;
             }
             Ok(None) => {}
-            Err(error) => eprintln!("{error}; 回退到普通上下文裁剪"),
+            Err(error) => {
+                ai_logger.write_event("context.compaction_error", None, json!({ "error": &error }));
+                eprintln!("{error}; 回退到普通上下文裁剪");
+            }
         }
     }
     let mut api_messages = vec![json!({ "role": "system", "content": system })];
@@ -4659,9 +4745,8 @@ async fn ai_chat(
     } else {
         Vec::new()
     };
-    let stream_event_name = format!("ai-stream:{stream_id}");
-
-    for _ in 0..config.tools.max_tool_rounds.max(1) {
+    for round_index in 0..config.tools.max_tool_rounds.max(1) {
+        let round = round_index as usize + 1;
         let input_cost = if config.api_mode.is_responses() {
             trim_response_inputs_for_context(
                 &mut response_inputs,
@@ -4679,6 +4764,15 @@ async fn ai_chat(
             .saturating_sub(64)
             .min(config.max_output_tokens as usize);
         if output_budget == 0 {
+            ai_logger.write_event(
+                "round.rejected",
+                Some(round),
+                json!({
+                    "reason": "no_output_budget",
+                    "inputCost": input_cost,
+                    "contextWindow": config.context_window,
+                }),
+            );
             return Err("当前上下文没有可用的输出空间，请缩短对话或增大上下文大小".to_string());
         }
         let mut body = if config.api_mode.is_responses() {
@@ -4706,16 +4800,51 @@ async fn ai_chat(
             body["prompt_cache_key"] = json!(prompt_cache_key);
         }
 
-        let response = client
+        let debug_request = json!({
+            "timestamp": ai_timestamp_ms(),
+            "round": round,
+            "method": "POST",
+            "endpoint": &endpoint,
+            "logPath": ai_logger.log_path_string(),
+            "body": &body,
+        });
+        ai_logger.write_event("round.request", Some(round), debug_request.clone());
+        if let Err(error) = app.emit(&debug_event_name, debug_request) {
+            ai_logger.write_event(
+                "round.debug_emit_error",
+                Some(round),
+                json!({ "error": error.to_string() }),
+            );
+        }
+
+        let response = match client
             .post(&endpoint)
             .bearer_auth(&api_key)
             .json(&body)
             .send()
             .await
-            .map_err(|error| format!("AI 请求失败: {error}"))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                ai_logger.write_event(
+                    "round.request_error",
+                    Some(round),
+                    json!({ "error": error.to_string() }),
+                );
+                return Err(format!("AI 请求失败: {error}"));
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             let response_body = response.text().await.unwrap_or_default();
+            ai_logger.write_event(
+                "round.http_error",
+                Some(round),
+                json!({
+                    "status": status.as_u16(),
+                    "body": &response_body,
+                }),
+            );
             let payload = serde_json::from_str::<Value>(&response_body).ok();
             let detail = payload
                 .as_ref()
@@ -4732,7 +4861,17 @@ async fn ai_chat(
             return Err(format!("AI 接口返回 {status}: {detail}"));
         }
 
-        let completion = read_ai_stream(response, &app, &stream_event_name).await?;
+        let completion = match read_ai_stream(response, &app, &stream_event_name).await {
+            Ok(completion) => completion,
+            Err(error) => {
+                ai_logger.write_event(
+                    "round.stream_error",
+                    Some(round),
+                    json!({ "error": &error }),
+                );
+                return Err(error);
+            }
+        };
         usage.record(completion.usage);
         let message = completion.message();
         let tool_calls = message
@@ -4740,10 +4879,31 @@ async fn ai_chat(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        ai_logger.write_event(
+            "round.response",
+            Some(round),
+            json!({
+                "responseId": &completion.response_id,
+                "content": &completion.content,
+                "reasoning": &completion.reasoning,
+                "message": &message,
+                "responseOutput": &completion.response_output,
+                "toolCallCount": tool_calls.len(),
+                "usage": completion.usage,
+            }),
+        );
         if config.api_mode.is_responses() && !tool_calls.is_empty() {
             let output_items = completion.response_output_items();
             if output_items.is_empty() {
                 let response_id = completion.response_id.as_deref().unwrap_or("unknown");
+                ai_logger.write_event(
+                    "round.invalid_tool_response",
+                    Some(round),
+                    json!({
+                        "responseId": response_id,
+                        "reason": "missing_response_output_items",
+                    }),
+                );
                 return Err(format!(
                     "Responses 工具调用响应 {response_id} 缺少可重放的 output items"
                 ));
@@ -4754,6 +4914,17 @@ async fn ai_chat(
             let (content, summary) = extract_reasoning_summary(&completion.content);
             let provider_reasoning =
                 (!completion.reasoning.is_empty()).then_some(completion.reasoning);
+            ai_logger.write_event(
+                "chat.completed",
+                Some(round),
+                json!({
+                    "content": &content,
+                    "reasoningSummary": &summary,
+                    "providerReasoning": &provider_reasoning,
+                    "toolCalls": &executed_tools,
+                    "usage": usage,
+                }),
+            );
             return Ok(AiResponse {
                 content,
                 reasoning: summary.or_else(|| provider_reasoning.clone()),
@@ -4799,23 +4970,63 @@ async fn ai_chat(
                     &tool_call_ids[index + 1..],
                 )?
             };
+            ai_logger.write_event(
+                "tool.requested",
+                Some(round),
+                json!({
+                    "index": index + 1,
+                    "outputBudget": output_budget,
+                    "raw": &tool_call,
+                }),
+            );
             let arguments = tool_call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            let parsed: Value = serde_json::from_str(arguments)
-                .map_err(|error| format!("工具参数解析失败: {error}"))?;
+            let parsed: Value = match serde_json::from_str(arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    ai_logger.write_event(
+                        "tool.arguments_error",
+                        Some(round),
+                        json!({
+                            "arguments": arguments,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    return Err(format!("工具参数解析失败: {error}"));
+                }
+            };
             let tool_name = tool_call
                 .pointer("/function/name")
                 .and_then(Value::as_str)
                 .unwrap_or("execute_command")
                 .to_string();
             if !ai_tool_enabled(&config.tools, &tool_name) {
+                ai_logger.write_event(
+                    "tool.disabled",
+                    Some(round),
+                    json!({
+                        "tool": &tool_name,
+                        "arguments": &parsed,
+                    }),
+                );
                 return Err(format!("AI 工具 {tool_name} 未在设置中启用"));
             }
             let pending_command =
                 ai_tool_command_for_risk(&tool_name, &parsed).unwrap_or_else(|| tool_name.clone());
             let started_at = ai_timestamp_ms();
+            ai_logger.write_event(
+                "tool.started",
+                Some(round),
+                json!({
+                    "id": id,
+                    "tool": &tool_name,
+                    "arguments": &parsed,
+                    "command": &pending_command,
+                    "outputBudget": output_budget,
+                }),
+            );
             emit_ai_tool_stream_update(
                 &app,
                 &stream_event_name,
@@ -4852,6 +5063,14 @@ async fn ai_chat(
                     &tool_result.command,
                     Some(&tool_result.output),
                     Some(tool_result.exit_code),
+                );
+                ai_logger.write_event(
+                    "tool.blocked",
+                    Some(round),
+                    json!({
+                        "reason": "mutation_not_authorized",
+                        "result": &tool_result,
+                    }),
                 );
                 executed_tools.push(tool_result);
                 append_ai_tool_output(
@@ -4892,6 +5111,15 @@ async fn ai_chat(
                             &tool_result.command,
                             Some(&tool_result.output),
                             Some(tool_result.exit_code),
+                        );
+                        ai_logger.write_event(
+                            "tool.approval_required",
+                            Some(round),
+                            json!({
+                                "reason": &reason,
+                                "arguments": &parsed,
+                                "result": &tool_result,
+                            }),
                         );
                         executed_tools.push(tool_result);
                         return Ok(AiResponse {
@@ -4938,6 +5166,15 @@ async fn ai_chat(
                                 Some(&tool_result.output),
                                 Some(tool_result.exit_code),
                             );
+                            ai_logger.write_event(
+                                "tool.blocked",
+                                Some(round),
+                                json!({
+                                    "reason": "protected_write_path",
+                                    "arguments": &parsed,
+                                    "result": &tool_result,
+                                }),
+                            );
                             executed_tools.push(tool_result);
                             return Ok(AiResponse {
                                 content: "已阻止写入受保护系统路径。".to_string(),
@@ -4965,6 +5202,15 @@ async fn ai_chat(
                 None,
                 None,
             );
+            ai_logger.write_event(
+                "tool.running",
+                Some(round),
+                json!({
+                    "id": id,
+                    "tool": &tool_name,
+                    "command": &pending_command,
+                }),
+            );
             let execution = match execute_ai_tool(&tool_name, &parsed, &server, &config.tools).await
             {
                 Ok(execution) => execution,
@@ -4978,6 +5224,16 @@ async fn ai_chat(
                         &pending_command,
                         Some(&error),
                         Some(1),
+                    );
+                    ai_logger.write_event(
+                        "tool.execution_error",
+                        Some(round),
+                        json!({
+                            "id": id,
+                            "tool": &tool_name,
+                            "command": &pending_command,
+                            "error": &error,
+                        }),
                     );
                     return Err(error);
                 }
@@ -5005,6 +5261,11 @@ async fn ai_chat(
                 Some(&tool_result.output),
                 Some(tool_result.exit_code),
             );
+            ai_logger.write_event(
+                "tool.completed",
+                Some(round),
+                json!({ "result": &tool_result }),
+            );
             append_ai_tool_output(
                 &mut api_messages,
                 &mut response_inputs,
@@ -5019,6 +5280,11 @@ async fn ai_chat(
         }
     }
 
+    ai_logger.write_event(
+        "chat.tool_round_limit",
+        None,
+        json!({ "maxToolRounds": config.tools.max_tool_rounds.max(1) }),
+    );
     Err("AI 工具调用次数超过上限".to_string())
 }
 
