@@ -111,7 +111,7 @@ export interface TransferTask extends TransferRequest {
   error?: string;
 }
 
-export type MessageRole = "user" | "assistant" | "tool";
+export type MessageRole = "user" | "assistant";
 
 export interface AiTokenUsage {
   available: boolean;
@@ -133,14 +133,36 @@ export interface AiImageAttachment {
   size: number;
 }
 
-export type AiActionStatus = "started" | "running" | "completed" | "error";
-export type AiMessageType = "text" | "command" | "tool" | "approval" | "status" | "error";
-export type AiStreamEventType = "message_delta" | "action_update";
+export type AiActionStatus = "started" | "running" | "completed" | "error" | "rejected" | "cancelled";
+export type AiMessageType = "text" | "tool" | "approval" | "error";
 
 export interface AiReasoning {
   id: string;
   content: string;
-  sequence?: number;
+  sequence: number;
+}
+
+export interface AiApproval {
+  id: string;
+  actionId: string;
+  tool: string;
+  command: string;
+  reason: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface AiToolResult {
+  id: string;
+  sequence: number;
+  tool: string;
+  command: string;
+  arguments?: Record<string, unknown>;
+  output: string;
+  exitCode: number;
+  status: AiActionStatus;
+  startedAt: number;
+  updatedAt: number;
+  completedAt?: number;
 }
 
 export interface AiMessage {
@@ -150,7 +172,6 @@ export interface AiMessage {
   content: string;
   attachments?: AiImageAttachment[];
   reasonings?: AiReasoning[];
-  reasoningContent?: string;
   toolCalls?: AiToolResult[];
   approval?: AiApproval;
   approvalState?: "pending" | "approved" | "rejected";
@@ -159,26 +180,6 @@ export interface AiMessage {
   updatedAt: number;
   completedAt?: number;
   status: AiActionStatus;
-}
-
-export interface AiApproval {
-  tool: string;
-  command: string;
-  reason: string;
-  arguments?: Record<string, unknown>;
-}
-
-export interface AiToolResult {
-  id: string;
-  sequence?: number;
-  tool: string;
-  command: string;
-  output: string;
-  exitCode: number;
-  status: AiActionStatus;
-  startedAt: number;
-  updatedAt: number;
-  completedAt?: number;
 }
 
 export type AiToolKey =
@@ -242,7 +243,7 @@ export const DEFAULT_AI_TOOL_SETTINGS: AiToolSettings = {
   maxToolRounds: 6,
   maxOutputChars: 12000,
   commandTimeoutSeconds: 30,
-  allowMutatingTools: true,
+  allowMutatingTools: false,
 };
 
 export type AiApiMode = "chat-completions" | "responses";
@@ -252,9 +253,7 @@ export interface AiConfig {
   endpoint: string;
   apiKey: string;
   model: string;
-  contextWindow: number;
   maxOutputTokens: number;
-  autoCompress: boolean;
   temperature: number;
   systemPrompt: string;
   tools: AiToolSettings;
@@ -265,16 +264,14 @@ type AiConfigInput = Omit<Partial<AiConfig>, "tools"> & {
 };
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
-  apiMode: "chat-completions",
+  apiMode: "responses",
   endpoint: "https://api.openai.com/v1",
   apiKey: "",
   model: "gpt-4.1-mini",
-  contextWindow: 128000,
   maxOutputTokens: 4096,
-  autoCompress: true,
   temperature: 0.2,
   systemPrompt:
-    "你是一名谨慎的 Linux 运维助手。优先解释风险；先使用 risk_checker 评估动作，再调用合适的结构化工具。高风险操作必须等待人工确认，不要尝试绕过本地策略。",
+    "你是 Portico SSH 的 Rig 运维 Agent。先观察再行动，优先使用结构化工具获取事实；明确说明风险和执行结果。不要声称读取过尚未通过工具访问的文件，高风险或变更型动作必须等待人工审批。",
   tools: DEFAULT_AI_TOOL_SETTINGS,
 };
 
@@ -284,42 +281,68 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
     endpoint: config.endpoint ?? fallback.endpoint,
     apiKey: config.apiKey ?? fallback.apiKey,
     model: config.model ?? fallback.model,
-    contextWindow: config.contextWindow ?? fallback.contextWindow,
     maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,
-    autoCompress: config.autoCompress ?? fallback.autoCompress,
     temperature: config.temperature ?? fallback.temperature,
     systemPrompt: config.systemPrompt ?? fallback.systemPrompt,
     tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...fallback.tools, ...(config.tools ?? {}) },
   };
 }
 
-export interface AiResponse {
+interface AiAgentEventBase {
+  runId: string;
+  sequence: number;
+  timestamp: number;
+}
+
+export type AiAgentEvent = AiAgentEventBase & (
+  | { type: "run_started"; model: string; apiMode: string }
+  | { type: "text_delta"; delta: string }
+  | { type: "reasoning_delta"; delta: string }
+  | {
+      type: "tool_started";
+      actionId: string;
+      tool: string;
+      command: string;
+      arguments: Record<string, unknown>;
+      startedAt: number;
+    }
+  | {
+      type: "approval_required";
+      approvalId: string;
+      actionId: string;
+      tool: string;
+      command: string;
+      arguments: Record<string, unknown>;
+      reason: string;
+    }
+  | {
+      type: "tool_finished";
+      actionId: string;
+      tool: string;
+      command: string;
+      output: string;
+      exitCode: number;
+      status: AiActionStatus;
+      startedAt: number;
+      completedAt: number;
+    }
+  | {
+      type: "usage";
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      cachedTokens: number;
+      reasoningTokens: number;
+      requests: number;
+    }
+  | { type: "run_completed" }
+  | { type: "run_cancelled" }
+  | { type: "run_failed"; error: string }
+);
+
+export interface AiRunResult {
   content: string;
   reasoning?: string;
-  reasoningContent?: string;
-  approval?: AiApproval;
-  toolCalls: AiToolResult[];
-  usage?: AiTokenUsage;
-  compactionSummary?: string;
-  compactionMessagesRemoved?: number;
+  usage: AiTokenUsage;
 }
-
-export interface AiStreamDelta {
-  eventType: AiStreamEventType;
-  content?: string;
-  reasoning?: string;
-  toolCall?: {
-    id: string;
-    phase: "started" | "running" | "finished" | "error";
-    status: AiActionStatus;
-    tool: string;
-    command: string;
-    output?: string;
-    exitCode?: number;
-    startedAt?: number;
-    updatedAt: number;
-    completedAt?: number;
-  };
-}
-
 export type WorkspaceView = "terminal" | "files" | "split";

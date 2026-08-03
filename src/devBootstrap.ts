@@ -62,9 +62,8 @@ const createDevBootstrap = (): DevBootstrapConfig | undefined => {
       endpoint,
       apiKey,
       model: envValue("VITE_PORTICO_AI_MODEL"),
-      contextWindow: envNumber("VITE_PORTICO_AI_CONTEXT_WINDOW", 65536),
+      apiMode: envValue("VITE_PORTICO_AI_API_MODE") === "chat-completions" ? "chat-completions" : "responses",
       maxOutputTokens: envNumber("VITE_PORTICO_AI_MAX_OUTPUT_TOKENS", 4096),
-      autoCompress: envValue("VITE_PORTICO_AI_AUTO_COMPRESS") !== "false",
       temperature: envNumber("VITE_PORTICO_AI_TEMPERATURE", 0.2),
     } : undefined,
   };

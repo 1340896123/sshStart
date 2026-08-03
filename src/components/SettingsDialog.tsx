@@ -100,7 +100,7 @@ const SETTINGS_SECTIONS: Array<{
   icon: typeof Bot;
 }> = [
   { id: "model", label: "模型", description: "接口、密钥与模型能力", icon: Bot },
-  { id: "agent", label: "Agent", description: "上下文与会话提示词", icon: SlidersHorizontal },
+  { id: "agent", label: "Agent", description: "运行参数与系统提示词", icon: SlidersHorizontal },
   { id: "tools", label: "工具能力", description: "终端、诊断与服务工具", icon: Wrench },
   { id: "transfer", label: "文件传输", description: "文件系统与 SFTP 权限", icon: Upload },
   { id: "security", label: "安全策略", description: "高危拦截与变更边界", icon: ShieldCheck },
@@ -125,7 +125,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     setError("");
     try {
       if (!isTauri()) throw new Error("模型列表仅可在桌面应用中获取");
-      const nextModels = await invoke<string[]>("list_ai_models", { config: value });
+      const nextModels = await invoke<string[]>("list_rig_models", { config: value });
       setModels(nextModels);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -148,10 +148,6 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     }
     if (!value.model.trim()) {
       setError("请填写或选择模型");
-      return;
-    }
-    if (!Number.isInteger(value.contextWindow) || value.contextWindow < 1024) {
-      setError("上下文大小需为不小于 1,024 的整数");
       return;
     }
     if (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 256) {
@@ -366,23 +362,11 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
             {visibleActiveSection === "agent" && (
               <>
                 <section className="settings-panel">
-                  <header><strong>会话参数</strong><small>控制模型可读取的上下文和回答随机性</small></header>
-                  <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>最大上下文长度</strong><small>模型可读取的最大上下文窗口，单位为 tokens</small></span>
-                    <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={1024} step={1} value={value.contextWindow} onChange={(event) => setValue({ ...value, contextWindow: Number(event.target.value) })} /><em>tokens</em></span>
-                  </label>
+                  <header><strong>Agent 运行参数</strong><small>由 Rig 管理多轮调用、工具循环和 provider 差异</small></header>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>输出长度</strong><small>单次回答最多生成的 tokens 数</small></span>
                     <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={256} step={1} value={value.maxOutputTokens} onChange={(event) => setValue({ ...value, maxOutputTokens: Number(event.target.value) })} /><em>tokens</em></span>
                   </label>
-                  <div className="settings-config-row settings-toggle-row">
-                    <span className="settings-row-copy"><strong>自动压缩上下文</strong><small>接近上限时先总结较早对话，再保留最近几轮继续请求</small></span>
-                    <label className="settings-toggle-control">
-                      <input type="checkbox" checked={value.autoCompress} onChange={(event) => setValue({ ...value, autoCompress: event.target.checked })} />
-                      <span className="switch" aria-hidden="true" />
-                      <span>达到上下文阈值时自动压缩</span>
-                    </label>
-                  </div>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>温度</strong><small>较低值更稳定，较高值更发散</small></span>
                     <span className="settings-range-control"><input type="range" min={0} max={2} step={0.1} value={value.temperature} onChange={(event) => setValue({ ...value, temperature: Number(event.target.value) })} /><output>{value.temperature.toFixed(1)}</output></span>
@@ -421,8 +405,8 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
               <>
                 <div className="settings-section-summary"><div><strong>安全与知识</strong><small>在执行前检查风险并复用经过整理的命令片段</small></div></div>
                 <div className="settings-tool-groups">{renderToolGroup(TOOL_GROUPS[3])}</div>
-                <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许变更型工具</strong><small>写文件、上传、服务重启和进程信号仍会经过高危策略拦截。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
-                <div className="settings-note"><ShieldCheck size={15} /><span>风险检查在 Rust 核心执行。命中高危规则时会暂停并等待人工确认，写入型工具默认关闭。</span></div>
+                <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许 Agent 请求变更</strong><small>开启后 Rig 可提出写入、上传、服务和进程操作，但执行前仍需人工审批。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
+                <div className="settings-note"><ShieldCheck size={15} /><span>审批由 Rust 运行时挂起 Rig 工具调用；拒绝结果会返回 Agent，由它继续解释或调整计划。</span></div>
               </>
             )}
           </div>
