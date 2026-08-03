@@ -7,6 +7,8 @@ import {
   CircleAlert,
   Container,
   Download,
+  Eye,
+  EyeOff,
   ExternalLink,
   FileCode2,
   FilePenLine,
@@ -115,6 +117,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
   const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
   const [removingKey, setRemovingKey] = useState(false);
+  const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [error, setError] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSection>("model");
   const [navSearch, setNavSearch] = useState("");
@@ -150,6 +153,10 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
       setError("请填写或选择模型");
       return;
     }
+    if (!Number.isInteger(value.contextWindow) || value.contextWindow < 1) {
+      setError("上下文大小需为正整数");
+      return;
+    }
     if (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 256) {
       setError("输出长度需为不小于 256 的整数");
       return;
@@ -162,8 +169,8 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
       setError("工具调用轮数需为不小于 1 的整数");
       return;
     }
-    if (!Number.isInteger(value.tools.maxOutputChars) || value.tools.maxOutputChars < 1000) {
-      setError("工具输出上限需为不小于 1,000 的整数");
+    if (!Number.isInteger(value.tools.maxOutputChars) || value.tools.maxOutputChars < 1) {
+      setError("工具输出上限需为正整数");
       return;
     }
     if (!Number.isInteger(value.tools.commandTimeoutSeconds) || value.tools.commandTimeoutSeconds < 5) {
@@ -332,10 +339,15 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                     <span className="settings-row-copy"><strong>Base URL</strong><small>可填写 API 基础地址，也可填写当前模式的完整接口地址</small></span>
                     <input className="settings-input settings-mono-input" value={value.endpoint} onChange={(event) => setValue({ ...value, endpoint: event.target.value })} />
                   </label>
-                  <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>API Key</strong><small>密钥保存到系统凭据库；留空并保存会保留已保存的密钥</small></span>
-                    <input className="settings-input settings-mono-input" type="password" autoComplete="off" value={value.apiKey} onChange={(event) => setValue({ ...value, apiKey: event.target.value })} placeholder="sk-..." />
-                  </label>
+                  <div className="settings-config-row">
+                    <label className="settings-row-copy" htmlFor="ai-api-key"><strong>API Key</strong><small>桌面端安全保存到系统凭据库，并在启动时自动恢复</small></label>
+                    <span className="settings-secret-control">
+                      <input id="ai-api-key" className="settings-input settings-mono-input" type={apiKeyVisible ? "text" : "password"} autoComplete="off" spellCheck={false} value={value.apiKey} onChange={(event) => setValue({ ...value, apiKey: event.target.value })} placeholder="sk-..." />
+                      <button className="settings-secret-toggle" type="button" onClick={() => setApiKeyVisible((visible) => !visible)} aria-label={apiKeyVisible ? "隐藏 API Key" : "显示 API Key"} aria-pressed={apiKeyVisible} title={apiKeyVisible ? "隐藏 API Key" : "显示 API Key"}>
+                        {apiKeyVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+                      </button>
+                    </span>
+                  </div>
                   <div className="settings-config-row">
                     <span className="settings-row-copy"><strong>移除已保存密钥</strong><small>从系统凭据库永久删除当前密钥；此操作不能通过清空输入框完成</small></span>
                     <button className="danger-button" type="button" disabled={busy} onClick={() => void removeSavedKey()}>
@@ -364,6 +376,10 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                 <section className="settings-panel">
                   <header><strong>Agent 运行参数</strong><small>由 Rig 管理多轮调用、工具循环和 provider 差异</small></header>
                   <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>最大上下文</strong><small>模型上下文预算；Portico 不额外限制可填写的上限</small></span>
+                    <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={1} step={1} value={value.contextWindow} onChange={(event) => setValue({ ...value, contextWindow: Number(event.target.value) })} /><em>tokens</em></span>
+                  </label>
+                  <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>输出长度</strong><small>单次回答最多生成的 tokens 数</small></span>
                     <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={256} step={1} value={value.maxOutputTokens} onChange={(event) => setValue({ ...value, maxOutputTokens: Number(event.target.value) })} /><em>tokens</em></span>
                   </label>
@@ -387,7 +403,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                   <header><strong>执行策略</strong><small>配置每次工具链的运行轮次、输出体积和命令超时</small></header>
                   <div className="tool-policy-grid">
                     <label className="field"><span>最大工具轮数 <small>每次请求</small></span><input type="number" min={1} step={1} value={value.tools.maxToolRounds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxToolRounds: Number(event.target.value) } })} /></label>
-                    <label className="field"><span>输出上限 <small>字符</small></span><input type="number" min={1000} step={1} value={value.tools.maxOutputChars} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxOutputChars: Number(event.target.value) } })} /></label>
+                    <label className="field"><span>单轮输出上限 <small>字符</small></span><input type="number" min={1} step={1} value={value.tools.maxOutputChars} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxOutputChars: Number(event.target.value) } })} /></label>
                     <label className="field"><span>命令超时 <small>秒</small></span><input type="number" min={5} step={1} value={value.tools.commandTimeoutSeconds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, commandTimeoutSeconds: Number(event.target.value) } })} /></label>
                   </div>
                 </section>

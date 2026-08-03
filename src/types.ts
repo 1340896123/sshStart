@@ -240,8 +240,8 @@ export const DEFAULT_AI_TOOL_SETTINGS: AiToolSettings = {
   riskChecker: true,
   snippetLibrary: true,
   logAnalyzer: true,
-  maxToolRounds: 6,
-  maxOutputChars: 12000,
+  maxToolRounds: 200,
+  maxOutputChars: 128000,
   commandTimeoutSeconds: 30,
   allowMutatingTools: false,
 };
@@ -253,6 +253,7 @@ export interface AiConfig {
   endpoint: string;
   apiKey: string;
   model: string;
+  contextWindow: number;
   maxOutputTokens: number;
   temperature: number;
   systemPrompt: string;
@@ -268,7 +269,8 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   endpoint: "https://api.openai.com/v1",
   apiKey: "",
   model: "gpt-4.1-mini",
-  maxOutputTokens: 4096,
+  contextWindow: 1000000,
+  maxOutputTokens: 384000,
   temperature: 0.2,
   systemPrompt:
     "你是 Portico SSH 的 Rig 运维 Agent。先观察再行动，优先使用结构化工具获取事实；明确说明风险和执行结果。不要声称读取过尚未通过工具访问的文件，高风险或变更型动作必须等待人工审批。",
@@ -281,6 +283,7 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
     endpoint: config.endpoint ?? fallback.endpoint,
     apiKey: config.apiKey ?? fallback.apiKey,
     model: config.model ?? fallback.model,
+    contextWindow: config.contextWindow ?? fallback.contextWindow,
     maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,
     temperature: config.temperature ?? fallback.temperature,
     systemPrompt: config.systemPrompt ?? fallback.systemPrompt,

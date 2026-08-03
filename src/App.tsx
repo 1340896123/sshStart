@@ -32,7 +32,11 @@ import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
 import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
 
 const AI_CONFIG_STORAGE_KEY = "portico.ai";
-const serializeAiConfig = ({ apiKey: _apiKey, ...config }: AiConfig) => config;
+const serializeAiConfig = (config: AiConfig) => {
+  if (!isTauri()) return config;
+  const { apiKey: _apiKey, ...persistedConfig } = config;
+  return persistedConfig;
+};
 
 const SIDEBAR_MIN_WIDTH = 210;
 const SIDEBAR_MAX_WIDTH = 420;
@@ -165,6 +169,20 @@ export default function App() {
       dispose();
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    void invoke<string | null>("load_ai_key")
+      .then((apiKey) => {
+        if (disposed || !apiKey) return;
+        setAiConfig((current) => current.apiKey.trim() ? current : { ...current, apiKey });
+      })
+      .catch((error) => console.error("Failed to load saved AI API key", error));
+    return () => {
+      disposed = true;
+    };
+  }, [setAiConfig]);
 
   useEffect(() => {
     if (!DEV_BOOTSTRAP) return;

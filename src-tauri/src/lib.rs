@@ -599,6 +599,15 @@ fn store_ai_key(api_key: String) -> Result<(), String> {
         .map_err(|error| format!("保存 AI API Key 失败: {error}"))
 }
 
+#[tauri::command]
+fn load_ai_key() -> Result<Option<String>, String> {
+    match keyring_entry("ai:api-key")?.get_password() {
+        Ok(api_key) => Ok(Some(api_key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("读取 AI API Key 失败: {error}")),
+    }
+}
+
 fn delete_ai_key_from_keyring(account: &str) -> Result<(), String> {
     match keyring_entry(account)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -2388,6 +2397,7 @@ pub fn run() {
             store_server_secret,
             delete_server_secret,
             store_ai_key,
+            load_ai_key,
             delete_ai_key,
             start_terminal,
             terminal_input,

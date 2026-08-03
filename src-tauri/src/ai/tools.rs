@@ -84,11 +84,11 @@ fn default_true() -> bool {
 }
 
 fn default_tool_rounds() -> u32 {
-    8
+    200
 }
 
 fn default_tool_output_chars() -> usize {
-    12_000
+    128_000
 }
 
 fn default_command_timeout_seconds() -> u32 {

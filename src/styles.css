@@ -4199,6 +4199,42 @@ body.is-resizing-rows .system-dock {
   font-size: 10px;
 }
 
+.settings-secret-control {
+  position: relative;
+  min-width: 0;
+}
+
+.settings-secret-control .settings-input {
+  padding-right: 40px;
+}
+
+.settings-secret-toggle {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  transform: translateY(-50%);
+  transition: background 150ms cubic-bezier(0.2, 0, 0, 1), color 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.settings-secret-toggle:hover {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.settings-secret-toggle:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .settings-model-control {
   min-width: 0;
   display: grid;

@@ -445,7 +445,7 @@ fn validate_config(config: &AiConfig) -> Result<(), String> {
 }
 
 fn default_max_output_tokens() -> u32 {
-    4_096
+    384_000
 }
 
 fn default_temperature() -> f32 {
