@@ -277,7 +277,7 @@ type AiConfigInput = Omit<Partial<AiConfig>, "tools"> & {
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
   apiMode: "responses",
-  endpoint: "https://api.openai.com/v1",
+  endpoint: "https://api.deepseek.com",
   apiKey: "",
   model: "gpt-4.1-mini",
   reviewerModel: "",

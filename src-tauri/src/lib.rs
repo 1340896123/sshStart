@@ -7,13 +7,13 @@ use ssh2::{CheckResult, KnownHostFileKind, OpenFlags, OpenType, RenameFlags, Ses
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command},
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{mpsc, Arc, Condvar, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -247,6 +247,116 @@ const KEYRING_SERVICE: &str = "com.portico.ssh";
 const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 30;
 const SSH_KEEPALIVE_RETRY_SECS: u64 = 1;
 static KNOWN_HOSTS_LOCK: Mutex<()> = Mutex::new(());
+static DIAGNOSTIC_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn diagnostic_log_path() -> PathBuf {
+    let root = if cfg!(windows) {
+        env::var_os("LOCALAPPDATA")
+            .or_else(|| env::var_os("APPDATA"))
+            .or_else(|| env::var_os("USERPROFILE"))
+    } else {
+        env::var_os("XDG_STATE_HOME").or_else(|| env::var_os("HOME"))
+    }
+    .map(PathBuf::from)
+    .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    root.join("Portico SSH").join("logs").join("portico.log")
+}
+
+fn append_diagnostic_record(
+    source: &str,
+    level: &str,
+    event: &str,
+    fields: serde_json::Value,
+) -> Result<PathBuf, String> {
+    let path = diagnostic_log_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建诊断日志目录失败: {error}"))?;
+    }
+
+    let _guard = DIAGNOSTIC_LOG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("打开诊断日志失败: {error}"))?;
+    if file.metadata().map(|metadata| metadata.len()).unwrap_or(0) > 32 * 1024 * 1024 {
+        let rotated = path.with_extension("log.1");
+        let _ = fs::remove_file(&rotated);
+        let _ = fs::rename(&path, &rotated);
+        file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("创建轮转诊断日志失败: {error}"))?;
+    }
+
+    let record = serde_json::json!({
+        "timestampUnixMs": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        "source": source,
+        "level": level,
+        "event": event,
+        "processId": std::process::id(),
+        "threadId": format!("{:?}", thread::current().id()),
+        "fields": fields,
+    });
+    let line =
+        serde_json::to_string(&record).map_err(|error| format!("序列化诊断日志失败: {error}"))?;
+    writeln!(file, "{line}").map_err(|error| format!("写入诊断日志失败: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("刷新诊断日志失败: {error}"))?;
+    Ok(path)
+}
+
+fn log_backend_event(level: &str, event: &str, fields: serde_json::Value) {
+    if let Err(error) = append_diagnostic_record("backend", level, event, fields) {
+        eprintln!("Portico diagnostic log failure: {error}");
+    }
+}
+
+fn server_log_fields(server: &ServerProfile) -> serde_json::Value {
+    serde_json::json!({
+        "serverId": server.id,
+        "host": server.host,
+        "port": server.port,
+        "username": server.username,
+        "authType": server.auth_type,
+        "passwordConfigured": server.password.as_ref().is_some_and(|value| !value.is_empty()),
+        "privateKeyConfigured": server.private_key_path.as_ref().is_some_and(|value| !value.is_empty()),
+        "passphraseConfigured": server.passphrase.as_ref().is_some_and(|value| !value.is_empty()),
+        "jumpHostEnabled": server.jump_host.as_ref().is_some_and(|jump| jump.enabled),
+    })
+}
+
+fn install_diagnostic_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic payload");
+        let location = info.location().map(|location| {
+            serde_json::json!({
+                "file": location.file(),
+                "line": location.line(),
+                "column": location.column(),
+            })
+        });
+        log_backend_event(
+            "fatal",
+            "rust.panic",
+            serde_json::json!({ "payload": payload, "location": location }),
+        );
+        previous(info);
+    }));
+}
 
 fn poll_ssh_keepalive(session: &Session, deadline: &mut Instant) -> Result<(), String> {
     let now = Instant::now();
@@ -892,6 +1002,29 @@ async fn list_network_interfaces(server: ServerProfile) -> Result<Vec<NetworkInt
 }
 
 #[tauri::command]
+fn get_diagnostic_log_path() -> String {
+    diagnostic_log_path().to_string_lossy().into_owned()
+}
+
+#[tauri::command]
+fn write_diagnostic_log(entry: String) -> Result<String, String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(&entry)
+        .unwrap_or_else(|_| serde_json::json!({ "message": entry }));
+    let level = parsed
+        .get("level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info")
+        .to_string();
+    let event = parsed
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("frontend.event")
+        .to_string();
+    append_diagnostic_record("frontend", &level, &event, parsed)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 async fn start_terminal(
     app: tauri::AppHandle,
     manager: State<'_, TerminalManager>,
@@ -900,37 +1033,118 @@ async fn start_terminal(
     cols: u32,
     rows: u32,
 ) -> Result<(), String> {
+    let server_fields = server_log_fields(&server);
+    log_backend_event(
+        "info",
+        "terminal.start.requested",
+        serde_json::json!({
+            "sessionId": session_id,
+            "cols": cols,
+            "rows": rows,
+            "server": server_fields,
+        }),
+    );
     if manager
         .terminals
         .lock()
         .map_err(|_| "终端状态锁已损坏")?
         .contains_key(&session_id)
     {
+        log_backend_event(
+            "warn",
+            "terminal.start.duplicate",
+            serde_json::json!({ "sessionId": session_id }),
+        );
         return Ok(());
     }
 
-    let session = tauri::async_runtime::spawn_blocking(move || connect_ssh(&server))
-        .await
-        .map_err(|error| format!("连接任务失败: {error}"))??;
+    let session = match tauri::async_runtime::spawn_blocking(move || connect_ssh(&server)).await {
+        Ok(Ok(session)) => {
+            log_backend_event(
+                "info",
+                "terminal.ssh.connected",
+                serde_json::json!({ "sessionId": session_id, "server": server_fields }),
+            );
+            session
+        }
+        Ok(Err(error)) => {
+            log_backend_event(
+                "error",
+                "terminal.ssh.connect_failed",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "server": server_fields,
+                    "error": error,
+                }),
+            );
+            return Err(error);
+        }
+        Err(error) => {
+            let message = format!("连接任务失败: {error}");
+            log_backend_event(
+                "error",
+                "terminal.ssh.connect_task_failed",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "server": server_fields,
+                    "error": message,
+                }),
+            );
+            return Err(message);
+        }
+    };
     let (sender, receiver) = mpsc::channel::<TerminalRequest>();
     manager
         .terminals
         .lock()
         .map_err(|_| "终端状态锁已损坏")?
         .insert(session_id.clone(), sender);
+    log_backend_event(
+        "info",
+        "terminal.worker.registered",
+        serde_json::json!({ "sessionId": session_id }),
+    );
 
+    let worker_session_id = session_id.clone();
+    let event_session_id = session_id.clone();
     thread::spawn(move || {
-        let event_name = format!("terminal-output-{session_id}");
+        let event_name = format!("terminal-output-{event_session_id}");
+        let started_at = Instant::now();
+        let mut input_count = 0_u64;
+        let mut input_bytes = 0_u64;
+        let mut resize_count = 0_u64;
+        let mut output_chunks = 0_u64;
+        let mut output_bytes = 0_u64;
+        log_backend_event(
+            "info",
+            "terminal.worker.started",
+            serde_json::json!({ "sessionId": worker_session_id, "eventName": event_name }),
+        );
         let result = (|| -> Result<(), String> {
             let mut channel = session
                 .channel_session()
                 .map_err(|error| format!("无法创建终端通道: {error}"))?;
+            log_backend_event(
+                "info",
+                "terminal.channel.created",
+                serde_json::json!({ "sessionId": worker_session_id }),
+            );
             channel
                 .request_pty("xterm-256color", None, Some((cols, rows, 0, 0)))
                 .map_err(|error| format!("PTY 请求失败: {error}"))?;
+            log_backend_event(
+                "info",
+                "terminal.pty.requested",
+                serde_json::json!({ "sessionId": worker_session_id, "cols": cols, "rows": rows }),
+            );
             channel
                 .shell()
                 .map_err(|error| format!("Shell 启动失败: {error}"))?;
+            log_backend_event(
+                "info",
+                "terminal.shell.started",
+                serde_json::json!({ "sessionId": worker_session_id }),
+            );
             session.set_keepalive(true, SSH_KEEPALIVE_INTERVAL_SECS);
             session.set_blocking(false);
             let mut buffer = [0_u8; 16 * 1024];
@@ -942,17 +1156,47 @@ async fn start_terminal(
                 while let Ok(request) = receiver.try_recv() {
                     match request {
                         TerminalRequest::Input(bytes) => {
+                            input_count += 1;
+                            input_bytes += bytes.len() as u64;
+                            if input_count <= 5 || input_count % 100 == 0 {
+                                log_backend_event(
+                                    "debug",
+                                    "terminal.input.received",
+                                    serde_json::json!({
+                                        "sessionId": worker_session_id,
+                                        "count": input_count,
+                                        "bytes": bytes.len(),
+                                        "totalBytes": input_bytes,
+                                    }),
+                                );
+                            }
                             channel
                                 .write_all(&bytes)
                                 .map_err(|error| format!("终端写入失败: {error}"))?;
                             channel.flush().ok();
                         }
                         TerminalRequest::Resize(next_cols, next_rows) => {
+                            resize_count += 1;
+                            log_backend_event(
+                                "debug",
+                                "terminal.resize.received",
+                                serde_json::json!({
+                                    "sessionId": worker_session_id,
+                                    "count": resize_count,
+                                    "cols": next_cols,
+                                    "rows": next_rows,
+                                }),
+                            );
                             channel
                                 .request_pty_size(next_cols, next_rows, None, None)
                                 .map_err(|error| format!("终端尺寸更新失败: {error}"))?;
                         }
                         TerminalRequest::Stop => {
+                            log_backend_event(
+                                "info",
+                                "terminal.stop.received",
+                                serde_json::json!({ "sessionId": worker_session_id }),
+                            );
                             channel.close().ok();
                             return Ok(());
                         }
@@ -960,11 +1204,31 @@ async fn start_terminal(
                 }
 
                 match channel.read(&mut buffer) {
-                    Ok(0) if channel.eof() => return Ok(()),
+                    Ok(0) if channel.eof() => {
+                        log_backend_event(
+                            "info",
+                            "terminal.channel.eof",
+                            serde_json::json!({ "sessionId": worker_session_id }),
+                        );
+                        return Ok(());
+                    }
                     Ok(0) => thread::sleep(Duration::from_millis(8)),
                     Ok(read) => {
+                        output_chunks += 1;
+                        output_bytes += read as u64;
                         let output = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                        app.emit(&event_name, output).ok();
+                        if let Err(error) = app.emit(&event_name, output) {
+                            log_backend_event(
+                                "error",
+                                "terminal.output.emit_failed",
+                                serde_json::json!({
+                                    "sessionId": worker_session_id,
+                                    "error": error.to_string(),
+                                    "chunks": output_chunks,
+                                    "bytes": output_bytes,
+                                }),
+                            );
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(8));
@@ -974,11 +1238,55 @@ async fn start_terminal(
             }
         })();
 
-        if let Err(error) = result {
-            app.emit(&event_name, format!("\r\n\x1b[31m{error}\x1b[0m\r\n"))
-                .ok();
+        match result {
+            Ok(()) => log_backend_event(
+                "info",
+                "terminal.worker.completed",
+                serde_json::json!({
+                    "sessionId": worker_session_id,
+                    "elapsedMs": started_at.elapsed().as_millis(),
+                    "inputCount": input_count,
+                    "inputBytes": input_bytes,
+                    "resizeCount": resize_count,
+                    "outputChunks": output_chunks,
+                    "outputBytes": output_bytes,
+                }),
+            ),
+            Err(error) => {
+                log_backend_event(
+                    "error",
+                    "terminal.worker.failed",
+                    serde_json::json!({
+                        "sessionId": worker_session_id,
+                        "elapsedMs": started_at.elapsed().as_millis(),
+                        "inputCount": input_count,
+                        "inputBytes": input_bytes,
+                        "resizeCount": resize_count,
+                        "outputChunks": output_chunks,
+                        "outputBytes": output_bytes,
+                        "error": error,
+                    }),
+                );
+                if let Err(emit_error) =
+                    app.emit(&event_name, format!("\r\n\x1b[31m{error}\x1b[0m\r\n"))
+                {
+                    log_backend_event(
+                        "error",
+                        "terminal.worker.error_emit_failed",
+                        serde_json::json!({
+                            "sessionId": worker_session_id,
+                            "error": emit_error.to_string(),
+                        }),
+                    );
+                }
+            }
         }
     });
+    log_backend_event(
+        "info",
+        "terminal.start.completed",
+        serde_json::json!({ "sessionId": session_id }),
+    );
     Ok(())
 }
 
@@ -988,12 +1296,26 @@ fn terminal_input(
     session_id: String,
     data: String,
 ) -> Result<(), String> {
+    let data_length = data.len();
     let terminals = manager.terminals.lock().map_err(|_| "终端状态锁已损坏")?;
-    terminals
+    let result = terminals
         .get(&session_id)
         .ok_or_else(|| "终端会话不存在".to_string())?
         .send(TerminalRequest::Input(data.into_bytes()))
-        .map_err(|_| "终端会话已经关闭".to_string())
+        .map_err(|_| "终端会话已经关闭".to_string());
+    if data_length > 1 || result.is_err() {
+        log_backend_event(
+            if result.is_err() { "warn" } else { "debug" },
+            "terminal.input.forwarded",
+            serde_json::json!({
+                "sessionId": session_id,
+                "bytes": data_length,
+                "success": result.is_ok(),
+                "error": result.as_ref().err(),
+            }),
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -1004,24 +1326,46 @@ fn terminal_resize(
     rows: u32,
 ) -> Result<(), String> {
     let terminals = manager.terminals.lock().map_err(|_| "终端状态锁已损坏")?;
-    if let Some(sender) = terminals.get(&session_id) {
+    let result = if let Some(sender) = terminals.get(&session_id) {
         sender
             .send(TerminalRequest::Resize(cols, rows))
-            .map_err(|_| "终端会话已经关闭".to_string())?;
+            .map_err(|_| "终端会话已经关闭".to_string())
+    } else {
+        Ok(())
+    };
+    if result.is_err() {
+        log_backend_event(
+            "warn",
+            "terminal.resize.failed",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cols": cols,
+                "rows": rows,
+                "error": result.as_ref().err(),
+            }),
+        );
     }
-    Ok(())
+    result
 }
 
 #[tauri::command]
 fn stop_terminal(manager: State<'_, TerminalManager>, session_id: String) -> Result<(), String> {
-    if let Some(sender) = manager
+    let sender = manager
         .terminals
         .lock()
         .map_err(|_| "终端状态锁已损坏")?
-        .remove(&session_id)
-    {
-        sender.send(TerminalRequest::Stop).ok();
-    }
+        .remove(&session_id);
+    let removed = sender.is_some();
+    let send_result = sender.map(|sender| sender.send(TerminalRequest::Stop));
+    log_backend_event(
+        "info",
+        "terminal.stop.requested",
+        serde_json::json!({
+            "sessionId": session_id,
+            "removed": removed,
+            "sent": send_result.as_ref().is_some_and(Result::is_ok),
+        }),
+    );
     Ok(())
 }
 
@@ -2387,6 +2731,15 @@ fn is_high_risk_command(command: &str) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_diagnostic_panic_hook();
+    log_backend_event(
+        "info",
+        "runtime.starting",
+        serde_json::json!({
+            "logPath": diagnostic_log_path().to_string_lossy(),
+            "debugBuild": cfg!(debug_assertions),
+        }),
+    );
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(TerminalManager::default())
@@ -2399,6 +2752,8 @@ pub fn run() {
             store_ai_key,
             load_ai_key,
             delete_ai_key,
+            get_diagnostic_log_path,
+            write_diagnostic_log,
             start_terminal,
             terminal_input,
             terminal_resize,

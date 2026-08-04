@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { Copy, Maximize2, RotateCcw, SquareTerminal, Wifi, WifiOff } from "lucide-react";
+import { diagnosticError, diagnosticLog } from "../diagnostics";
 import { isTauri } from "../lib";
 import type { ServerProfile, SessionState } from "../types";
 
@@ -51,10 +52,31 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
 
     let unlisten: UnlistenFn | undefined;
     let disposed = false;
+    let inputCount = 0;
+    let inputBytes = 0;
+    let outputChunks = 0;
+    let outputBytes = 0;
+    let lastCols = 0;
+    let lastRows = 0;
+    diagnosticLog("info", "terminal.pane.mounted", {
+      sessionId: session.id,
+      serverId: server.id,
+      host: server.host,
+      username: server.username,
+    });
 
     const start = async () => {
-      fit.fit();
-      terminal.writeln(`\x1b[38;2;96;108;104mPortico · ${server.username}@${server.host}\x1b[0m`);
+      diagnosticLog("info", "terminal.frontend.start.begin", { sessionId: session.id });
+      try {
+        fit.fit();
+        lastCols = terminal.cols;
+        lastRows = terminal.rows;
+        diagnosticLog("debug", "terminal.frontend.fitted", { sessionId: session.id, cols: lastCols, rows: lastRows });
+        terminal.writeln(`\x1b[38;2;96;108;104mPortico · ${server.username}@${server.host}\x1b[0m`);
+      } catch (reason) {
+        diagnosticError("terminal.frontend.setup_failed", reason, { sessionId: session.id });
+        throw reason;
+      }
       if (!isTauri()) {
         terminal.writeln("\x1b[38;2;28;111;96m✓ Browser preview connected\x1b[0m");
         terminal.writeln("Type a command to explore the terminal interaction.\r\n");
@@ -65,10 +87,36 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
       }
 
       try {
-        unlisten = await listen<string>(`terminal-output-${session.id}`, (event) => terminal.write(event.payload));
+        unlisten = await listen<string>(`terminal-output-${session.id}`, (event) => {
+          outputChunks += 1;
+          outputBytes += event.payload.length;
+          if (outputChunks <= 3 || outputChunks % 100 === 0) {
+            diagnosticLog("debug", "terminal.output.received", {
+              sessionId: session.id,
+              chunks: outputChunks,
+              bytes: event.payload.length,
+              totalBytes: outputBytes,
+            });
+          }
+          try {
+            terminal.write(event.payload);
+          } catch (reason) {
+            diagnosticError("terminal.output.render_failed", reason, {
+              sessionId: session.id,
+              chunks: outputChunks,
+              totalBytes: outputBytes,
+            });
+          }
+        });
+        diagnosticLog("info", "terminal.output_listener.ready", { sessionId: session.id });
         await invoke("start_terminal", {
           sessionId: session.id,
           server,
+          cols: terminal.cols,
+          rows: terminal.rows,
+        });
+        diagnosticLog("info", "terminal.frontend.start.completed", {
+          sessionId: session.id,
           cols: terminal.cols,
           rows: terminal.rows,
         });
@@ -78,6 +126,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
         }
       } catch (reason) {
         const message = String(reason);
+        diagnosticError("terminal.frontend.start_failed", reason, { sessionId: session.id });
         terminal.writeln(`\r\n\x1b[31m连接失败: ${message}\x1b[0m`);
         setError(message);
         setStatus("failed");
@@ -87,7 +136,19 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
 
     const dataDisposable = terminal.onData((data) => {
       if (isTauri()) {
-        void invoke("terminal_input", { sessionId: session.id, data });
+        inputCount += 1;
+        inputBytes += data.length;
+        if (inputCount <= 5 || inputCount % 100 === 0) {
+          diagnosticLog("debug", "terminal.input.sent", {
+            sessionId: session.id,
+            count: inputCount,
+            bytes: data.length,
+            totalBytes: inputBytes,
+          });
+        }
+        void invoke("terminal_input", { sessionId: session.id, data }).catch((reason) => {
+          diagnosticError("terminal.input.failed", reason, { sessionId: session.id, bytes: data.length });
+        });
         return;
       }
       if (data === "\r") {
@@ -111,9 +172,29 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
     });
 
     const observer = new ResizeObserver(() => {
-      fit.fit();
+      try {
+        fit.fit();
+      } catch (reason) {
+        diagnosticError("terminal.resize.fit_failed", reason, { sessionId: session.id });
+        return;
+      }
       if (isTauri()) {
-        void invoke("terminal_resize", { sessionId: session.id, cols: terminal.cols, rows: terminal.rows });
+        if (terminal.cols !== lastCols || terminal.rows !== lastRows) {
+          lastCols = terminal.cols;
+          lastRows = terminal.rows;
+          diagnosticLog("debug", "terminal.resize.sent", {
+            sessionId: session.id,
+            cols: terminal.cols,
+            rows: terminal.rows,
+          });
+        }
+        void invoke("terminal_resize", { sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).catch((reason) => {
+          diagnosticError("terminal.resize.failed", reason, {
+            sessionId: session.id,
+            cols: terminal.cols,
+            rows: terminal.rows,
+          });
+        });
       }
     });
     observer.observe(hostRef.current);
@@ -121,12 +202,23 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
 
     return () => {
       disposed = true;
+      diagnosticLog("info", "terminal.pane.unmounted", {
+        sessionId: session.id,
+        inputCount,
+        inputBytes,
+        outputChunks,
+        outputBytes,
+      });
       unlisten?.();
       observer.disconnect();
       dataDisposable.dispose();
       terminal.dispose();
       terminalRef.current = undefined;
-      if (isTauri()) void invoke("stop_terminal", { sessionId: session.id }).catch(() => undefined);
+      if (isTauri()) {
+        void invoke("stop_terminal", { sessionId: session.id }).catch((reason) => {
+          diagnosticError("terminal.stop.cleanup_failed", reason, { sessionId: session.id });
+        });
+      }
     };
     // The terminal belongs to this session for its entire lifetime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -134,6 +226,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
 
   const reconnect = async () => {
     if (!isTauri()) return;
+    diagnosticLog("info", "terminal.reconnect.begin", { sessionId: session.id });
     setStatus("connecting");
     setError("");
     try {
@@ -146,7 +239,9 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
       });
       setStatus("connected");
       onUpdate({ connected: true });
+      diagnosticLog("info", "terminal.reconnect.completed", { sessionId: session.id });
     } catch (reason) {
+      diagnosticError("terminal.reconnect.failed", reason, { sessionId: session.id });
       setError(String(reason));
       setStatus("failed");
     }
