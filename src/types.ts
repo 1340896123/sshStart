@@ -35,6 +35,7 @@ export interface SessionState {
   terminalStarted: boolean;
   cwd: string;
   selectedFile?: string;
+  approvalPolicy?: AiApprovalPolicy;
   aiMessages: AiMessage[];
 }
 
@@ -112,6 +113,7 @@ export interface TransferTask extends TransferRequest {
 }
 
 export type MessageRole = "user" | "assistant";
+export type AiApprovalPolicy = "request" | "reviewer" | "full-access";
 
 export interface AiTokenUsage {
   available: boolean;
@@ -137,6 +139,12 @@ export type AiActionStatus = "started" | "running" | "completed" | "error" | "re
 export type AiMessageType = "text" | "tool" | "approval" | "error";
 
 export interface AiReasoning {
+  id: string;
+  content: string;
+  sequence: number;
+}
+
+export interface AiTextSegment {
   id: string;
   content: string;
   sequence: number;
@@ -172,9 +180,11 @@ export interface AiMessage {
   content: string;
   attachments?: AiImageAttachment[];
   reasonings?: AiReasoning[];
+  textSegments?: AiTextSegment[];
   toolCalls?: AiToolResult[];
   approval?: AiApproval;
   approvalState?: "pending" | "approved" | "rejected";
+  approvalNote?: string;
   usage?: AiTokenUsage;
   createdAt: number;
   updatedAt: number;
@@ -253,6 +263,7 @@ export interface AiConfig {
   endpoint: string;
   apiKey: string;
   model: string;
+  reviewerModel: string;
   contextWindow: number;
   maxOutputTokens: number;
   temperature: number;
@@ -269,6 +280,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   endpoint: "https://api.openai.com/v1",
   apiKey: "",
   model: "gpt-4.1-mini",
+  reviewerModel: "",
   contextWindow: 1000000,
   maxOutputTokens: 384000,
   temperature: 0.2,
@@ -283,6 +295,7 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
     endpoint: config.endpoint ?? fallback.endpoint,
     apiKey: config.apiKey ?? fallback.apiKey,
     model: config.model ?? fallback.model,
+    reviewerModel: config.reviewerModel ?? fallback.reviewerModel,
     contextWindow: config.contextWindow ?? fallback.contextWindow,
     maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,
     temperature: config.temperature ?? fallback.temperature,

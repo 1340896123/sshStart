@@ -5,11 +5,13 @@ import { uid } from "../lib";
 import type {
   AiAgentEvent,
   AiApproval,
+  AiApprovalPolicy,
   AiConfig,
   AiImageAttachment,
   AiMessage,
   AiReasoning,
   AiRunResult,
+  AiTextSegment,
   AiTokenUsage,
   AiToolResult,
   ServerProfile,
@@ -20,6 +22,7 @@ interface UseAiAgentOptions {
   server: ServerProfile;
   messages: AiMessage[];
   onMessagesChange: (messages: AiMessage[], persist: boolean) => void;
+  approvalPolicy: AiApprovalPolicy;
 }
 
 interface StartAiAgentInput {
@@ -32,7 +35,13 @@ interface ActiveRun {
   runId: string;
   messageId: string;
   activeReasoningId?: string;
+  activeTextSegmentId?: string;
   unlisten?: UnlistenFn;
+}
+
+interface AiApprovalReview {
+  decision: "approve" | "reject";
+  reason: string;
 }
 
 const mergeToolCall = (toolCalls: AiToolResult[] = [], next: AiToolResult) => {
@@ -62,6 +71,19 @@ const appendReasoning = (
     : reasoning);
 };
 
+const appendTextSegment = (
+  segments: AiTextSegment[] = [],
+  segmentId: string,
+  delta: string,
+  sequence: number,
+) => {
+  const index = segments.findIndex((segment) => segment.id === segmentId);
+  if (index < 0) return [...segments, { id: segmentId, content: delta, sequence }];
+  return segments.map((segment, segmentIndex) => segmentIndex === index
+    ? { ...segment, content: `${segment.content}${delta}` }
+    : segment);
+};
+
 const usageFromEvent = (event: Extract<AiAgentEvent, { type: "usage" }>): AiTokenUsage => ({
   available: true,
   inputTokens: event.inputTokens,
@@ -78,6 +100,7 @@ export function useAiAgent({
   server,
   messages,
   onMessagesChange,
+  approvalPolicy,
 }: UseAiAgentOptions) {
   const [running, setRunning] = useState(false);
   const [resolvingApprovalId, setResolvingApprovalId] = useState<string>();
@@ -108,6 +131,87 @@ export function useAiAgent({
     );
   };
 
+  const commitApprovalDecision = async (
+    messageId: string,
+    approval: AiApproval,
+    decision: "approve" | "reject",
+    note: string,
+    rejectionReason?: string,
+  ) => {
+    updateAssistant(messageId, (message) => ({
+      ...message,
+      approvalState: decision === "approve" ? "approved" : "rejected",
+      approvalNote: note,
+      updatedAt: Date.now(),
+    }), true);
+    await invoke("resolve_ai_approval", {
+      approvalId: approval.id,
+      decision,
+      arguments: decision === "approve" ? approval.arguments : undefined,
+      reason: decision === "reject" ? rejectionReason : undefined,
+    });
+  };
+
+  const fallbackToManualApproval = (messageId: string, reason: unknown) => {
+    updateAssistant(messageId, (message) => ({
+      ...message,
+      approvalState: "pending",
+      approvalNote: `自动审批失败：${String(reason)}，请人工处理。`,
+      updatedAt: Date.now(),
+    }), true);
+  };
+
+  const submitApproval = async (
+    messageId: string,
+    approval: AiApproval,
+    decision: "approve" | "reject",
+    note: string,
+    rejectionReason?: string,
+  ) => {
+    setResolvingApprovalId(approval.id);
+    try {
+      await commitApprovalDecision(messageId, approval, decision, note, rejectionReason);
+    } catch (reason) {
+      fallbackToManualApproval(messageId, reason);
+    } finally {
+      setResolvingApprovalId(undefined);
+    }
+  };
+
+  const reviewApproval = async (messageId: string, approval: AiApproval) => {
+    setResolvingApprovalId(approval.id);
+    updateAssistant(messageId, (message) => ({
+      ...message,
+      approvalNote: "审核模型正在评估工具调用…",
+      updatedAt: Date.now(),
+    }), true);
+    try {
+      const requestContext = [...messagesRef.current]
+        .reverse()
+        .find((message) => message.role === "user")?.content ?? "";
+      const review = await invoke<AiApprovalReview>("review_ai_approval", {
+        config,
+        server,
+        tool: approval.tool,
+        command: approval.command,
+        arguments: approval.arguments,
+        reason: approval.reason,
+        requestContext,
+      });
+      await commitApprovalDecision(
+        messageId,
+        approval,
+        review.decision,
+        `审核模型${review.decision === "approve" ? "批准" : "拒绝"}：${review.reason}`,
+        review.reason,
+      );
+    } catch (reason) {
+      fallbackToManualApproval(messageId, reason);
+    } finally {
+      setResolvingApprovalId(undefined);
+    }
+  };
+
   const applyEvent = (event: AiAgentEvent) => {
     const activeRun = activeRunRef.current;
     if (!activeRun || activeRun.runId !== event.runId) return;
@@ -123,15 +227,23 @@ export function useAiAgent({
         break;
       case "text_delta":
         activeRun.activeReasoningId = undefined;
+        activeRun.activeTextSegmentId ??= `text-${event.runId}-${event.sequence}`;
         updateAssistant(messageId, (message) => ({
           ...message,
           content: `${message.content}${event.delta}`,
+          textSegments: appendTextSegment(
+            message.textSegments,
+            activeRun.activeTextSegmentId!,
+            event.delta,
+            event.sequence,
+          ),
           messageType: message.toolCalls?.length ? "tool" : "text",
           status: "running",
           updatedAt: event.timestamp,
         }));
         break;
       case "reasoning_delta": {
+        activeRun.activeTextSegmentId = undefined;
         const reasoningId = activeRun.activeReasoningId
           ?? `reasoning-${event.runId}-${event.sequence}`;
         activeRun.activeReasoningId = reasoningId;
@@ -145,6 +257,7 @@ export function useAiAgent({
       }
       case "tool_started":
         activeRun.activeReasoningId = undefined;
+        activeRun.activeTextSegmentId = undefined;
         updateAssistant(messageId, (message) => ({
           ...message,
           messageType: "tool",
@@ -166,6 +279,7 @@ export function useAiAgent({
         break;
       case "approval_required": {
         activeRun.activeReasoningId = undefined;
+        activeRun.activeTextSegmentId = undefined;
         const approval: AiApproval = {
           id: event.approvalId,
           actionId: event.actionId,
@@ -178,14 +292,21 @@ export function useAiAgent({
           ...message,
           approval,
           approvalState: "pending",
+          approvalNote: undefined,
           messageType: "approval",
           status: "running",
           updatedAt: event.timestamp,
         }), true);
+        if (approvalPolicy === "full-access") {
+          void submitApproval(messageId, approval, "approve", "完全访问已自动批准，Agent 正在继续");
+        } else if (approvalPolicy === "reviewer") {
+          void reviewApproval(messageId, approval);
+        }
         break;
       }
       case "tool_finished":
         activeRun.activeReasoningId = undefined;
+        activeRun.activeTextSegmentId = undefined;
         updateAssistant(messageId, (message) => ({
           ...message,
           messageType: "tool",
@@ -356,29 +477,13 @@ export function useAiAgent({
     const message = messagesRef.current.find((candidate) => candidate.id === messageId);
     const approval = message?.approval;
     if (!approval || message.approvalState !== "pending") return;
-    setResolvingApprovalId(approval.id);
-    updateAssistant(messageId, (current) => ({
-      ...current,
-      approvalState: decision === "approve" ? "approved" : "rejected",
-      updatedAt: Date.now(),
-    }), true);
-    try {
-      await invoke("resolve_ai_approval", {
-        approvalId: approval.id,
-        decision,
-        arguments: decision === "approve" ? approval.arguments : undefined,
-        reason: decision === "reject" ? "用户拒绝了该工具调用" : undefined,
-      });
-    } catch (reason) {
-      updateAssistant(messageId, (current) => ({
-        ...current,
-        approvalState: "pending",
-        content: current.content || `审批提交失败：${String(reason)}`,
-        updatedAt: Date.now(),
-      }), true);
-    } finally {
-      setResolvingApprovalId(undefined);
-    }
+    await submitApproval(
+      messageId,
+      approval,
+      decision,
+      decision === "approve" ? "你已批准，Agent 正在继续" : "你已拒绝该工具调用",
+      "用户拒绝了该工具调用",
+    );
   };
 
   useEffect(() => () => {

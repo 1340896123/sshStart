@@ -25,6 +25,7 @@ import {
   Play,
   Send,
   ShieldAlert,
+  ShieldCheck,
   Settings2,
   Sparkles,
   TerminalSquare,
@@ -43,11 +44,13 @@ import { useAiAgent } from "../ai/useAiAgent";
 import { formatBytes, isTauri, uid } from "../lib";
 import type {
   AiActionStatus,
+  AiApprovalPolicy,
   AiConfig,
   AiImageAttachment,
   AiMessage,
   AiMessageType,
   AiReasoning,
+  AiTextSegment,
   AiTokenUsage,
   AiToolResult,
   ServerProfile,
@@ -86,6 +89,7 @@ interface PastedAttachmentSource {
 }
 
 type AiTimelineItem =
+  | { kind: "text"; segment: AiTextSegment; index: number; sequence: number }
   | { kind: "reasoning"; reasoning: AiReasoning; index: number; sequence: number }
   | { kind: "tool"; toolCall: AiToolResult; index: number; sequence: number };
 
@@ -121,6 +125,11 @@ const MESSAGE_TYPE_LABELS: Record<AiMessageType, string> = {
   tool: "工具",
   approval: "审批",
   error: "错误消息",
+};
+const APPROVAL_POLICY_META: Record<AiApprovalPolicy, { label: string; description: string }> = {
+  request: { label: "请求批准", description: "高风险或变更型工具调用等待你确认" },
+  reviewer: { label: "替我审批", description: "由设置中的审核模型逐次批准或拒绝" },
+  "full-access": { label: "完全访问", description: "自动批准所有运行时审批请求" },
 };
 const TOKEN_NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN");
 const TOKEN_COMPACT_FORMATTER = new Intl.NumberFormat("zh-CN", {
@@ -176,6 +185,12 @@ const formatActionDuration = (startedAt: number, completedAt?: number) => {
 const shortActionId = (id: string) => id.length > 14 ? `${id.slice(0, 6)}…${id.slice(-6)}` : id;
 
 const timelineForMessage = (message: AiMessage): AiTimelineItem[] => [
+  ...(message.textSegments ?? []).map((segment, index): AiTimelineItem => ({
+    kind: "text",
+    segment,
+    index,
+    sequence: segment.sequence,
+  })),
   ...(message.reasonings ?? []).map((reasoning, index): AiTimelineItem => ({
     kind: "reasoning",
     reasoning,
@@ -325,11 +340,13 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     ));
   };
 
+  const approvalPolicy = session.approvalPolicy ?? "request";
   const agent = useAiAgent({
     config,
     server,
     messages: session.aiMessages,
     onMessagesChange: commitMessages,
+    approvalPolicy,
   });
 
   const contextLabel = useMemo(
@@ -620,7 +637,9 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         )}
         {session.aiMessages.map((message) => {
           const timeline = timelineForMessage(message);
+          const hasTextTimeline = Boolean(message.textSegments?.length);
           const isStreaming = agent.running && agent.activeMessageId === message.id;
+          const approvalResolving = agent.resolvingApprovalId === message.approval?.id;
           return (
             <article
               className={`ai-message ${message.role} status-${message.status} ${isStreaming ? "streaming" : ""}`}
@@ -658,30 +677,42 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                   ))}
                 </div>
               ) : null}
-              {timeline.map((item) => item.kind === "reasoning" ? (
-                <div className="reasoning-block" key={item.reasoning.id}>
-                  <button
-                    aria-controls={`${item.reasoning.id}-content`}
-                    aria-expanded={Boolean(thinkingOpen[item.reasoning.id])}
-                    onClick={() => setThinkingOpen((current) => ({
-                      ...current,
-                      [item.reasoning.id]: !current[item.reasoning.id],
-                    }))}
-                  >
-                    <BrainCircuit size={13} />
-                    <span>{(message.reasonings?.length ?? 0) > 1 ? `推理 ${item.index + 1}` : "推理"}</span>
-                    <code title={item.reasoning.id}>{shortActionId(item.reasoning.id)}</code>
-                    {thinkingOpen[item.reasoning.id]
-                      ? <ChevronDown size={12} />
-                      : <ChevronRight size={12} />}
-                  </button>
-                  {thinkingOpen[item.reasoning.id] && (
-                    <p id={`${item.reasoning.id}-content`}>{item.reasoning.content}</p>
-                  )}
-                </div>
-              ) : (
-                <ToolCallCard toolCall={item.toolCall} key={item.toolCall.id} />
-              ))}
+              {timeline.map((item) => {
+                if (item.kind === "text") {
+                  return (
+                    <div className="message-text-segment" key={item.segment.id}>
+                      <Suspense fallback={<div className="message-copy plain-text">{item.segment.content}</div>}>
+                        <MarkdownMessage content={item.segment.content} />
+                      </Suspense>
+                    </div>
+                  );
+                }
+                if (item.kind === "reasoning") {
+                  return (
+                    <div className="reasoning-block" key={item.reasoning.id}>
+                      <button
+                        aria-controls={`${item.reasoning.id}-content`}
+                        aria-expanded={Boolean(thinkingOpen[item.reasoning.id])}
+                        onClick={() => setThinkingOpen((current) => ({
+                          ...current,
+                          [item.reasoning.id]: !current[item.reasoning.id],
+                        }))}
+                      >
+                        <BrainCircuit size={13} />
+                        <span>{(message.reasonings?.length ?? 0) > 1 ? `推理 ${item.index + 1}` : "推理"}</span>
+                        <code title={item.reasoning.id}>{shortActionId(item.reasoning.id)}</code>
+                        {thinkingOpen[item.reasoning.id]
+                          ? <ChevronDown size={12} />
+                          : <ChevronRight size={12} />}
+                      </button>
+                      {thinkingOpen[item.reasoning.id] && (
+                        <p id={`${item.reasoning.id}-content`}>{item.reasoning.content}</p>
+                      )}
+                    </div>
+                  );
+                }
+                return <ToolCallCard toolCall={item.toolCall} key={item.toolCall.id} />;
+              })}
               {message.role === "assistant"
                 && !message.content
                 && timeline.length === 0
@@ -696,7 +727,9 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                   <div className="approval-call-heading">
                     <ShieldAlert size={14} />
                     <span>Agent 请求执行</span>
-                    <small>等待人工审批</small>
+                    <small>{approvalResolving
+                      ? approvalPolicy === "reviewer" ? "审核模型评估中" : "正在自动放行"
+                      : message.approvalNote ? "需要人工处理" : "等待人工审批"}</small>
                     <CopyAction
                       className="approval-command-copy"
                       label="复制命令"
@@ -705,7 +738,8 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                   </div>
                   <code>$ {message.approval.command}</code>
                   <p>{message.approval.reason}</p>
-                  <div className="approval-call-actions">
+                  {message.approvalNote && <p className="approval-call-note">{message.approvalNote}</p>}
+                  {!approvalResolving && <div className="approval-call-actions">
                     <button
                       className="approval-confirm"
                       disabled={agent.resolvingApprovalId === message.approval.id}
@@ -722,17 +756,17 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                       <X size={12} />
                       拒绝
                     </button>
-                  </div>
+                  </div>}
                 </div>
               )}
               {message.approvalState === "approved" && (
-                <div className="approval-dismissed"><Check size={12} />已批准，Agent 正在继续</div>
+                <div className="approval-dismissed"><Check size={12} />{message.approvalNote || "已批准，Agent 正在继续"}</div>
               )}
               {message.approvalState === "rejected" && (
-                <div className="approval-dismissed"><X size={12} />已拒绝该工具调用</div>
+                <div className="approval-dismissed"><X size={12} />{message.approvalNote || "已拒绝该工具调用"}</div>
               )}
               {message.role === "assistant"
-                ? (
+                ? !hasTextTimeline && (
                   <Suspense fallback={<div className="message-copy plain-text">{message.content}</div>}>
                     <MarkdownMessage content={message.content} />
                   </Suspense>
@@ -852,7 +886,25 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             placeholder="描述目标，Rig Agent 会规划并选择工具"
           />
           <div className="composer-footer">
-            <span className="composer-status">{pasteNotice || `当前目录 ${session.cwd}`}</span>
+            <label
+              className="approval-policy-control"
+              data-policy={approvalPolicy}
+              title={APPROVAL_POLICY_META[approvalPolicy].description}
+            >
+              <ShieldCheck size={11} aria-hidden="true" />
+              <select
+                aria-label="工具审批策略"
+                disabled={agent.running}
+                value={approvalPolicy}
+                onChange={(event) => onUpdate({ approvalPolicy: event.target.value as AiApprovalPolicy })}
+              >
+                <option value="request">请求批准</option>
+                <option value="reviewer" disabled={!config.reviewerModel.trim()}>替我审批</option>
+                <option value="full-access">完全访问</option>
+              </select>
+              <ChevronDown size={10} aria-hidden="true" />
+            </label>
+            {pasteNotice && <span className="composer-status">{pasteNotice}</span>}
             {agent.running ? (
               <button className="send-button stop" title="停止 Agent" onClick={() => void agent.cancel()}>
                 <CircleStop size={15} />

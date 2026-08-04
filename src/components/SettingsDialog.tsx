@@ -94,6 +94,7 @@ const TOOL_GROUPS: Array<{
 ];
 
 type SettingsSection = "model" | "agent" | "tools" | "transfer" | "security";
+type ModelPickerTarget = "agent" | "reviewer";
 
 const SETTINGS_SECTIONS: Array<{
   id: SettingsSection;
@@ -112,7 +113,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
   const [value, setValue] = useState(() => normalizeAiConfig(config));
   const [savedValue, setSavedValue] = useState(() => normalizeAiConfig(config));
   const [models, setModels] = useState<string[]>([]);
-  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [modelPickerTarget, setModelPickerTarget] = useState<ModelPickerTarget>();
   const [modelSearch, setModelSearch] = useState("");
   const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -121,6 +122,8 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
   const [error, setError] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSection>("model");
   const [navSearch, setNavSearch] = useState("");
+  const modelPickerOpen = Boolean(modelPickerTarget);
+  const selectedPickerModel = modelPickerTarget === "reviewer" ? value.reviewerModel : value.model;
   const isDirty = JSON.stringify(value) !== JSON.stringify(savedValue);
 
   const loadModels = async () => {
@@ -137,8 +140,8 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     }
   };
 
-  const openModelPicker = async () => {
-    setModelPickerOpen(true);
+  const openModelPicker = async (target: ModelPickerTarget) => {
+    setModelPickerTarget(target);
     setModelSearch("");
     await loadModels();
   };
@@ -185,6 +188,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
         endpoint: value.endpoint.trim(),
         apiKey: value.apiKey.trim(),
         model: value.model.trim(),
+        reviewerModel: value.reviewerModel.trim(),
         tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...value.tools },
       });
       await onSave(nextValue);
@@ -259,7 +263,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
 
   return (
     <div className="settings-backdrop">
-      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape") { if (modelPickerOpen) setModelPickerOpen(false); else if (!busy && (!isDirty || window.confirm("设置有未保存的修改，确定要退出吗？"))) onClose(); } }}>
+      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape") { if (modelPickerOpen) setModelPickerTarget(undefined); else if (!busy && (!isDirty || window.confirm("设置有未保存的修改，确定要退出吗？"))) onClose(); } }}>
         <aside className="settings-sidebar">
           <div className="settings-sidebar-header">
             <span className="settings-brand-mark"><Bot size={17} /></span>
@@ -359,7 +363,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                     <span className="settings-row-copy"><strong>Model</strong><small>{models.length > 0 ? `已获取 ${models.length} 个模型` : "支持手动输入模型名称"}</small></span>
                     <span className="settings-model-control">
                       <input className="settings-input settings-mono-input" value={value.model} onChange={(event) => setValue({ ...value, model: event.target.value })} placeholder="输入模型 ID" />
-                      <button type="button" disabled={loadingModels} onClick={() => void openModelPicker()}>
+                      <button type="button" disabled={loadingModels} onClick={() => void openModelPicker("agent")}>
                         <RefreshCw className={loadingModels ? "spinning" : ""} size={14} />
                         {loadingModels ? "获取中" : "选择模型"}
                       </button>
@@ -421,31 +425,44 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
               <>
                 <div className="settings-section-summary"><div><strong>安全与知识</strong><small>在执行前检查风险并复用经过整理的命令片段</small></div></div>
                 <div className="settings-tool-groups">{renderToolGroup(TOOL_GROUPS[3])}</div>
-                <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许 Agent 请求变更</strong><small>开启后 Rig 可提出写入、上传、服务和进程操作，但执行前仍需人工审批。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
-                <div className="settings-note"><ShieldCheck size={15} /><span>审批由 Rust 运行时挂起 Rig 工具调用；拒绝结果会返回 Agent，由它继续解释或调整计划。</span></div>
+                <section className="settings-panel">
+                  <header><strong>审批审核模型</strong><small>供会话中的“替我审批”策略评估单次工具调用</small></header>
+                  <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>审核模型</strong><small>复用主模型的接口模式、Base URL 与 API Key；未配置时只能人工审批</small></span>
+                    <span className="settings-model-control">
+                      <input className="settings-input settings-mono-input" value={value.reviewerModel} onChange={(event) => setValue({ ...value, reviewerModel: event.target.value })} placeholder="输入审核模型 ID" />
+                      <button type="button" disabled={loadingModels} onClick={() => void openModelPicker("reviewer")}>
+                        <RefreshCw className={loadingModels ? "spinning" : ""} size={14} />
+                        {loadingModels ? "获取中" : "选择模型"}
+                      </button>
+                    </span>
+                  </label>
+                </section>
+                <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许 Agent 请求变更</strong><small>开启后 Rig 可提出写入、上传、服务和进程操作；是否放行由当前会话的审批策略决定。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
+                <div className="settings-note"><ShieldCheck size={15} /><span>审核模型返回无法解析的结果或请求失败时，Portico 会退回人工审批，不会默认放行。</span></div>
               </>
             )}
           </div>
         </main>
 
         {modelPickerOpen && (
-          <div className="model-picker-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setModelPickerOpen(false); }}>
+          <div className="model-picker-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setModelPickerTarget(undefined); }}>
             <section className="model-picker" role="dialog" aria-modal="true" aria-labelledby="model-picker-title">
               <header className="model-picker-header">
-                <div><span>模型服务</span><h3 id="model-picker-title">选择模型</h3><small>{models.length > 0 ? `${models.length} 个模型可用` : "从当前接口读取模型列表"}</small></div>
-                <button className="icon-button quiet" type="button" onClick={() => setModelPickerOpen(false)} title="关闭模型选择" aria-label="关闭模型选择"><X size={16} /></button>
+                <div><span>模型服务</span><h3 id="model-picker-title">{modelPickerTarget === "reviewer" ? "选择审核模型" : "选择模型"}</h3><small>{models.length > 0 ? `${models.length} 个模型可用` : "从当前接口读取模型列表"}</small></div>
+                <button className="icon-button quiet" type="button" onClick={() => setModelPickerTarget(undefined)} title="关闭模型选择" aria-label="关闭模型选择"><X size={16} /></button>
               </header>
               <label className="model-picker-search"><Search size={14} /><input autoFocus value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="筛选模型 ID" aria-label="筛选模型 ID" /></label>
               <div className="model-picker-list" role="listbox" aria-label="可用模型">
                 {models.filter((model) => model.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())).map((model) => (
-                  <button className={`model-picker-option ${value.model === model ? "selected" : ""}`} type="button" role="option" aria-selected={value.model === model} key={model} onClick={() => { setValue({ ...value, model }); setModelPickerOpen(false); }}>
-                    <span className="model-picker-option-icon"><Bot size={14} /></span><span>{model}</span>{value.model === model && <Check size={14} />}
+                  <button className={`model-picker-option ${selectedPickerModel === model ? "selected" : ""}`} type="button" role="option" aria-selected={selectedPickerModel === model} key={model} onClick={() => { setValue(modelPickerTarget === "reviewer" ? { ...value, reviewerModel: model } : { ...value, model }); setModelPickerTarget(undefined); }}>
+                    <span className="model-picker-option-icon"><Bot size={14} /></span><span>{model}</span>{selectedPickerModel === model && <Check size={14} />}
                   </button>
                 ))}
                 {models.length === 0 && !loadingModels && <div className="model-picker-empty"><CircleAlert size={16} /><span>没有可显示的模型，请检查接口地址和密钥，或直接在文本框输入模型 ID。</span></div>}
                 {models.length > 0 && models.filter((model) => model.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())).length === 0 && <div className="model-picker-empty"><Search size={16} /><span>没有匹配的模型</span></div>}
               </div>
-              <footer className="model-picker-footer"><span>当前选择</span><code>{value.model || "未选择"}</code></footer>
+              <footer className="model-picker-footer"><span>当前选择</span><code>{selectedPickerModel || "未选择"}</code></footer>
             </section>
           </div>
         )}

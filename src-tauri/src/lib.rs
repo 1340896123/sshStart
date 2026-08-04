@@ -2424,6 +2424,7 @@ pub fn run() {
             compress_remote_path,
             run_ssh_command,
             ai::list_rig_models,
+            ai::review_ai_approval,
             ai::cancel_ai_run,
             ai::resolve_ai_approval,
             ai::run_ai_agent
