@@ -36,6 +36,7 @@ const UNGROUPED_KEY = "__ungrouped__";
 interface Props {
   servers: ServerProfile[];
   savedGroups: string[];
+  initialCollapsedGroups: string[];
   sessions: SessionState[];
   search: string;
   selectedServerId?: string;
@@ -51,6 +52,7 @@ interface Props {
   onCreateGroup: (group: string) => void;
   onRenameGroup: (currentGroup: string, nextGroup: string) => void;
   onDeleteGroup: (group: string) => void;
+  onCollapsedGroupsChange: (groups: string[]) => void;
 }
 
 interface GroupNode {
@@ -151,6 +153,7 @@ const filterGroupTree = (nodes: GroupNode[], query: string, includeAll = false):
 export function ServerTree({
   servers,
   savedGroups,
+  initialCollapsedGroups,
   sessions,
   search,
   selectedServerId,
@@ -166,17 +169,12 @@ export function ServerTree({
   onCreateGroup,
   onRenameGroup,
   onDeleteGroup,
+  onCollapsedGroupsChange,
 }: Props) {
   const searchRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef(new Map<string, HTMLDivElement>());
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
-    try {
-      return new Set(JSON.parse(localStorage.getItem("portico.server-tree.collapsed") ?? "[]") as string[]);
-    } catch {
-      return new Set();
-    }
-  });
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set(initialCollapsedGroups));
   const [contextMenu, setContextMenu] = useState<ContextMenu>();
   const [groupEditor, setGroupEditor] = useState<GroupEditor>();
   const [groupError, setGroupError] = useState("");
@@ -208,8 +206,8 @@ export function ServerTree({
     && visibleGroups.every((node) => collapsedGroups.has(groupKey(node.path)));
 
   useEffect(() => {
-    localStorage.setItem("portico.server-tree.collapsed", JSON.stringify([...collapsedGroups]));
-  }, [collapsedGroups]);
+    setCollapsedGroups(new Set(initialCollapsedGroups));
+  }, [initialCollapsedGroups]);
 
   useEffect(() => {
     if (!focusedKey || !visibleKeys.includes(focusedKey)) setFocusedKey(visibleKeys[0]);
@@ -242,13 +240,12 @@ export function ServerTree({
 
   const toggleGroup = (group: string, forceExpanded?: boolean) => {
     const key = groupKey(group);
-    setCollapsedGroups((current) => {
-      const next = new Set(current);
-      const shouldExpand = forceExpanded ?? next.has(key);
-      if (shouldExpand) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+    const next = new Set(collapsedGroups);
+    const shouldExpand = forceExpanded ?? next.has(key);
+    if (shouldExpand) next.delete(key);
+    else next.add(key);
+    setCollapsedGroups(next);
+    onCollapsedGroupsChange([...next]);
   };
 
   const focusItem = (key: string) => {

@@ -1,4 +1,5 @@
 mod ai;
+mod storage;
 mod system_icons;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -17,7 +18,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2742,6 +2743,12 @@ pub fn run() {
     );
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let database =
+                storage::AppDatabase::initialize(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(database);
+            Ok(())
+        })
         .manage(TerminalManager::default())
         .manage(EditorManager::default())
         .manage(TransferManager::default())
@@ -2752,6 +2759,12 @@ pub fn run() {
             store_ai_key,
             load_ai_key,
             delete_ai_key,
+            storage::load_app_state,
+            storage::save_servers,
+            storage::save_server_groups,
+            storage::save_ai_config,
+            storage::save_ai_conversations,
+            storage::save_collapsed_groups,
             get_diagnostic_log_path,
             write_diagnostic_log,
             start_terminal,

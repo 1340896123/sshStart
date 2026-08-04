@@ -26,12 +26,19 @@ import { TerminalPane } from "./components/TerminalPane";
 import { TransferPanel } from "./components/TransferPanel";
 import { SystemDock } from "./components/SystemDock";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
+import { initializeAiConversations } from "./aiHistory";
 import { DEMO_SERVER, isTauri, uid } from "./lib";
 import { normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
+import {
+  loadAppStorage,
+  saveAiConfig as saveAiConfigToStorage,
+  saveCollapsedGroups,
+  saveServerGroups,
+  saveServers,
+} from "./storage";
 import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
 import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
 
-const AI_CONFIG_STORAGE_KEY = "portico.ai";
 const serializeAiConfig = (config: AiConfig) => {
   if (!isTauri()) return config;
   const { apiKey: _apiKey, ...persistedConfig } = config;
@@ -58,48 +65,13 @@ const initialAiPaneWidth = () => {
   return clampWidth(window.innerWidth * 0.29, 330, 410);
 };
 
-function useStoredState<T>(
-  key: string,
-  initialValue: T,
-  serialize: (value: T) => unknown = (value) => value,
-  deserialize?: (value: unknown) => T,
-) {
-  const [value, setValue] = useState<T>(() => {
-    try {
-      const stored = localStorage.getItem(key);
-      if (!stored) return initialValue;
-      const parsed = JSON.parse(stored) as unknown;
-      if (deserialize) return deserialize(parsed);
-      return typeof initialValue === "object" && initialValue !== null && !Array.isArray(initialValue)
-        ? { ...initialValue, ...(parsed as T) }
-        : parsed as T;
-    } catch {
-      return initialValue;
-    }
-  });
-
-  useEffect(() => {
-    localStorage.setItem(key, JSON.stringify(serialize(value)));
-  }, [key, serialize, value]);
-
-  return [value, setValue] as const;
-}
-
 export default function App() {
-  const hadStoredAiConfig = useRef(localStorage.getItem(AI_CONFIG_STORAGE_KEY) !== null);
-  const [servers, setServers] = useStoredState<ServerProfile[]>("portico.servers", [DEMO_SERVER], (items) =>
-    items.map(({ password: _password, passphrase: _passphrase, jumpHost, ...server }) => ({
-      ...server,
-      jumpHost: jumpHost ? (({ password: _jumpPassword, passphrase: _jumpPassphrase, ...rest }) => rest)(jumpHost) : undefined,
-    })),
-  );
-  const [savedGroups, setSavedGroups] = useStoredState<string[]>("portico.server-groups", []);
-  const [aiConfig, setAiConfig] = useStoredState<AiConfig>(
-    AI_CONFIG_STORAGE_KEY,
-    DEFAULT_AI_CONFIG,
-    serializeAiConfig,
-    (stored) => normalizeAiConfig(stored as Partial<AiConfig>),
-  );
+  const hadStoredAiConfig = useRef(false);
+  const [storageReady, setStorageReady] = useState(!isTauri());
+  const [servers, setServers] = useState<ServerProfile[]>([DEMO_SERVER]);
+  const [savedGroups, setSavedGroups] = useState<string[]>([]);
+  const [aiConfig, setAiConfig] = useState<AiConfig>(DEFAULT_AI_CONFIG);
+  const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -127,6 +99,52 @@ export default function App() {
 
   useEffect(() => {
     if (!isTauri()) return;
+    let disposed = false;
+    void loadAppStorage()
+      .then((state) => {
+        if (disposed) return;
+        setServers(state.servers.length ? state.servers : [DEMO_SERVER]);
+        setSavedGroups(state.savedGroups);
+        setAiConfig(state.aiConfig ? normalizeAiConfig(state.aiConfig) : DEFAULT_AI_CONFIG);
+        setCollapsedGroups(state.collapsedGroups);
+        hadStoredAiConfig.current = state.aiConfig !== null;
+        initializeAiConversations(state.aiConversations);
+        setStorageReady(true);
+      })
+      .catch((error) => {
+        if (disposed) return;
+        console.error("Failed to load SQLite application state", error);
+        setStorageReady(true);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void saveServers(servers).catch((error) => console.error("Failed to save servers", error));
+  }, [servers, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void saveServerGroups(savedGroups).catch((error) => console.error("Failed to save server groups", error));
+  }, [savedGroups, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void saveAiConfigToStorage(serializeAiConfig(aiConfig))
+      .catch((error) => console.error("Failed to save AI configuration", error));
+  }, [aiConfig, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void saveCollapsedGroups(collapsedGroups)
+      .catch((error) => console.error("Failed to save collapsed groups", error));
+  }, [collapsedGroups, storageReady]);
+
+  useEffect(() => {
+    if (!isTauri() || !storageReady) return;
     let disposed = false;
     let dispose: () => void = () => undefined;
     void listen<TransferProgressEvent>("transfer-progress", ({ payload }) => {
@@ -182,10 +200,10 @@ export default function App() {
     return () => {
       disposed = true;
     };
-  }, [setAiConfig]);
+  }, [storageReady]);
 
   useEffect(() => {
-    if (!DEV_BOOTSTRAP) return;
+    if (!DEV_BOOTSTRAP || !storageReady) return;
 
     const { servers: bootstrapServers = [], ai } = DEV_BOOTSTRAP;
     if (bootstrapServers.length) {
@@ -218,7 +236,7 @@ export default function App() {
       writes.push(invoke("store_ai_key", { apiKey: ai.apiKey }));
     }
     void Promise.all(writes).catch((error) => console.error("Failed to initialize development credentials", error));
-  }, [setAiConfig, setSavedGroups, setServers]);
+  }, [setAiConfig, setSavedGroups, setServers, storageReady]);
 
   const updateSession = (id: string, patch: Partial<SessionState>) => {
     setSessions((current) =>
@@ -303,7 +321,6 @@ export default function App() {
     if (isTauri() && nextConfig.apiKey.trim()) {
       await invoke("store_ai_key", { apiKey: nextConfig.apiKey.trim() });
     }
-    localStorage.setItem(AI_CONFIG_STORAGE_KEY, JSON.stringify(serializeAiConfig(nextConfig)));
     setAiConfig(nextConfig);
   };
 
@@ -624,6 +641,7 @@ export default function App() {
             <ServerTree
               servers={servers}
               savedGroups={savedGroups}
+              initialCollapsedGroups={collapsedGroups}
               sessions={sessions}
               search={search}
               selectedServerId={selectedServerId ?? activeServer?.id}
@@ -639,6 +657,7 @@ export default function App() {
               onCreateGroup={createGroup}
               onRenameGroup={renameGroup}
               onDeleteGroup={deleteGroup}
+              onCollapsedGroupsChange={setCollapsedGroups}
             />
           </aside>
         )}

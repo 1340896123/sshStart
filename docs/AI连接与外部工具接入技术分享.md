@@ -56,9 +56,9 @@ flowchart LR
 | [`src/components/AiPane.tsx`](../src/components/AiPane.tsx) | 发送消息、订阅流事件、合并文本/推理/工具状态、审批交互 |
 | [`src/components/SettingsDialog.tsx`](../src/components/SettingsDialog.tsx) | Provider、模型、上下文、工具权限和安全策略设置 |
 | [`src/types.ts`](../src/types.ts) | 前端 AI 配置、消息、工具结果和流事件类型 |
-| [`src/App.tsx`](../src/App.tsx) | 配置持久化；剔除 API Key 后写入 `localStorage` |
+| [`src/App.tsx`](../src/App.tsx) | 配置持久化；剔除 API Key 后写入 SQLite |
 | [`src-tauri/src/lib.rs`](../src-tauri/src/lib.rs) | Provider 请求、SSE 解析、Agent 循环、工具定义、工具执行、安全门禁、凭据读取 |
-| [`src/aiHistory.ts`](../src/aiHistory.ts) | 会话历史的本地持久化与裁剪 |
+| [`src/aiHistory.ts`](../src/aiHistory.ts) | SQLite 会话历史持久化与裁剪 |
 
 ### 3.2 信任边界
 
@@ -141,7 +141,7 @@ const serializeAiConfig = ({ apiKey: _apiKey, ...config }: AiConfig) => config;
 if (isTauri() && nextConfig.apiKey.trim()) {
   await invoke("store_ai_key", { apiKey: nextConfig.apiKey.trim() });
 }
-localStorage.setItem(AI_CONFIG_STORAGE_KEY, JSON.stringify(serializeAiConfig(nextConfig)));
+await saveAiConfigToStorage(serializeAiConfig(nextConfig));
 ```
 
 源码：[`src/App.tsx:34`](../src/App.tsx#L34)、[`src/App.tsx:283`](../src/App.tsx#L283)
@@ -158,7 +158,7 @@ fn read_secret(account: &str) -> Option<String> {
 
 源码：[`src-tauri/src/lib.rs:708`](../src-tauri/src/lib.rs#L708)、[`src-tauri/src/lib.rs:1057`](../src-tauri/src/lib.rs#L1057)
 
-这避免了长期密钥进入 WebView `localStorage`。但单次保存期间 API Key 仍会经过 Tauri IPC，因此 IPC 命令权限和前端供应链仍属于安全边界。
+这避免了长期密钥进入 SQLite 或 WebView 存储。单次保存期间 API Key 仍会经过 Tauri IPC，因此 IPC 命令权限和前端供应链仍属于安全边界。
 
 ### 4.4 两种请求协议的适配
 
@@ -590,7 +590,7 @@ fn ai_tool_is_mutating(name: &str, arguments: &Value) -> bool {
 3. **工具复用度高**：Agent 工具直接复用已有 SSH、SFTP、进程和网络能力。
 4. **可观测性较好**：工具生命周期、命令、输出、退出码和时间戳对用户可见。
 5. **资源边界完整**：同时限制上下文、输出、命令时间和工具轮数。
-6. **密钥边界合理**：长期 API Key 不进入 `localStorage`。
+6. **密钥边界合理**：长期 API Key 不进入 SQLite 或 WebView 存储。
 7. **Responses 工具重放正确**：保存 output item 并追加 `function_call_output`，符合连续工具调用所需的状态模型。
 
 ### 11.2 需要关注的限制

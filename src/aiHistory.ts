@@ -1,4 +1,5 @@
 import type { AiMessage, ServerProfile } from "./types";
+import { saveAiConversations } from "./storage";
 
 export interface AiConversation {
   id: string;
@@ -10,11 +11,11 @@ export interface AiConversation {
   updatedAt: number;
 }
 
-export const AI_HISTORY_STORAGE_KEY = "portico.ai-history.v2";
 export const AI_HISTORY_UPDATED_EVENT = "portico:ai-history-updated";
 
 const MAX_CONVERSATIONS_PER_SERVER = 30;
 const MAX_TITLE_LENGTH = 38;
+let cachedConversations: AiConversation[] = [];
 
 const isConversation = (value: unknown): value is AiConversation => {
   if (!value || typeof value !== "object") return false;
@@ -48,28 +49,27 @@ const trimConversations = (conversations: AiConversation[]) => {
     });
 };
 
-export const readAiConversations = (): AiConversation[] => {
-  if (typeof window === "undefined") return [];
-  try {
-    const stored = localStorage.getItem(AI_HISTORY_STORAGE_KEY);
-    if (!stored) return [];
-    const parsed = JSON.parse(stored) as unknown;
-    return Array.isArray(parsed) ? trimConversations(parsed.filter(isConversation)) : [];
-  } catch {
-    return [];
+export const readAiConversations = () => cachedConversations;
+
+const notifyAiHistoryUpdated = (conversations: AiConversation[]) => {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent<AiConversation[]>(AI_HISTORY_UPDATED_EVENT, { detail: conversations }));
   }
 };
 
+export const initializeAiConversations = (conversations: AiConversation[]) => {
+  cachedConversations = trimConversations(conversations.filter(isConversation));
+  notifyAiHistoryUpdated(cachedConversations);
+  return cachedConversations;
+};
+
 export const publishAiConversations = (conversations: AiConversation[]) => {
-  const next = trimConversations(conversations);
-  if (typeof window === "undefined") return next;
-  try {
-    localStorage.setItem(AI_HISTORY_STORAGE_KEY, JSON.stringify(next));
-  } catch {
-    // Keep the in-memory history available when browser storage is full or unavailable.
-  }
-  window.dispatchEvent(new CustomEvent<AiConversation[]>(AI_HISTORY_UPDATED_EVENT, { detail: next }));
-  return next;
+  cachedConversations = trimConversations(conversations);
+  void saveAiConversations(cachedConversations).catch((error) => {
+    console.error("Failed to save AI conversations", error);
+  });
+  notifyAiHistoryUpdated(cachedConversations);
+  return cachedConversations;
 };
 
 export const upsertAiConversation = (

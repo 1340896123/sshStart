@@ -33,7 +33,6 @@ import {
   X,
 } from "lucide-react";
 import {
-  AI_HISTORY_STORAGE_KEY,
   AI_HISTORY_UPDATED_EVENT,
   publishAiConversations,
   readAiConversations,
@@ -389,14 +388,9 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
       conversationsRef.current = next;
       setConversations(next);
     };
-    const syncStorage = (event: StorageEvent) => {
-      if (event.key === AI_HISTORY_STORAGE_KEY) syncHistory(event);
-    };
     window.addEventListener(AI_HISTORY_UPDATED_EVENT, syncHistory);
-    window.addEventListener("storage", syncStorage);
     return () => {
       window.removeEventListener(AI_HISTORY_UPDATED_EVENT, syncHistory);
-      window.removeEventListener("storage", syncStorage);
     };
   }, []);
 
