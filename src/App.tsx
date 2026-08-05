@@ -30,7 +30,7 @@ import { SystemDock } from "./components/SystemDock";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
 import { initializeAiConversations } from "./aiHistory";
 import { DEMO_SERVER, isTauri, uid } from "./lib";
-import { normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
+import { isGroupWithin, normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
 import {
   AI_IMPORT_GROUP,
   materializeServerDrafts,
@@ -361,14 +361,22 @@ export default function App() {
     }
   };
 
-  const deleteServer = (serverId: string) => {
-    if (isTauri()) void invoke("delete_server_secret", { serverId }).catch(() => undefined);
-    setServers((current) => current.filter((server) => server.id !== serverId));
-    setSelectedServerId((current) => current === serverId ? undefined : current);
+  const deleteServers = (serverIds: string[]) => {
+    const deletedIds = new Set(serverIds);
+    if (deletedIds.size === 0) return;
+    if (isTauri()) {
+      deletedIds.forEach((serverId) => {
+        void invoke("delete_server_secret", { serverId }).catch(() => undefined);
+      });
+    }
+    setServers((current) => current.filter((server) => !deletedIds.has(server.id)));
+    setSelectedServerId((current) => current && deletedIds.has(current) ? undefined : current);
     sessions
-      .filter((session) => session.serverId === serverId)
+      .filter((session) => deletedIds.has(session.serverId))
       .forEach((session) => void closeSession(session.id));
   };
+
+  const deleteServer = (serverId: string) => deleteServers([serverId]);
 
   const saveAiConfig = async (next: AiConfig) => {
     const nextConfig = normalizeAiConfig(next);
@@ -602,7 +610,14 @@ export default function App() {
     });
   };
 
-  const deleteGroup = (group: string) => {
+  const deleteGroup = (group: string, deleteContainedServers: boolean) => {
+    if (deleteContainedServers) {
+      deleteServers(servers
+        .filter((server) => isGroupWithin(server.group, group))
+        .map((server) => server.id));
+      setSavedGroups((current) => current.filter((item) => !isGroupWithin(item, group)));
+      return;
+    }
     setServers((current) => current.map((server) =>
       ({ ...server, group: removeGroupLevel(server.group, group) }),
     ));

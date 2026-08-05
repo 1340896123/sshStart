@@ -34,6 +34,7 @@ import {
   replaceGroupPrefix,
 } from "../serverGroups";
 import type { ServerProfile, SessionState } from "../types";
+import { GroupDeleteDialog } from "./GroupDeleteDialog";
 
 const UNGROUPED_KEY = "__ungrouped__";
 
@@ -56,7 +57,7 @@ interface Props {
   onMoveServer: (server: ServerProfile, group: string) => void;
   onCreateGroup: (group: string) => void;
   onRenameGroup: (currentGroup: string, nextGroup: string) => void;
-  onDeleteGroup: (group: string) => void;
+  onDeleteGroup: (group: string, deleteServers: boolean) => void;
   onCollapsedGroupsChange: (groups: string[]) => void;
   onExportAll: () => void;
   onImport: () => void;
@@ -192,6 +193,7 @@ export function ServerTree({
   const [contextMenu, setContextMenu] = useState<ContextMenu>();
   const [groupEditor, setGroupEditor] = useState<GroupEditor>();
   const [groupError, setGroupError] = useState("");
+  const [pendingGroupDelete, setPendingGroupDelete] = useState<{ group: string; serverCount: number }>();
   const [focusedKey, setFocusedKey] = useState<string>();
   const [draggedServerId, setDraggedServerId] = useState<string>();
   const [dropGroup, setDropGroup] = useState<string>();
@@ -241,6 +243,7 @@ export function ServerTree({
         setContextMenu(undefined);
         setGroupEditor(undefined);
         setGroupError("");
+        setPendingGroupDelete(undefined);
       }
     };
 
@@ -359,14 +362,25 @@ export function ServerTree({
     const details = count > 0 || hasChildren
       ? `其中的服务器和子分组将上移一级到${destination}。`
       : "";
+    if (count > 0) {
+      setPendingGroupDelete({ group, serverCount: count });
+      return;
+    }
     if (!confirm(`删除分组“${groupBreadcrumb(group)}”？${details}`)) return;
+    completeGroupDelete(group, false);
+  };
 
-    onDeleteGroup(group);
-    setCollapsedGroups((current) => new Set(
-      [...current]
-        .filter((path) => !isGroupWithin(path, group) || path !== group)
-        .map((path) => removeGroupLevel(path, group)),
-    ));
+  const completeGroupDelete = (group: string, deleteServers: boolean) => {
+    onDeleteGroup(group, deleteServers);
+    const nextCollapsedGroups = new Set(
+      [...collapsedGroups]
+        .filter((path) => !deleteServers || !isGroupWithin(path, group))
+        .filter((path) => deleteServers || !isGroupWithin(path, group) || path !== group)
+        .map((path) => deleteServers ? path : removeGroupLevel(path, group)),
+    );
+    setCollapsedGroups(nextCollapsedGroups);
+    onCollapsedGroupsChange([...nextCollapsedGroups]);
+    setPendingGroupDelete(undefined);
   };
 
   const renderGroupEditor = (level: number) => {
@@ -714,6 +728,18 @@ export function ServerTree({
             </>
           )}
         </div>
+      )}
+      {pendingGroupDelete && (
+        <GroupDeleteDialog
+          groupName={groupBreadcrumb(pendingGroupDelete.group)}
+          serverCount={pendingGroupDelete.serverCount}
+          dissolveDescription={groupParent(pendingGroupDelete.group)
+            ? `服务器和子分组将上移到“${groupBreadcrumb(groupParent(pendingGroupDelete.group))}”。`
+            : "服务器将移至“未分组”，子分组将上移到顶层。"}
+          onClose={() => setPendingGroupDelete(undefined)}
+          onDissolve={() => completeGroupDelete(pendingGroupDelete.group, false)}
+          onDeleteServers={() => completeGroupDelete(pendingGroupDelete.group, true)}
+        />
       )}
     </>
   );
