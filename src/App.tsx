@@ -28,7 +28,7 @@ import { TerminalPane } from "./components/TerminalPane";
 import { TransferPanel } from "./components/TransferPanel";
 import { SystemDock } from "./components/SystemDock";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
-import { initializeAiConversations } from "./aiHistory";
+import { initializeAiConversations, readAiConversations } from "./aiHistory";
 import { DEMO_SERVER, isTauri, uid } from "./lib";
 import { isGroupWithin, normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
 import {
@@ -45,6 +45,9 @@ import {
   saveCollapsedGroups,
   saveServerGroups,
   saveServers,
+  pullCloudSync,
+  pushCloudSync,
+  type AppStorageSnapshot,
 } from "./storage";
 import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
 import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
@@ -97,6 +100,7 @@ const initialAiPaneWidth = () => {
 
 export default function App() {
   const hadStoredAiConfig = useRef(false);
+  const syncHydrated = useRef(!isTauri());
   const [storageReady, setStorageReady] = useState(!isTauri());
   const [servers, setServers] = useState<ServerProfile[]>([DEMO_SERVER]);
   const [savedGroups, setSavedGroups] = useState<string[]>([]);
@@ -135,13 +139,33 @@ export default function App() {
     void loadAppStorage()
       .then((state) => {
         if (disposed) return;
+        const localConfig = state.aiConfig ? normalizeAiConfig(state.aiConfig) : DEFAULT_AI_CONFIG;
         setServers(state.servers.length ? state.servers : [DEMO_SERVER]);
         setSavedGroups(state.savedGroups);
-        setAiConfig(state.aiConfig ? normalizeAiConfig(state.aiConfig) : DEFAULT_AI_CONFIG);
+        setAiConfig(localConfig);
         setCollapsedGroups(state.collapsedGroups);
         hadStoredAiConfig.current = state.aiConfig !== null;
         initializeAiConversations(state.aiConversations);
-        setStorageReady(true);
+        const finish = (nextState: AppStorageSnapshot) => {
+          if (disposed) return;
+          setServers(nextState.servers.length ? nextState.servers : [DEMO_SERVER]);
+          setSavedGroups(nextState.savedGroups);
+          setAiConfig(nextState.aiConfig ? normalizeAiConfig(nextState.aiConfig) : DEFAULT_AI_CONFIG);
+          setCollapsedGroups(nextState.collapsedGroups);
+          initializeAiConversations(nextState.aiConversations);
+          syncHydrated.current = true;
+          setStorageReady(true);
+        };
+        if (!localConfig.cloudSync.enabled || !localConfig.cloudSync.endpoint.trim()) {
+          finish(state);
+          return;
+        }
+        void pullCloudSync(localConfig.cloudSync.endpoint)
+          .then((remote) => finish(remote ?? state))
+          .catch((error) => {
+            console.warn("Failed to pull cloud sync state", error);
+            finish(state);
+          });
       })
       .catch((error) => {
         if (disposed) return;
@@ -152,6 +176,24 @@ export default function App() {
       disposed = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!storageReady || !syncHydrated.current || !isTauri()) return;
+    if (!aiConfig.cloudSync.enabled || !aiConfig.cloudSync.endpoint.trim()) return;
+    const snapshot: AppStorageSnapshot = {
+      servers,
+      savedGroups,
+      aiConfig: serializeAiConfigForStorage(aiConfig),
+      aiConversations: readAiConversations(),
+      collapsedGroups,
+    };
+    const timer = window.setTimeout(() => {
+      void pushCloudSync(aiConfig.cloudSync.endpoint, snapshot).catch((error) => {
+        console.warn("Failed to push cloud sync state", error);
+      });
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [aiConfig, collapsedGroups, savedGroups, servers, storageReady]);
 
   useEffect(() => {
     if (!storageReady) return;

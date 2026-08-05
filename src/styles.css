@@ -4601,6 +4601,13 @@ body.is-resizing-rows .system-dock {
   border-top: 1px solid var(--border);
 }
 
+.settings-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 24px 18px;
+}
+
 .settings-row-copy {
   min-width: 0;
   display: grid;

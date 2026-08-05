@@ -10,3 +10,5 @@ src-tauri/gen/schemas/
 .learnings/
 output/
 tmp/
+.claude/
+.codegraph/

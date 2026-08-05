@@ -5,6 +5,7 @@ import {
   Bot,
   Check,
   CircleAlert,
+  Cloud,
   Container,
   Download,
   Eye,
@@ -16,6 +17,8 @@ import {
   Gauge,
   KeyRound,
   ListTree,
+  LogIn,
+  LogOut,
   Network,
   Play,
   RefreshCw,
@@ -28,10 +31,12 @@ import {
   SquareTerminal,
   Trash2,
   Upload,
+  UserPlus,
   Wrench,
   X,
 } from "lucide-react";
 import { isTauri } from "../lib";
+import { getCloudSyncStatus, loginCloudSync, logoutCloudSync, registerCloudSync, type CloudSyncStatus } from "../storage";
 import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, type AiConfig, type AiToolKey } from "../types";
 
 interface Props {
@@ -93,7 +98,7 @@ const TOOL_GROUPS: Array<{
   },
 ];
 
-type SettingsSection = "model" | "agent" | "tools" | "transfer" | "server-data" | "security";
+type SettingsSection = "model" | "agent" | "tools" | "transfer" | "server-data" | "security" | "cloud-sync";
 type ModelPickerTarget = "agent" | "reviewer";
 
 const SETTINGS_SECTIONS: Array<{
@@ -108,6 +113,7 @@ const SETTINGS_SECTIONS: Array<{
   { id: "transfer", label: "文件传输", description: "文件系统与 SFTP 权限", icon: Upload },
   { id: "server-data", label: "导入导出", description: "服务器列表与密钥策略", icon: Download },
   { id: "security", label: "安全策略", description: "高危拦截与变更边界", icon: ShieldCheck },
+  { id: "cloud-sync", label: "云端同步", description: "登录、加密与自动同步", icon: Cloud },
 ];
 
 export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Props) {
@@ -121,11 +127,53 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
   const [removingKey, setRemovingKey] = useState(false);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [error, setError] = useState("");
+  const [syncStatus, setSyncStatus] = useState<CloudSyncStatus>();
+  const [syncEmail, setSyncEmail] = useState("");
+  const [syncPassword, setSyncPassword] = useState("");
+  const [syncBusy, setSyncBusy] = useState(false);
   const [activeSection, setActiveSection] = useState<SettingsSection>("model");
   const [navSearch, setNavSearch] = useState("");
   const modelPickerOpen = Boolean(modelPickerTarget);
   const selectedPickerModel = modelPickerTarget === "reviewer" ? value.reviewerModel : value.model;
   const isDirty = JSON.stringify(value) !== JSON.stringify(savedValue);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void getCloudSyncStatus().then(setSyncStatus).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+  }, []);
+
+  const authenticateSync = async (mode: "login" | "register") => {
+    setSyncBusy(true);
+    setError("");
+    try {
+      const result = mode === "register"
+        ? await registerCloudSync(value.cloudSync.endpoint, syncEmail, syncPassword)
+        : await loginCloudSync(value.cloudSync.endpoint, syncEmail, syncPassword);
+      setSyncStatus((current) => ({ ...(current ?? { keyPath: "" }), authenticated: true, email: result.email }));
+      setSyncPassword("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const logoutSync = async () => {
+    setSyncBusy(true);
+    setError("");
+    try {
+      await logoutCloudSync();
+      setSyncStatus((current) => ({ ...(current ?? { keyPath: "" }), authenticated: false, email: undefined }));
+      const nextValue = normalizeAiConfig({ ...value, cloudSync: { ...value.cloudSync, enabled: false } });
+      await onSave(nextValue);
+      setValue(nextValue);
+      setSavedValue(nextValue);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
 
   const loadModels = async () => {
     setLoadingModels(true);
@@ -179,6 +227,14 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     }
     if (!Number.isInteger(value.tools.commandTimeoutSeconds) || value.tools.commandTimeoutSeconds < 5) {
       setError("命令超时需为不小于 5 秒的整数");
+      return;
+    }
+    if (value.cloudSync.enabled && !value.cloudSync.endpoint.trim()) {
+      setError("启用同步前请填写同步服务地址");
+      return;
+    }
+    if (value.cloudSync.enabled && !syncStatus?.authenticated) {
+      setError("启用同步前请先登录或注册同步账号");
       return;
     }
     setSaving(true);
@@ -311,7 +367,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
           <header className="settings-page-header">
             {activeSectionMeta ? (
               <div>
-                <span>{visibleActiveSection === "server-data" ? "服务器设置" : "AI 配置"}</span>
+                <span>{visibleActiveSection === "server-data" || visibleActiveSection === "cloud-sync" ? "服务器设置" : "AI 配置"}</span>
                 <h2 id="settings-page-title">{activeSectionMeta.label}</h2>
                 <p>{activeSectionMeta.description}</p>
               </div>
@@ -467,6 +523,37 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                 </section>
                 <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许 Agent 请求变更</strong><small>开启后 Rig 可提出写入、上传、服务和进程操作；是否放行由当前会话的审批策略决定。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
                 <div className="settings-note"><ShieldCheck size={15} /><span>审核模型返回无法解析的结果或请求失败时，Portico 会退回人工审批，不会默认放行。</span></div>
+              </>
+            )}
+
+            {visibleActiveSection === "cloud-sync" && (
+              <>
+                <section className="settings-panel">
+                  <header><strong>云端同步</strong><small>服务器列表和全部设置会在本地加密后再上传，云端永远只保存密文</small></header>
+                  <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>同步服务地址</strong><small>填写团队或自建同步服务的 API 根地址</small></span>
+                    <input className="settings-input settings-mono-input" value={value.cloudSync.endpoint} onChange={(event) => setValue({ ...value, cloudSync: { ...value.cloudSync, endpoint: event.target.value } })} placeholder="https://sync.example.com/api" />
+                  </label>
+                  <label className="mutating-tools-toggle">
+                    <span className="tool-permission-icon"><Cloud size={14} /></span>
+                    <span className="tool-permission-copy"><strong>开启自动同步</strong><small>保存服务器或设置后自动上传；启动时自动下载最新密文</small></span>
+                    <input type="checkbox" checked={value.cloudSync.enabled} onChange={(event) => setValue({ ...value, cloudSync: { ...value.cloudSync, enabled: event.target.checked } })} />
+                    <span className="switch" aria-hidden="true" />
+                  </label>
+                </section>
+                <section className="settings-panel">
+                  <header><strong>同步账号</strong><small>{syncStatus?.authenticated ? `已登录：${syncStatus.email ?? "当前账号"}` : "必须登录后才能开启同步"}</small></header>
+                  {!syncStatus?.authenticated ? (
+                    <>
+                      <label className="settings-config-row"><span className="settings-row-copy"><strong>邮箱</strong><small>用于登录或注册同步账号</small></span><input className="settings-input" type="email" autoComplete="username" value={syncEmail} onChange={(event) => setSyncEmail(event.target.value)} placeholder="you@example.com" /></label>
+                      <label className="settings-config-row"><span className="settings-row-copy"><strong>密码</strong><small>仅用于认证请求，不会写入本地状态</small></span><input className="settings-input" type="password" autoComplete="current-password" value={syncPassword} onChange={(event) => setSyncPassword(event.target.value)} placeholder="至少 8 位" /></label>
+                      <div className="settings-action-row"><button className="secondary-button" type="button" disabled={syncBusy} onClick={() => void authenticateSync("login")}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <LogIn size={14} />}登录</button><button className="secondary-button" type="button" disabled={syncBusy} onClick={() => void authenticateSync("register")}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <UserPlus size={14} />}注册并登录</button></div>
+                    </>
+                  ) : (
+                    <div className="settings-config-row"><span className="settings-row-copy"><strong>当前账号</strong><small>令牌保存在系统凭据库；加密密钥保存在 {syncStatus.keyPath || "~/.porticossh/"}</small></span><button className="danger-button" type="button" disabled={syncBusy} onClick={() => void logoutSync()}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <LogOut size={14} />}退出登录</button></div>
+                  )}
+                </section>
+                <div className="settings-note"><KeyRound size={15} /><span>同步密钥由桌面端首次运行时生成并保存在 ~/.porticossh/sync.key。密钥不会上传；丢失密钥时云端密文无法恢复。</span></div>
               </>
             )}
           </div>

@@ -268,6 +268,16 @@ export const DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS: ServerImportExportSettings =
   includeSecretsInExport: true,
 };
 
+export interface CloudSyncSettings {
+  enabled: boolean;
+  endpoint: string;
+}
+
+export const DEFAULT_CLOUD_SYNC_SETTINGS: CloudSyncSettings = {
+  enabled: false,
+  endpoint: import.meta.env.VITE_PORTICO_SYNC_API_URL ?? "",
+};
+
 export interface AiConfig {
   apiMode: AiApiMode;
   endpoint: string;
@@ -280,11 +290,13 @@ export interface AiConfig {
   systemPrompt: string;
   tools: AiToolSettings;
   serverImportExport: ServerImportExportSettings;
+  cloudSync: CloudSyncSettings;
 }
 
-type AiConfigInput = Omit<Partial<AiConfig>, "tools" | "serverImportExport"> & {
+type AiConfigInput = Omit<Partial<AiConfig>, "tools" | "serverImportExport" | "cloudSync"> & {
   tools?: Partial<AiToolSettings>;
   serverImportExport?: Partial<ServerImportExportSettings>;
+  cloudSync?: Partial<CloudSyncSettings>;
 };
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
@@ -300,6 +312,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
     "你是 Portico SSH 的 Rig 运维 Agent。先观察再行动，优先使用结构化工具获取事实；明确说明风险和执行结果。不要声称读取过尚未通过工具访问的文件，高风险或变更型动作必须等待人工审批。",
   tools: DEFAULT_AI_TOOL_SETTINGS,
   serverImportExport: DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,
+  cloudSync: DEFAULT_CLOUD_SYNC_SETTINGS,
 };
 
 export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig = DEFAULT_AI_CONFIG): AiConfig {
@@ -318,6 +331,11 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
       ...DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,
       ...fallback.serverImportExport,
       ...(config.serverImportExport ?? {}),
+    },
+    cloudSync: {
+      ...DEFAULT_CLOUD_SYNC_SETTINGS,
+      ...fallback.cloudSync,
+      ...(config.cloudSync ?? {}),
     },
   };
 }

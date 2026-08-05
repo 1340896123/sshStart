@@ -1,4 +1,6 @@
 mod ai;
+mod cloud_sync;
+mod crypto;
 mod server_transfer;
 mod storage;
 mod system_icons;
@@ -2799,6 +2801,12 @@ pub fn run() {
             store_ai_key,
             load_ai_key,
             delete_ai_key,
+            cloud_sync::sync_register,
+            cloud_sync::sync_login,
+            cloud_sync::sync_status,
+            cloud_sync::sync_logout,
+            cloud_sync::sync_push,
+            cloud_sync::sync_pull,
             storage::load_app_state,
             storage::save_servers,
             storage::save_server_groups,

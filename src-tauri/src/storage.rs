@@ -1,3 +1,4 @@
+use crate::crypto::{decrypt_json, encrypt_json, ensure_key};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
@@ -17,6 +18,7 @@ pub struct AppDatabase {
 
 impl AppDatabase {
     pub fn initialize(app: &AppHandle) -> Result<Self, String> {
+        ensure_key()?;
         let app_data_dir = app
             .path()
             .app_data_dir()
@@ -35,6 +37,33 @@ impl AppDatabase {
                  );",
             )
             .map_err(|error| format!("初始化 SQLite 数据库失败: {error}"))?;
+        let legacy_values = {
+            let mut statement = connection
+                .prepare("SELECT key, value FROM app_state")
+                .map_err(|error| format!("读取旧版 SQLite 状态失败: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| format!("扫描旧版 SQLite 状态失败: {error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("读取旧版 SQLite 状态失败: {error}"))?
+        };
+        for (key, raw) in legacy_values {
+            if decrypt_json(&raw).is_ok() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let encrypted = encrypt_json(&value)?;
+            connection
+                .execute(
+                    "UPDATE app_state SET value = ?1 WHERE key = ?2",
+                    params![encrypted, key],
+                )
+                .map_err(|error| format!("迁移 SQLite 状态失败: {error}"))?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -53,15 +82,16 @@ impl AppDatabase {
             )
             .optional()
             .map_err(|error| format!("读取 SQLite 状态失败: {error}"))?;
-        raw.map(|value| {
-            serde_json::from_str(&value).map_err(|error| format!("解析 SQLite 状态失败: {error}"))
+        raw.map(|value| match decrypt_json(&value) {
+            Ok(value) => Ok(value),
+            Err(_) => serde_json::from_str(&value)
+                .map_err(|error| format!("解析 SQLite 状态失败: {error}")),
         })
         .transpose()
     }
 
     fn write_value(&self, key: &str, value: &Value) -> Result<(), String> {
-        let serialized = serde_json::to_string(value)
-            .map_err(|error| format!("序列化 SQLite 状态失败: {error}"))?;
+        let serialized = encrypt_json(value)?;
         let connection = self
             .connection
             .lock()
