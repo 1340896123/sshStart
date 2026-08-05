@@ -391,6 +391,14 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     container.scrollTop = container.scrollHeight;
   }, [session.aiMessages]);
 
+  useLayoutEffect(() => {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > 200 ? "auto" : "hidden";
+  }, [input]);
+
   useEffect(() => {
     const syncHistory = (event: Event) => {
       const next = (event as CustomEvent<AiConversation[]>).detail ?? readAiConversations();
