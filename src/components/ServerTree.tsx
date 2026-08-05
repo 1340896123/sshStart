@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsUp,
+  Copy,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -46,6 +47,7 @@ interface Props {
   onOpen: (server: ServerProfile) => void;
   onNewSession: (server: ServerProfile) => void;
   onAddServer: (group?: string) => void;
+  onCopyServer: (server: ServerProfile) => void;
   onEditServer: (server: ServerProfile) => void;
   onDeleteServer: (server: ServerProfile) => void;
   onMoveServer: (server: ServerProfile, group: string) => void;
@@ -163,6 +165,7 @@ export function ServerTree({
   onOpen,
   onNewSession,
   onAddServer,
+  onCopyServer,
   onEditServer,
   onDeleteServer,
   onMoveServer,
@@ -620,6 +623,9 @@ export function ServerTree({
               </button>
               <button role="menuitem" onClick={() => { onEditServer(contextMenu.server); setContextMenu(undefined); }}>
                 <Pencil size={14} /><span>编辑</span><kbd>F2</kbd>
+              </button>
+              <button role="menuitem" onClick={() => { onCopyServer(contextMenu.server); setContextMenu(undefined); }}>
+                <Copy size={14} /><span>复制</span>
               </button>
               <div className="context-submenu">
                 <button role="menuitem" aria-haspopup="menu">

@@ -694,6 +694,20 @@ fn store_server_secret(
 }
 
 #[tauri::command]
+fn copy_server_secret(source_server_id: String, target_server_id: String) -> Result<(), String> {
+    for suffix in ["password", "passphrase", "jump:password", "jump:passphrase"] {
+        let source_account = format!("server:{source_server_id}:{suffix}");
+        let Some(secret) = read_secret(&source_account) else {
+            continue;
+        };
+        keyring_entry(&format!("server:{target_server_id}:{suffix}"))?
+            .set_password(&secret)
+            .map_err(|error| format!("复制服务器凭据失败: {error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn delete_server_secret(server_id: String) -> Result<(), String> {
     for suffix in ["password", "passphrase", "jump:password", "jump:passphrase"] {
         if let Ok(entry) = keyring_entry(&format!("server:{server_id}:{suffix}")) {
@@ -2755,6 +2769,7 @@ pub fn run() {
         .manage(ai::AiRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             store_server_secret,
+            copy_server_secret,
             delete_server_secret,
             store_ai_key,
             load_ai_key,

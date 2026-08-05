@@ -53,6 +53,16 @@ const COLUMN_SPLITTER_WIDTH = 7;
 
 const clampWidth = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
+const copyServerName = (servers: ServerProfile[], sourceName: string) => {
+  const baseName = `${sourceName} 副本`;
+  const existingNames = new Set(servers.map((server) => server.name.toLocaleLowerCase()));
+  if (!existingNames.has(baseName.toLocaleLowerCase())) return baseName;
+
+  let copyNumber = 2;
+  while (existingNames.has(`${baseName} ${copyNumber}`.toLocaleLowerCase())) copyNumber += 1;
+  return `${baseName} ${copyNumber}`;
+};
+
 const initialSidebarWidth = () => {
   if (window.innerWidth <= 1100) return SIDEBAR_MIN_WIDTH;
   if (window.innerWidth <= 1180) return 232;
@@ -305,6 +315,28 @@ export default function App() {
     setEditingServer(undefined);
     setSelectedServerId(nextServer.id);
     openSession(nextServer, true);
+  };
+
+  const copyServer = async (server: ServerProfile) => {
+    const copy = {
+      ...server,
+      id: uid("server"),
+      name: copyServerName(servers, server.name),
+      jumpHost: server.jumpHost ? { ...server.jumpHost } : undefined,
+    };
+    try {
+      if (isTauri()) {
+        await invoke("copy_server_secret", {
+          sourceServerId: server.id,
+          targetServerId: copy.id,
+        });
+      }
+      setServers((current) => [...current, copy]);
+      setSelectedServerId(copy.id);
+    } catch (error) {
+      console.error("Failed to copy server", error);
+      alert(`复制服务器失败：${String(error)}`);
+    }
   };
 
   const deleteServer = (serverId: string) => {
@@ -651,6 +683,7 @@ export default function App() {
               onOpen={(server) => { setSelectedServerId(server.id); openSession(server); }}
               onNewSession={(server) => { setSelectedServerId(server.id); openSession(server, true); }}
               onAddServer={(group) => openServerDialog(undefined, group)}
+              onCopyServer={(server) => { void copyServer(server); }}
               onEditServer={(server) => openServerDialog(server)}
               onDeleteServer={(server) => deleteServer(server.id)}
               onMoveServer={moveServer}
