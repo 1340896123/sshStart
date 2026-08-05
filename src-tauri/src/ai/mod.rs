@@ -10,8 +10,9 @@ use self::{
 use super::{read_secret, ServerProfile};
 use rig::{
     completion::{CompletionModel, Usage},
+    http_client::{HttpClientExt, NoBody},
     message::Message,
-    prelude::{CompletionClient, ModelListingClient, MultiTurnStreamItem, Prompt, StreamingChat},
+    prelude::{CompletionClient, MultiTurnStreamItem, Prompt, StreamingChat},
     providers::openai,
     streaming::StreamedAssistantContent,
     AgentBuilder,
@@ -22,6 +23,16 @@ use tauri::AppHandle;
 use tokio::sync::watch;
 
 const AI_RUN_CANCELLED: &str = "AI 运行已取消";
+
+#[derive(Debug, Deserialize)]
+struct ModelListResponse {
+    data: Vec<ModelListEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelListEntry {
+    id: String,
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -157,13 +168,19 @@ pub(crate) struct AiApprovalReview {
 pub(crate) async fn list_rig_models(config: AiConfig) -> Result<Vec<String>, String> {
     let api_key = api_key(&config)?;
     let client = openai_client(&config, &api_key)?;
-    let mut models = client
-        .list_models()
+    let request = client
+        .get("/models")
+        .map_err(|error| format!("构造模型列表请求失败: {error}"))?
+        .body(NoBody)
+        .map_err(|error| format!("构造模型列表请求失败: {error}"))?;
+    let response = client
+        .send::<_, Vec<u8>>(request)
         .await
         .map_err(|error| format!("获取模型列表失败: {error}"))?
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<Vec<_>>();
+        .into_body()
+        .await
+        .map_err(|error| format!("读取模型列表失败: {error}"))?;
+    let mut models = parse_model_ids(&response)?;
     models.sort_unstable();
     models.dedup();
     if models.is_empty() {
@@ -171,6 +188,19 @@ pub(crate) async fn list_rig_models(config: AiConfig) -> Result<Vec<String>, Str
     } else {
         Ok(models)
     }
+}
+
+fn parse_model_ids(body: &[u8]) -> Result<Vec<String>, String> {
+    serde_json::from_slice::<ModelListResponse>(body)
+        .map(|response| {
+            response
+                .data
+                .into_iter()
+                .map(|model| model.id)
+                .filter(|model| !model.trim().is_empty())
+                .collect()
+        })
+        .map_err(|error| format!("接口返回的模型列表格式无效: {error}"))
 }
 
 #[tauri::command]
@@ -545,7 +575,16 @@ fn default_temperature() -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_approval_review, provider_base_url};
+    use super::{parse_approval_review, parse_model_ids, provider_base_url};
+
+    #[test]
+    fn parses_model_lists_without_optional_openai_fields() {
+        let models = parse_model_ids(
+            br#"{"object":"list","data":[{"id":"deepseek-v4-flash","object":"model","owned_by":"deepseek"}]}"#,
+        )
+        .expect("model list should parse");
+        assert_eq!(models, vec!["deepseek-v4-flash"]);
+    }
 
     #[test]
     fn normalizes_openai_compatible_base_urls() {
