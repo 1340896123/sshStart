@@ -1,4 +1,5 @@
 mod ai;
+mod server_transfer;
 mod storage;
 mod system_icons;
 
@@ -2780,6 +2781,8 @@ pub fn run() {
             storage::save_ai_config,
             storage::save_ai_conversations,
             storage::save_collapsed_groups,
+            server_transfer::read_server_import_file,
+            server_transfer::write_server_export_file,
             get_diagnostic_log_path,
             write_diagnostic_log,
             start_terminal,
@@ -2810,7 +2813,8 @@ pub fn run() {
             ai::review_ai_approval,
             ai::cancel_ai_run,
             ai::resolve_ai_approval,
-            ai::run_ai_agent
+            ai::run_ai_agent,
+            ai::import::parse_ai_server_import
         ])
         .run(tauri::generate_context!())
         .expect("error while running Portico SSH");

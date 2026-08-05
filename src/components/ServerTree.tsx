@@ -6,6 +6,7 @@ import {
   ChevronRight,
   ChevronsUp,
   Copy,
+  Download,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -15,7 +16,9 @@ import {
   Plus,
   Search,
   Server,
+  Sparkles,
   Trash2,
+  Upload,
 } from "lucide-react";
 import { connectionLabel } from "../lib";
 import {
@@ -55,6 +58,10 @@ interface Props {
   onRenameGroup: (currentGroup: string, nextGroup: string) => void;
   onDeleteGroup: (group: string) => void;
   onCollapsedGroupsChange: (groups: string[]) => void;
+  onExportAll: () => void;
+  onImport: () => void;
+  onAiImport: () => void;
+  onExportGroup: (group: string) => void;
 }
 
 interface GroupNode {
@@ -173,6 +180,10 @@ export function ServerTree({
   onRenameGroup,
   onDeleteGroup,
   onCollapsedGroupsChange,
+  onExportAll,
+  onImport,
+  onAiImport,
+  onExportGroup,
 }: Props) {
   const searchRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -560,6 +571,18 @@ export function ServerTree({
         </div>
       </div>
 
+      <div className="server-transfer-actions" aria-label="服务器列表导入导出">
+        <button type="button" className="tree-action-button" title="导出全部服务器" onClick={onExportAll}>
+          <Download size={13} /><span>全量导出</span>
+        </button>
+        <button type="button" className="tree-action-button" title="从 JSON 文件导入服务器" onClick={onImport}>
+          <Upload size={13} /><span>导入</span>
+        </button>
+        <button type="button" className="tree-action-button accent" title="用 AI 解析服务器信息" onClick={onAiImport}>
+          <Sparkles size={13} /><span>AI 导入</span>
+        </button>
+      </div>
+
       <label className="search-field">
         <Search size={14} />
         <input
@@ -676,6 +699,9 @@ export function ServerTree({
               <button role="menuitem" onClick={() => { toggleGroup(contextMenu.group); setContextMenu(undefined); }}>
                 {collapsedGroups.has(groupKey(contextMenu.group)) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                 <span>{collapsedGroups.has(groupKey(contextMenu.group)) ? "展开" : "折叠"}</span>
+              </button>
+              <button role="menuitem" onClick={() => { onExportGroup(contextMenu.group); setContextMenu(undefined); }}>
+                <Download size={14} /><span>导出此分组</span>
               </button>
               {contextMenu.group && (
                 <>

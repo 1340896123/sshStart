@@ -288,7 +288,7 @@ button:disabled {
   flex: 0 1 var(--sidebar-width, 276px);
   min-height: 0;
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
   padding: 14px 10px 10px;
   background: var(--surface);
 }
@@ -684,6 +684,44 @@ body.is-resizing-columns * {
 .sidebar-heading-actions {
   display: flex;
   gap: 4px;
+}
+
+.server-transfer-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.8fr) minmax(0, 1fr);
+  gap: 4px;
+  padding-bottom: 8px;
+}
+
+.tree-action-button {
+  min-width: 0;
+  height: 27px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 5px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-raised);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 550;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 120ms cubic-bezier(0.2, 0, 0, 1), color 120ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.tree-action-button:hover {
+  background: var(--surface-muted);
+  color: var(--fg);
+}
+
+.tree-action-button.accent {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
 }
 
 .eyebrow {
@@ -3969,6 +4007,160 @@ body.is-resizing-rows .system-dock {
   background: var(--danger-soft);
   color: var(--danger);
   font-size: 10px;
+}
+
+.ai-import-dialog {
+  width: min(700px, calc(100vw - 40px));
+}
+
+.ai-import-body {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.ai-import-body .field-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 550;
+  letter-spacing: 0.02em;
+}
+
+.ai-import-textarea {
+  width: 100%;
+  min-height: 178px;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: 0;
+  background: var(--surface);
+  color: var(--fg);
+  font: 400 11px/1.55 var(--font-mono);
+}
+
+.ai-import-textarea:focus {
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.ai-import-hint {
+  color: var(--muted-2);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.ai-import-body .dialog-inline-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 9px;
+  border: 1px solid var(--danger);
+  border-radius: 5px;
+}
+
+.ai-import-preview {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.ai-import-preview-heading {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 9px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.ai-import-preview-heading > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--success);
+  font-weight: 550;
+}
+
+.ai-import-preview-heading small {
+  overflow: hidden;
+  color: var(--muted-2);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-import-preview-list {
+  max-height: 190px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.ai-import-preview-row {
+  min-height: 31px;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 9px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-import-preview-row:last-child {
+  border-bottom: 0;
+}
+
+.ai-import-preview-row strong,
+.ai-import-preview-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-import-preview-row strong {
+  font-size: 10px;
+  font-weight: 550;
+}
+
+.ai-import-preview-row span {
+  color: var(--muted);
+  font: 400 9px/1.4 var(--font-mono);
+}
+
+.ai-import-success {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--success);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--success);
+  font-size: 10px;
+}
+
+.dialog-footer-note {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--muted-2);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.visually-hidden {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .primary-button,

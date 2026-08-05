@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   Bell,
   Braces,
@@ -17,6 +18,7 @@ import {
   X,
 } from "lucide-react";
 import { AiPane } from "./components/AiPane";
+import { AiImportDialog } from "./components/AiImportDialog";
 import { ColumnSplitter } from "./components/ColumnSplitter";
 import { FilePane } from "./components/FilePane";
 import { ServerDialog } from "./components/ServerDialog";
@@ -30,6 +32,14 @@ import { initializeAiConversations } from "./aiHistory";
 import { DEMO_SERVER, isTauri, uid } from "./lib";
 import { normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
 import {
+  AI_IMPORT_GROUP,
+  materializeServerDrafts,
+  parseServerImportText,
+  selectGroupsInGroup,
+  selectServersInGroup,
+  serializeServerExport,
+} from "./serverImportExport";
+import {
   loadAppStorage,
   saveAiConfig as saveAiConfigToStorage,
   saveCollapsedGroups,
@@ -38,6 +48,7 @@ import {
 } from "./storage";
 import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
 import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
+import type { ServerImportDraft, ServerImportSummary } from "./serverImportExport";
 
 const serializeAiConfig = (config: AiConfig) => {
   if (!isTauri()) return config;
@@ -94,6 +105,7 @@ export default function App() {
   const [serverDialogGroup, setServerDialogGroup] = useState<string>();
   const [selectedServerId, setSelectedServerId] = useState<string>();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [aiImportOpen, setAiImportOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
   const cancelledTransfers = useRef(new Set<string>());
@@ -103,6 +115,7 @@ export default function App() {
     speedBytesPerSecond: number;
   }>());
   const appBodyRef = useRef<HTMLDivElement>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
 
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const activeServer = servers.find((server) => server.id === activeSession?.serverId);
@@ -596,6 +609,118 @@ export default function App() {
     if (normalized) setSavedGroups((current) => current.includes(normalized) ? current : [...current, normalized]);
   };
 
+  const downloadInBrowser = (content: string, fileName: string) => {
+    const blob = new Blob([content], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const exportServerList = async (scope?: string) => {
+    const selected = scope === undefined ? servers : selectServersInGroup(servers, scope);
+    if (!selected.length) {
+      alert(scope !== undefined ? "这个分组没有可导出的服务器" : "当前没有可导出的服务器");
+      return;
+    }
+    const exportGroups = scope === undefined ? savedGroups : selectGroupsInGroup(savedGroups, scope);
+    const content = serializeServerExport(selected, exportGroups, scope);
+    const safeName = scope !== undefined
+      ? (normalizeGroupPath(scope).replace(/[\\/:*?"<>|]+/g, "-") || "ungrouped")
+      : "portico-servers";
+    try {
+      if (!isTauri()) {
+        downloadInBrowser(content, `${safeName}.json`);
+        return;
+      }
+      const path = await saveFileDialog({
+        defaultPath: `${safeName}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (path) await invoke("write_server_export_file", { path, content });
+    } catch (error) {
+      alert(`导出服务器失败：${String(error)}`);
+    }
+  };
+
+  const storeImportedSecrets = async (importedServers: ServerProfile[]) => {
+    if (!isTauri()) return;
+    await Promise.all(importedServers
+      .filter((server) => server.password || server.passphrase || server.jumpHost?.password || server.jumpHost?.passphrase)
+      .map((server) => invoke("store_server_secret", {
+        serverId: server.id,
+        password: server.password ?? null,
+        passphrase: server.passphrase ?? null,
+        jumpPassword: server.jumpHost?.password ?? null,
+        jumpPassphrase: server.jumpHost?.passphrase ?? null,
+      })));
+  };
+
+  const commitImportedServers = async (
+    drafts: ServerImportDraft[],
+    groups: string[] = [],
+    forcedGroup?: string,
+  ): Promise<ServerImportSummary> => {
+    const materialized = materializeServerDrafts(drafts, servers, forcedGroup);
+    if (!materialized.servers.length) {
+      return { imported: 0, skipped: materialized.skipped, groups: 0 };
+    }
+    await storeImportedSecrets(materialized.servers);
+    setServers((current) => [...current, ...materialized.servers]);
+    const nextGroups = [...new Set([...groups, ...materialized.groups].map(normalizeGroupPath).filter(Boolean))];
+    if (nextGroups.length) setSavedGroups((current) => [...new Set([...current, ...nextGroups])]);
+    setSelectedServerId(materialized.servers[materialized.servers.length - 1]?.id);
+    return {
+      imported: materialized.servers.length,
+      skipped: materialized.skipped,
+      groups: nextGroups.length,
+    };
+  };
+
+  const importServerText = async (rawText: string) => {
+    try {
+      const parsed = parseServerImportText(rawText);
+      const summary = await commitImportedServers(parsed.drafts, parsed.groups);
+      const skipped = summary.skipped + parsed.skipped;
+      alert(`已导入 ${summary.imported} 台服务器${skipped ? `，跳过 ${skipped} 条重复或无效记录` : ""}。`);
+    } catch (error) {
+      alert(`导入服务器失败：${String(error)}`);
+    }
+  };
+
+  const importServerList = async () => {
+    if (!isTauri()) {
+      importFileRef.current?.click();
+      return;
+    }
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      const path = Array.isArray(picked) ? picked[0] : picked;
+      if (!path) return;
+      const rawText = await invoke<string>("read_server_import_file", { path });
+      await importServerText(rawText);
+    } catch (error) {
+      alert(`导入服务器失败：${String(error)}`);
+    }
+  };
+
+  const parseAiServerList = async (input: string) => {
+    if (!isTauri()) throw new Error("AI 导入仅在桌面应用中可用");
+    return invoke<ServerImportDraft[]>("parse_ai_server_import", {
+      config: serializeAiConfig(aiConfig),
+      input,
+    });
+  };
+
+  const importAiServerList = (drafts: ServerImportDraft[]) =>
+    commitImportedServers(drafts, [AI_IMPORT_GROUP], AI_IMPORT_GROUP);
+
   const activeTransferCount = transfers.filter((task) => task.status === "queued" || task.status === "running" || task.status === "paused").length;
 
   const resizeSidebar = (nextWidth: number) => {
@@ -691,6 +816,10 @@ export default function App() {
               onRenameGroup={renameGroup}
               onDeleteGroup={deleteGroup}
               onCollapsedGroupsChange={setCollapsedGroups}
+              onExportAll={() => { void exportServerList(); }}
+              onImport={() => { void importServerList(); }}
+              onAiImport={() => setAiImportOpen(true)}
+              onExportGroup={(group) => { void exportServerList(group); }}
             />
           </aside>
         )}
@@ -815,6 +944,25 @@ export default function App() {
           onClose={() => { setServerDialogOpen(false); setEditingServer(undefined); setServerDialogGroup(undefined); }}
           onSave={saveServer}
           onDelete={editingServer ? () => { deleteServer(editingServer.id); setServerDialogOpen(false); setEditingServer(undefined); } : undefined}
+        />
+      )}
+      <input
+        ref={importFileRef}
+        className="visually-hidden"
+        type="file"
+        accept="application/json,.json"
+        tabIndex={-1}
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = "";
+          if (file) void file.text().then(importServerText);
+        }}
+      />
+      {aiImportOpen && (
+        <AiImportDialog
+          onClose={() => setAiImportOpen(false)}
+          onParse={parseAiServerList}
+          onImport={importAiServerList}
         />
       )}
       {settingsOpen && <SettingsDialog config={aiConfig} onSave={saveAiConfig} onRemoveSavedKey={removeSavedAiKey} onClose={() => setSettingsOpen(false)} />}
