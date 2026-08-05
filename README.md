@@ -42,3 +42,14 @@ Cloud sync is intentionally backend-agnostic. Configure the API root in Settings
 - `PUT /sync/data` with a bearer token and `{ "ciphertext": string, "updatedAt": number }`.
 
 The `ciphertext` value is an AES-256-GCM envelope containing a random nonce and the complete server/settings snapshot. The encryption key is generated locally and stored at `~/.porticossh/sync.key`; it is never sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
+
+## Included cloud sync backend
+
+The repository includes a self-hosted implementation in `server/`. It uses Node.js 24's built-in HTTP, cryptography, and SQLite support, hashes passwords with scrypt, issues seven-day HMAC-SHA256 bearer tokens, rate-limits authentication attempts, and stores snapshots per account without decrypting them.
+
+```powershell
+$env:PORTICO_SYNC_TOKEN_SECRET = node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
+npm run sync-server
+```
+
+Configure the desktop app with `http://127.0.0.1:8787` for local development. For a public deployment, serve it behind HTTPS. See `server/README.md` for environment variables, Docker usage, and tests.

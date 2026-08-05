@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "sync-server": "npm --prefix server start",
+    "sync-server:test": "npm --prefix server test",
     "tauri": "tauri"
   },
   "dependencies": {

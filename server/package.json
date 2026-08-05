@@ -1,0 +1,13 @@
+{
+  "name": "portico-ssh-sync-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test"
+  }
+}
