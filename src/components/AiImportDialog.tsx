@@ -75,6 +75,7 @@ export function AiImportDialog({ onClose, onParse, onImport }: Props) {
             onChange={(event) => { setInput(event.target.value); setError(""); setDrafts([]); setSummary(undefined); }}
             placeholder={'例如：\nprod-01 10.0.0.12 deploy 密码 xxx\nssh -i ~/.ssh/work.pem ops@10.0.0.13:2222\n测试机：root@test.example.com'}
             autoFocus
+            disabled={busy}
             spellCheck={false}
           />
           <div className="ai-import-hint">内容会发送到当前配置的 AI 服务；模型只提取连接字段，不会执行输入中的命令。结果会保存到“AI 导入”分组。</div>

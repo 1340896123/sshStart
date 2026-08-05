@@ -5,6 +5,7 @@ import type { AuthType, JumpHostProfile, ServerProfile } from "./types";
 export const SERVER_EXPORT_FORMAT = "portico-server-list";
 export const SERVER_EXPORT_VERSION = 1;
 export const AI_IMPORT_GROUP = "AI 导入";
+export const MAX_SERVER_IMPORT_RECORDS = 5_000;
 
 export interface ServerImportDraft {
   name?: string;
@@ -108,6 +109,9 @@ export const parseServerImportText = (rawText: string): ServerImportParseResult 
       : Array.isArray(root?.data)
         ? root.data
         : [];
+  if (values.length > MAX_SERVER_IMPORT_RECORDS) {
+    throw new Error(`单次最多导入 ${MAX_SERVER_IMPORT_RECORDS} 台服务器`);
+  }
   const groups = (Array.isArray(root?.groups) ? root.groups : [])
     .map(textValue)
     .map(normalizeGroupPath)
@@ -166,8 +170,30 @@ export const selectGroupsInGroup = (groups: string[], group: string) => {
   return groups.filter((candidate) => isGroupWithin(candidate, normalizedGroup));
 };
 
-const serverIdentity = (server: Pick<ServerProfile, "host" | "port" | "username">) =>
-  `${server.username.trim().toLocaleLowerCase()}@${server.host.trim().toLocaleLowerCase()}:${server.port}`;
+type ServerIdentityInput = Pick<
+  ServerProfile,
+  "name" | "group" | "host" | "port" | "username" | "authType" | "privateKeyPath" | "jumpHost"
+>;
+
+const serverIdentity = (server: ServerIdentityInput) => JSON.stringify([
+  server.name.trim().toLocaleLowerCase(),
+  normalizeGroupPath(server.group).toLocaleLowerCase(),
+  server.username.trim().toLocaleLowerCase(),
+  server.host.trim().toLocaleLowerCase(),
+  server.port,
+  server.authType,
+  textValue(server.privateKeyPath),
+  server.jumpHost
+    ? [
+        server.jumpHost.enabled,
+        server.jumpHost.username.trim().toLocaleLowerCase(),
+        server.jumpHost.host.trim().toLocaleLowerCase(),
+        server.jumpHost.port,
+        server.jumpHost.authType,
+        textValue(server.jumpHost.privateKeyPath),
+      ]
+    : null,
+]);
 
 export const materializeServerDrafts = (
   drafts: ServerImportDraft[],
@@ -183,12 +209,28 @@ export const materializeServerDrafts = (
     const port = portValue(draft.port);
     const username = textValue(draft.username) || "root";
     const host = textValue(draft.host);
-    const identity = serverIdentity({ host, port, username });
+    const baseName = textValue(draft.name) || `${username}@${host}`;
+    const privateKeyPath = textValue(draft.privateKeyPath) || undefined;
+    const authType = draft.authType === "key"
+      ? "key"
+      : draft.authType === "password"
+        ? "password"
+        : privateKeyPath ? "key" : "password";
+    const jumpHost = normalizeJumpHost(draft.jumpHost);
+    const identity = serverIdentity({
+      name: baseName,
+      group: normalizedGroup,
+      host,
+      port,
+      username,
+      authType,
+      privateKeyPath,
+      jumpHost,
+    });
     if (!host || identities.has(identity)) {
       skipped += 1;
       return;
     }
-    const baseName = textValue(draft.name) || `${username}@${host}`;
     let name = baseName;
     let suffix = 2;
     while (names.has(name.toLocaleLowerCase())) {
@@ -202,18 +244,14 @@ export const materializeServerDrafts = (
       host,
       port,
       username,
-      authType: draft.authType === "key"
-        ? "key"
-        : draft.authType === "password"
-          ? "password"
-          : draft.privateKeyPath ? "key" : "password",
+      authType,
       password: textValue(draft.password) || undefined,
-      privateKeyPath: textValue(draft.privateKeyPath) || undefined,
+      privateKeyPath,
       passphrase: textValue(draft.passphrase) || undefined,
       color: "var(--accent)",
-      jumpHost: normalizeJumpHost(draft.jumpHost),
+      jumpHost,
     };
-    identities.add(identity);
+    identities.add(serverIdentity(server));
     names.add(name.toLocaleLowerCase());
     servers.push(server);
   });

@@ -4,29 +4,86 @@ use rig::{
     prelude::{CompletionClient, Prompt},
     AgentBuilder,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde_json::{Map, Value};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AiImportedServer {
-    #[serde(default)]
     name: String,
-    #[serde(default)]
     host: String,
-    #[serde(default = "default_ssh_port")]
     port: u16,
-    #[serde(default = "default_ssh_username")]
     username: String,
-    #[serde(default = "default_auth_type")]
     auth_type: String,
-    #[serde(default)]
     password: Option<String>,
-    #[serde(default)]
     private_key_path: Option<String>,
-    #[serde(default)]
     passphrase: Option<String>,
-    #[serde(default)]
-    jump_host: Option<serde_json::Value>,
+    jump_host: Option<Value>,
+}
+
+fn ai_string_field(object: &Map<String, Value>, field: &str) -> String {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn ai_optional_string_field(object: &Map<String, Value>, field: &str) -> Option<String> {
+    let value = ai_string_field(object, field);
+    (!value.is_empty()).then_some(value)
+}
+
+fn ai_port_field(object: &Map<String, Value>) -> u16 {
+    object
+        .get("port")
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_u64().and_then(|port| u16::try_from(port).ok()),
+            Value::String(port) => port.trim().parse::<u16>().ok(),
+            _ => None,
+        })
+        .filter(|port| *port > 0)
+        .unwrap_or_else(default_ssh_port)
+}
+
+fn parse_ai_server_value(value: Value, index: usize) -> Result<AiImportedServer, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("第 {} 条服务器记录必须是对象", index + 1))?;
+    let host = ai_string_field(object, "host");
+    if host.is_empty() {
+        return Err(format!("第 {} 条服务器记录缺少 host", index + 1));
+    }
+    let private_key_path = ai_optional_string_field(object, "privateKeyPath");
+    let auth_type = match ai_string_field(object, "authType")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "key" => "key".to_string(),
+        "password" => "password".to_string(),
+        _ if private_key_path.is_some() => "key".to_string(),
+        _ => default_auth_type(),
+    };
+    let username = ai_string_field(object, "username");
+    Ok(AiImportedServer {
+        name: ai_string_field(object, "name"),
+        host,
+        port: ai_port_field(object),
+        username: if username.is_empty() {
+            default_ssh_username()
+        } else {
+            username
+        },
+        auth_type,
+        password: ai_optional_string_field(object, "password"),
+        private_key_path,
+        passphrase: ai_optional_string_field(object, "passphrase"),
+        jump_host: object
+            .get("jumpHost")
+            .filter(|value| !value.is_null())
+            .cloned(),
+    })
 }
 
 #[tauri::command]
@@ -106,42 +163,19 @@ fn parse_ai_server_response(response: &str) -> Result<Vec<AiImportedServer>, Str
     if values.len() > 200 {
         return Err("AI 单次最多导入 200 台服务器".to_string());
     }
-    values
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let mut server = serde_json::from_value::<AiImportedServer>(value)
-                .map_err(|error| format!("第 {} 条服务器记录格式无效: {error}", index + 1))?;
-            server.name = server.name.trim().to_string();
-            server.host = server.host.trim().to_string();
-            server.username = if server.username.trim().is_empty() {
-                default_ssh_username()
-            } else {
-                server.username.trim().to_string()
-            };
-            if server.host.is_empty() {
-                return Err(format!("第 {} 条服务器记录缺少 host", index + 1));
-            }
-            if server.port == 0 {
-                server.port = default_ssh_port();
-            }
-            server.auth_type = match server.auth_type.trim().to_ascii_lowercase().as_str() {
-                "key" => "key".to_string(),
-                "password" => "password".to_string(),
-                _ if server
-                    .private_key_path
-                    .as_deref()
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty() =>
-                {
-                    default_auth_type()
-                }
-                _ => "key".to_string(),
-            };
-            Ok(server)
-        })
-        .collect()
+    let mut servers = Vec::with_capacity(values.len());
+    let mut first_error = None;
+    for (index, value) in values.into_iter().enumerate() {
+        match parse_ai_server_value(value, index) {
+            Ok(server) => servers.push(server),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    if servers.is_empty() {
+        return Err(first_error.unwrap_or_else(|| "AI 未识别出服务器记录".to_string()));
+    }
+    Ok(servers)
 }
 
 fn default_ssh_port() -> u16 {
@@ -180,6 +214,27 @@ mod tests {
         assert_eq!(servers[0].port, 22);
         assert_eq!(servers[0].username, "root");
         assert_eq!(servers[0].auth_type, "password");
+    }
+
+    #[test]
+    fn accepts_nullable_fields_and_string_ports() {
+        let servers = parse_ai_server_response(
+            "[{\"name\":null,\"host\":\"example.test\",\"port\":\"2222\",\"username\":null,\"authType\":null}]",
+        )
+        .expect("nullable optional fields should parse");
+        assert_eq!(servers[0].name, "");
+        assert_eq!(servers[0].port, 2222);
+        assert_eq!(servers[0].username, "root");
+        assert_eq!(servers[0].auth_type, "password");
+    }
+
+    #[test]
+    fn keeps_valid_servers_when_other_records_are_invalid() {
+        let servers =
+            parse_ai_server_response("[{\"name\":\"missing host\"},{\"host\":\"valid.example\"}]")
+                .expect("valid records should survive malformed siblings");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].host, "valid.example");
     }
 
     #[test]

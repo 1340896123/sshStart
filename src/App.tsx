@@ -50,7 +50,7 @@ import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
 import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
 import type { ServerImportDraft, ServerImportSummary } from "./serverImportExport";
 
-const serializeAiConfig = (config: AiConfig) => {
+const serializeAiConfigForStorage = (config: AiConfig) => {
   if (!isTauri()) return config;
   const { apiKey: _apiKey, ...persistedConfig } = config;
   return persistedConfig;
@@ -61,6 +61,8 @@ const SIDEBAR_MAX_WIDTH = 420;
 const AI_PANE_MIN_WIDTH = 300;
 const AI_PANE_MAX_WIDTH = 520;
 const COLUMN_SPLITTER_WIDTH = 7;
+const MAX_SERVER_IMPORT_BYTES = 10 * 1024 * 1024;
+const SECRET_STORE_CONCURRENCY = 8;
 
 const clampWidth = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
@@ -156,7 +158,7 @@ export default function App() {
 
   useEffect(() => {
     if (!storageReady) return;
-    void saveAiConfigToStorage(serializeAiConfig(aiConfig))
+    void saveAiConfigToStorage(serializeAiConfigForStorage(aiConfig))
       .catch((error) => console.error("Failed to save AI configuration", error));
   }, [aiConfig, storageReady]);
 
@@ -647,15 +649,17 @@ export default function App() {
 
   const storeImportedSecrets = async (importedServers: ServerProfile[]) => {
     if (!isTauri()) return;
-    await Promise.all(importedServers
-      .filter((server) => server.password || server.passphrase || server.jumpHost?.password || server.jumpHost?.passphrase)
-      .map((server) => invoke("store_server_secret", {
+    const serversWithSecrets = importedServers
+      .filter((server) => server.password || server.passphrase || server.jumpHost?.password || server.jumpHost?.passphrase);
+    for (let offset = 0; offset < serversWithSecrets.length; offset += SECRET_STORE_CONCURRENCY) {
+      await Promise.all(serversWithSecrets.slice(offset, offset + SECRET_STORE_CONCURRENCY).map((server) => invoke("store_server_secret", {
         serverId: server.id,
         password: server.password ?? null,
         passphrase: server.passphrase ?? null,
         jumpPassword: server.jumpHost?.password ?? null,
         jumpPassphrase: server.jumpHost?.passphrase ?? null,
       })));
+    }
   };
 
   const commitImportedServers = async (
@@ -713,7 +717,7 @@ export default function App() {
   const parseAiServerList = async (input: string) => {
     if (!isTauri()) throw new Error("AI 导入仅在桌面应用中可用");
     return invoke<ServerImportDraft[]>("parse_ai_server_import", {
-      config: serializeAiConfig(aiConfig),
+      config: aiConfig,
       input,
     });
   };
@@ -955,7 +959,14 @@ export default function App() {
         onChange={(event) => {
           const file = event.currentTarget.files?.[0];
           event.currentTarget.value = "";
-          if (file) void file.text().then(importServerText);
+          if (!file) return;
+          if (file.size > MAX_SERVER_IMPORT_BYTES) {
+            alert("导入文件不能超过 10 MB");
+            return;
+          }
+          void file.text()
+            .then(importServerText)
+            .catch((error) => alert(`读取导入文件失败：${String(error)}`));
         }}
       />
       {aiImportOpen && (
