@@ -36,13 +36,24 @@ interface ServerExportDocument {
   format: typeof SERVER_EXPORT_FORMAT;
   version: typeof SERVER_EXPORT_VERSION;
   exportedAt: string;
-  includeSecrets: false;
+  includeSecrets: boolean;
   scope?: string;
   groups: string[];
-  servers: Array<Omit<ServerProfile, "password" | "passphrase" | "jumpHost"> & {
-    jumpHost?: Omit<JumpHostProfile, "password" | "passphrase">;
-  }>;
+  servers: ServerExportRecord[];
 }
+
+export interface ServerExportOptions {
+  includeSecrets?: boolean;
+}
+
+type ServerExportRecord = Omit<ServerProfile, "password" | "passphrase" | "jumpHost"> & {
+  password?: string;
+  passphrase?: string;
+  jumpHost?: Omit<JumpHostProfile, "password" | "passphrase"> & {
+    password?: string;
+    passphrase?: string;
+  };
+};
 
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -126,7 +137,7 @@ export const parseServerImportText = (rawText: string): ServerImportParseResult 
   return { drafts, groups: [...new Set(groups)], skipped };
 };
 
-const safeServerForExport = (server: ServerProfile): ServerExportDocument["servers"][number] => {
+const safeServerForExport = (server: ServerProfile): ServerExportRecord => {
   const { password: _password, passphrase: _passphrase, jumpHost, ...safeServer } = server;
   const safeJumpHost = jumpHost
     ? (({ password: _jumpPassword, passphrase: _jumpPassphrase, ...rest }) => rest)(jumpHost)
@@ -134,28 +145,33 @@ const safeServerForExport = (server: ServerProfile): ServerExportDocument["serve
   return { ...safeServer, jumpHost: safeJumpHost };
 };
 
+const serverForExport = (server: ServerProfile, includeSecrets: boolean): ServerExportRecord =>
+  includeSecrets ? { ...server, jumpHost: server.jumpHost ? { ...server.jumpHost } : undefined } : safeServerForExport(server);
+
 export const buildServerExportDocument = (
   servers: ServerProfile[],
   savedGroups: string[],
   scope?: string,
+  options: ServerExportOptions = {},
 ): ServerExportDocument => ({
   format: SERVER_EXPORT_FORMAT,
   version: SERVER_EXPORT_VERSION,
   exportedAt: new Date().toISOString(),
-  includeSecrets: false,
+  includeSecrets: options.includeSecrets ?? true,
   ...(scope !== undefined ? { scope: normalizeGroupPath(scope) || "未分组" } : {}),
   groups: [...new Set([
     ...savedGroups.map(normalizeGroupPath).filter(Boolean),
     ...servers.map((server) => normalizeGroupPath(server.group)).filter(Boolean),
   ])],
-  servers: servers.map(safeServerForExport),
+  servers: servers.map((server) => serverForExport(server, options.includeSecrets ?? true)),
 });
 
 export const serializeServerExport = (
   servers: ServerProfile[],
   savedGroups: string[],
   scope?: string,
-) => JSON.stringify(buildServerExportDocument(servers, savedGroups, scope), null, 2);
+  options?: ServerExportOptions,
+) => JSON.stringify(buildServerExportDocument(servers, savedGroups, scope, options), null, 2);
 
 export const selectServersInGroup = (servers: ServerProfile[], group: string) => {
   const normalizedGroup = normalizeGroupPath(group);

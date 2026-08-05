@@ -93,7 +93,7 @@ const TOOL_GROUPS: Array<{
   },
 ];
 
-type SettingsSection = "model" | "agent" | "tools" | "transfer" | "security";
+type SettingsSection = "model" | "agent" | "tools" | "transfer" | "server-data" | "security";
 type ModelPickerTarget = "agent" | "reviewer";
 
 const SETTINGS_SECTIONS: Array<{
@@ -106,6 +106,7 @@ const SETTINGS_SECTIONS: Array<{
   { id: "agent", label: "Agent", description: "运行参数与系统提示词", icon: SlidersHorizontal },
   { id: "tools", label: "工具能力", description: "终端、诊断与服务工具", icon: Wrench },
   { id: "transfer", label: "文件传输", description: "文件系统与 SFTP 权限", icon: Upload },
+  { id: "server-data", label: "导入导出", description: "服务器列表与密钥策略", icon: Download },
   { id: "security", label: "安全策略", description: "高危拦截与变更边界", icon: ShieldCheck },
 ];
 
@@ -310,7 +311,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
           <header className="settings-page-header">
             {activeSectionMeta ? (
               <div>
-                <span>AI 配置</span>
+                <span>{visibleActiveSection === "server-data" ? "服务器设置" : "AI 配置"}</span>
                 <h2 id="settings-page-title">{activeSectionMeta.label}</h2>
                 <p>{activeSectionMeta.description}</p>
               </div>
@@ -418,6 +419,32 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
               <>
                 <div className="settings-section-summary"><div><strong>文件与 SFTP</strong><small>控制模型可使用的远端文件和传输能力</small></div></div>
                 <div className="settings-tool-groups">{renderToolGroup(TOOL_GROUPS[1])}</div>
+              </>
+            )}
+
+            {visibleActiveSection === "server-data" && (
+              <>
+                <section className="settings-panel">
+                  <header><strong>服务器导入</strong><small>从 JSON 文件批量创建服务器；文件中的分组信息会被保留</small></header>
+                  <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>默认导入分组</strong><small>当记录没有提供分组时使用；留空则导入到未分组</small></span>
+                    <input className="settings-input" value={value.serverImportExport.defaultImportGroup} onChange={(event) => setValue({ ...value, serverImportExport: { ...value.serverImportExport, defaultImportGroup: event.target.value } })} placeholder="例如：生产环境" />
+                  </label>
+                  <div className="settings-config-row">
+                    <span className="settings-row-copy"><strong>支持的格式</strong><small>兼容 Portico 导出的文件，也接受服务器数组或包含 servers/data 数组的 JSON</small></span>
+                    <span className="settings-static-value">JSON / Portico Server List</span>
+                  </div>
+                </section>
+                <section className="settings-panel">
+                  <header><strong>服务器导出</strong><small>导出当前列表或选定分组，便于备份和迁移</small></header>
+                  <label className="mutating-tools-toggle">
+                    <span className="tool-permission-icon"><KeyRound size={14} /></span>
+                    <span className="tool-permission-copy"><strong>导出包含密钥和密码</strong><small>包含密码、跳板机口令和密钥口令；私钥文件本身不会复制到导出文件</small></span>
+                    <input type="checkbox" checked={value.serverImportExport.includeSecretsInExport} onChange={(event) => setValue({ ...value, serverImportExport: { ...value.serverImportExport, includeSecretsInExport: event.target.checked } })} />
+                    <span className="switch" aria-hidden="true" />
+                  </label>
+                </section>
+                <div className="settings-note"><CircleAlert size={15} /><span>启用密钥导出后，生成的 JSON 会包含登录密码和口令。请只通过安全渠道传输，并在迁移完成后及时删除文件。</span></div>
               </>
             )}
 

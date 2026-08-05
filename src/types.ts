@@ -258,6 +258,16 @@ export const DEFAULT_AI_TOOL_SETTINGS: AiToolSettings = {
 
 export type AiApiMode = "chat-completions" | "responses";
 
+export interface ServerImportExportSettings {
+  defaultImportGroup: string;
+  includeSecretsInExport: boolean;
+}
+
+export const DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS: ServerImportExportSettings = {
+  defaultImportGroup: "",
+  includeSecretsInExport: true,
+};
+
 export interface AiConfig {
   apiMode: AiApiMode;
   endpoint: string;
@@ -269,10 +279,12 @@ export interface AiConfig {
   temperature: number;
   systemPrompt: string;
   tools: AiToolSettings;
+  serverImportExport: ServerImportExportSettings;
 }
 
-type AiConfigInput = Omit<Partial<AiConfig>, "tools"> & {
+type AiConfigInput = Omit<Partial<AiConfig>, "tools" | "serverImportExport"> & {
   tools?: Partial<AiToolSettings>;
+  serverImportExport?: Partial<ServerImportExportSettings>;
 };
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
@@ -287,6 +299,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   systemPrompt:
     "你是 Portico SSH 的 Rig 运维 Agent。先观察再行动，优先使用结构化工具获取事实；明确说明风险和执行结果。不要声称读取过尚未通过工具访问的文件，高风险或变更型动作必须等待人工审批。",
   tools: DEFAULT_AI_TOOL_SETTINGS,
+  serverImportExport: DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,
 };
 
 export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig = DEFAULT_AI_CONFIG): AiConfig {
@@ -301,6 +314,11 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
     temperature: config.temperature ?? fallback.temperature,
     systemPrompt: config.systemPrompt ?? fallback.systemPrompt,
     tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...fallback.tools, ...(config.tools ?? {}) },
+    serverImportExport: {
+      ...DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,
+      ...fallback.serverImportExport,
+      ...(config.serverImportExport ?? {}),
+    },
   };
 }
 

@@ -413,6 +413,29 @@ fn hydrate_server_secrets(server: &ServerProfile) -> ServerProfile {
     hydrated
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerSecretBundle {
+    password: Option<String>,
+    passphrase: Option<String>,
+    jump_password: Option<String>,
+    jump_passphrase: Option<String>,
+}
+
+#[tauri::command]
+fn load_server_secrets(server_id: String) -> Result<ServerSecretBundle, String> {
+    let server_id = server_id.trim();
+    if server_id.is_empty() {
+        return Err("服务器标识不能为空".to_string());
+    }
+    Ok(ServerSecretBundle {
+        password: read_secret(&format!("server:{server_id}:password")),
+        passphrase: read_secret(&format!("server:{server_id}:passphrase")),
+        jump_password: read_secret(&format!("server:{server_id}:jump:password")),
+        jump_passphrase: read_secret(&format!("server:{server_id}:jump:passphrase")),
+    })
+}
+
 fn resolve_address(server: &ServerProfile) -> Result<SocketAddr, String> {
     (server.host.as_str(), server.port)
         .to_socket_addrs()
@@ -2770,6 +2793,7 @@ pub fn run() {
         .manage(ai::AiRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             store_server_secret,
+            load_server_secrets,
             copy_server_secret,
             delete_server_secret,
             store_ai_key,

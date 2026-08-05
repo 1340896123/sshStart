@@ -64,6 +64,13 @@ const COLUMN_SPLITTER_WIDTH = 7;
 const MAX_SERVER_IMPORT_BYTES = 10 * 1024 * 1024;
 const SECRET_STORE_CONCURRENCY = 8;
 
+interface ServerSecretBundle {
+  password?: string;
+  passphrase?: string;
+  jumpPassword?: string;
+  jumpPassphrase?: string;
+}
+
 const clampWidth = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
 const copyServerName = (servers: ServerProfile[], sourceName: string) => {
@@ -628,11 +635,29 @@ export default function App() {
       return;
     }
     const exportGroups = scope === undefined ? savedGroups : selectGroupsInGroup(savedGroups, scope);
-    const content = serializeServerExport(selected, exportGroups, scope);
     const safeName = scope !== undefined
       ? (normalizeGroupPath(scope).replace(/[\\/:*?"<>|]+/g, "-") || "ungrouped")
       : "portico-servers";
     try {
+      const includeSecrets = aiConfig.serverImportExport.includeSecretsInExport;
+      const exportServers = includeSecrets && isTauri()
+        ? await Promise.all(selected.map(async (server) => {
+            const secrets = await invoke<ServerSecretBundle>("load_server_secrets", { serverId: server.id });
+            return {
+              ...server,
+              password: secrets.password ?? server.password,
+              passphrase: secrets.passphrase ?? server.passphrase,
+              jumpHost: server.jumpHost
+                ? {
+                    ...server.jumpHost,
+                    password: secrets.jumpPassword ?? server.jumpHost.password,
+                    passphrase: secrets.jumpPassphrase ?? server.jumpHost.passphrase,
+                  }
+                : server.jumpHost,
+            };
+          }))
+        : selected;
+      const content = serializeServerExport(exportServers, exportGroups, scope, { includeSecrets });
       if (!isTauri()) {
         downloadInBrowser(content, `${safeName}.json`);
         return;
@@ -686,7 +711,11 @@ export default function App() {
   const importServerText = async (rawText: string) => {
     try {
       const parsed = parseServerImportText(rawText);
-      const summary = await commitImportedServers(parsed.drafts, parsed.groups);
+      const defaultGroup = normalizeGroupPath(aiConfig.serverImportExport.defaultImportGroup);
+      const drafts = defaultGroup
+        ? parsed.drafts.map((draft) => draft.group ? draft : { ...draft, group: defaultGroup })
+        : parsed.drafts;
+      const summary = await commitImportedServers(drafts, parsed.groups);
       const skipped = summary.skipped + parsed.skipped;
       alert(`已导入 ${summary.imported} 台服务器${skipped ? `，跳过 ${skipped} 条重复或无效记录` : ""}。`);
     } catch (error) {
