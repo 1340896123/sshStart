@@ -1885,7 +1885,117 @@ body.is-resizing-rows .system-dock {
 
 .file-pane {
   position: relative;
-  grid-template-rows: 34px 32px minmax(0, 1fr) 22px;
+  grid-template-rows: 34px 28px 32px minmax(0, 1fr) 22px;
+}
+
+.file-list-tabs {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.file-list-tab-scroll {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-self: stretch;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.file-list-tab-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.file-list-tab {
+  min-width: 76px;
+  max-width: 180px;
+  height: 25px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 5px 5px 0 0;
+  color: var(--muted);
+}
+
+.file-list-tab:hover {
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+
+.file-list-tab.active {
+  border-color: var(--border);
+  background: var(--surface-raised);
+  color: var(--fg);
+}
+
+.file-list-tab-select,
+.file-list-tab-close,
+.file-list-add {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.file-list-tab-select {
+  min-width: 0;
+  height: 100%;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 4px 0 7px;
+  font-size: 9px;
+}
+
+.file-list-tab-select svg,
+.file-list-tab-close svg {
+  flex: 0 0 auto;
+}
+
+.file-list-tab-select span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-list-tab-close {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  margin-right: 2px;
+  border-radius: 4px;
+}
+
+.file-list-tab-close:hover,
+.file-list-add:hover {
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+
+.file-list-add {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+}
+
+.file-list-tab-select:focus-visible,
+.file-list-tab-close:focus-visible,
+.file-list-add:focus-visible {
+  outline: 1px solid var(--border-strong);
+  outline-offset: -1px;
 }
 
 .file-toolbar {
@@ -1929,6 +2039,10 @@ body.is-resizing-rows .system-dock {
   color: var(--fg);
   font-family: var(--font-mono);
   font-size: 9px;
+}
+
+.path-copy-button {
+  flex: 0 0 auto;
 }
 
 .file-search {

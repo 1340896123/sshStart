@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -18,11 +18,13 @@ import {
   FolderPlus,
   Home,
   Pencil,
+  Plus,
   RefreshCw,
   Search,
   Trash2,
+  X,
 } from "lucide-react";
-import { formatBytes, isTauri, joinRemotePath, parentPath } from "../lib";
+import { formatBytes, isTauri, joinRemotePath, parentPath, uid } from "../lib";
 import type { RemoteFile, ServerProfile, SessionState, TransferRequest } from "../types";
 
 interface Props {
@@ -36,6 +38,18 @@ type SortKey = "name" | "size" | "modified" | "permissions";
 type SortDirection = "asc" | "desc";
 type ColumnWidths = Record<SortKey, number>;
 type MenuState = { x: number; y: number; file?: RemoteFile };
+type FileListState = {
+  id: string;
+  path: string;
+  pathDraft: string;
+  files: RemoteFile[];
+  loading: boolean;
+  error: string;
+  filter: string;
+  selected?: string;
+  sort: { key: SortKey; direction: SortDirection };
+  columnWidths: ColumnWidths;
+};
 type FileIconName = "archive" | "code" | "config" | "file" | "folder" | "image" | "json" | "markdown" | "shell" | "text";
 type SystemFileIconRequest = { key: string; fileName: string; isDir: boolean };
 type SystemFileIcon = { key: string; dataUrl: string };
@@ -75,7 +89,28 @@ const DEMO_FILES: RemoteFile[] = [
 ];
 
 const minimumColumnWidths: ColumnWidths = { name: 180, size: 82, modified: 138, permissions: 112 };
+const defaultColumnWidths: ColumnWidths = { name: 340, size: 100, modified: 168, permissions: 126 };
 const systemFileIconCache = new Map<string, string>();
+
+function createFileListState(id: string, path: string): FileListState {
+  return {
+    id,
+    path,
+    pathDraft: path,
+    files: [],
+    loading: false,
+    error: "",
+    filter: "",
+    sort: { key: "name", direction: "asc" },
+    columnWidths: { ...defaultColumnWidths },
+  };
+}
+
+function fileListLabel(path: string) {
+  if (path === "/") return "/";
+  const normalized = path.replace(/\/+$/, "");
+  return normalized.slice(normalized.lastIndexOf("/") + 1) || normalized;
+}
 
 function fileExtension(name: string) {
   const index = name.lastIndexOf(".");
@@ -148,39 +183,60 @@ function SortGlyph({ active, direction }: { active: boolean; direction: SortDire
 }
 
 export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
-  const [files, setFiles] = useState<RemoteFile[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [filter, setFilter] = useState("");
-  const [selected, setSelected] = useState<string>();
-  const [pathDraft, setPathDraft] = useState(session.cwd);
-  const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({ key: "name", direction: "asc" });
-  const [columnWidths, setColumnWidths] = useState<ColumnWidths>({ name: 340, size: 100, modified: 168, permissions: 126 });
+  const initialListIdRef = useRef(uid("file-list"));
+  const [fileLists, setFileLists] = useState<FileListState[]>(() => [
+    createFileListState(initialListIdRef.current, session.cwd),
+  ]);
+  const [activeListId, setActiveListId] = useState(initialListIdRef.current);
+  const activeListIdRef = useRef(activeListId);
   const [menu, setMenu] = useState<MenuState>();
   const [editorStatus, setEditorStatus] = useState<VscodeSyncEvent>();
   const [systemFileIcons, setSystemFileIcons] = useState<Record<string, string>>({});
+  activeListIdRef.current = activeListId;
 
-  const load = useCallback(async (path: string) => {
+  const activeList = fileLists.find((list) => list.id === activeListId) ?? fileLists[0]!;
+  const { files, loading, error, filter, selected, pathDraft, sort, columnWidths } = activeList;
+
+  const patchFileList = useCallback((
+    listId: string,
+    patch: Partial<FileListState> | ((current: FileListState) => Partial<FileListState>),
+  ) => {
+    setFileLists((current) => current.map((list) => {
+      if (list.id !== listId) return list;
+      return { ...list, ...(typeof patch === "function" ? patch(list) : patch) };
+    }));
+  }, []);
+
+  const load = useCallback(async (path: string, listId = activeListIdRef.current) => {
     const normalizedPath = path.trim() === "" ? "/" : path.trim().startsWith("/") ? path.trim() : `/${path.trim()}`;
-    setLoading(true);
-    setError("");
+    patchFileList(listId, { loading: true, error: "" });
     try {
       const next = isTauri()
         ? await invoke<RemoteFile[]>("list_directory", { server, path: normalizedPath })
         : DEMO_FILES.map((file) => ({ ...file, path: joinRemotePath(normalizedPath, file.name) }));
-      setFiles(next);
-      setPathDraft(normalizedPath);
-      onUpdate({ cwd: normalizedPath, selectedFile: undefined });
-      setSelected(undefined);
+      patchFileList(listId, {
+        files: next,
+        path: normalizedPath,
+        pathDraft: normalizedPath,
+        selected: undefined,
+      });
+      if (activeListIdRef.current === listId) {
+        onUpdate({ cwd: normalizedPath, selectedFile: undefined });
+      }
     } catch (reason) {
-      setError(String(reason));
+      patchFileList(listId, { error: String(reason) });
     } finally {
-      setLoading(false);
+      patchFileList(listId, { loading: false });
     }
-  }, [onUpdate, server]);
+  }, [onUpdate, patchFileList, server]);
 
   useEffect(() => {
-    void load(session.cwd);
+    const initialList = createFileListState(uid("file-list"), session.cwd);
+    activeListIdRef.current = initialList.id;
+    setFileLists([initialList]);
+    setActiveListId(initialList.id);
+    setMenu(undefined);
+    void load(session.cwd, initialList.id);
     // Navigation calls load directly after the initial session load.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.id]);
@@ -263,25 +319,29 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   }, [files, filter, sort]);
 
   const selectFile = (file: RemoteFile) => {
-    setSelected(file.path);
+    patchFileList(activeList.id, { selected: file.path });
     onUpdate({ selectedFile: file.path });
   };
 
   const upload = async () => {
     if (!isTauri()) return;
+    const listId = activeList.id;
+    const currentPath = activeList.path;
     const picked = await open({ multiple: true, directory: false });
     if (!picked) return;
     const localPaths = Array.isArray(picked) ? picked : [picked];
     const results = await Promise.allSettled(localPaths.map((localPath) => {
       const name = localPath.split(/[\\/]/).pop() ?? "upload";
-      const remotePath = joinRemotePath(session.cwd, name);
+      const remotePath = joinRemotePath(currentPath, name);
       return onTransfer(
         { direction: "upload", fileName: name, sourcePath: localPath, destinationPath: remotePath },
         (transferId) => invoke("start_upload_file", { server, localPath, remotePath, transferId }),
       );
     }));
-    if (results.some((result) => result.status === "rejected")) setError("部分文件上传失败，请在传输列表中查看详情。");
-    await load(session.cwd);
+    if (results.some((result) => result.status === "rejected")) {
+      patchFileList(listId, { error: "部分文件上传失败，请在传输列表中查看详情。" });
+    }
+    await load(currentPath, listId);
   };
 
   const download = async (target?: RemoteFile) => {
@@ -295,17 +355,17 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
         (transferId) => invoke("start_download_file", { server, remotePath: file.path, localPath, transferId }),
       );
     } catch {
-      setError("下载失败，请在传输列表中查看详情。");
+      patchFileList(activeList.id, { error: "下载失败，请在传输列表中查看详情。" });
     }
   };
 
   const openInVscode = async (file: RemoteFile) => {
     if (file.isDir || !isCommonTextFile(file)) return;
     if (!isTauri()) {
-      setError("VS Code 编辑仅在桌面应用中可用。");
+      patchFileList(activeList.id, { error: "VS Code 编辑仅在桌面应用中可用。" });
       return;
     }
-    setError("");
+    patchFileList(activeList.id, { error: "" });
     setEditorStatus({
       sessionId: session.id,
       serverId: server.id,
@@ -318,88 +378,105 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
       await invoke("open_remote_file_in_vscode", { sessionId: session.id, server, remotePath: file.path });
     } catch (reason) {
       setEditorStatus(undefined);
-      setError(`无法使用 VS Code 打开 ${file.name}：${String(reason)}`);
+      patchFileList(activeList.id, { error: `无法使用 VS Code 打开 ${file.name}：${String(reason)}` });
     }
   };
 
   const openFile = (file: RemoteFile) => {
-    if (file.isDir) return void load(file.path);
+    if (file.isDir) return void load(file.path, activeList.id);
     if (isCommonTextFile(file)) return void openInVscode(file);
     return void download(file);
   };
 
   const createFolder = async () => {
+    const listId = activeList.id;
+    const currentPath = activeList.path;
     const name = prompt("新文件夹名称");
     if (!name?.trim()) return;
     if (name.includes("/")) {
-      setError("文件夹名称不能包含 /。");
+      patchFileList(listId, { error: "文件夹名称不能包含 /。" });
       return;
     }
-    const path = joinRemotePath(session.cwd, name.trim());
+    const path = joinRemotePath(currentPath, name.trim());
     try {
       if (isTauri()) await invoke("create_directory", { server, path });
-      else setFiles((current) => [{ name: name.trim(), path, isDir: true, size: 0, permissions: "drwxr-xr-x", modified: Math.floor(Date.now() / 1000) }, ...current]);
-      if (isTauri()) await load(session.cwd);
+      else patchFileList(listId, (current) => ({
+        files: [{ name: name.trim(), path, isDir: true, size: 0, permissions: "drwxr-xr-x", modified: Math.floor(Date.now() / 1000) }, ...current.files],
+      }));
+      if (isTauri()) await load(currentPath, listId);
     } catch (reason) {
-      setError(String(reason));
+      patchFileList(listId, { error: String(reason) });
     }
   };
 
   const remove = async (target?: RemoteFile) => {
+    const listId = activeList.id;
+    const currentPath = activeList.path;
     const file = target ?? files.find((item) => item.path === selected);
     if (!file || !confirm(`删除 ${file.name}？此操作不可撤销。`)) return;
     try {
       if (isTauri()) await invoke("delete_remote_path", { server, path: file.path, isDir: file.isDir });
-      else setFiles((current) => current.filter((item) => item.path !== file.path));
-      setSelected(undefined);
-      if (isTauri()) await load(session.cwd);
+      else patchFileList(listId, (current) => ({ files: current.files.filter((item) => item.path !== file.path) }));
+      patchFileList(listId, { selected: undefined });
+      if (activeListIdRef.current === listId) onUpdate({ selectedFile: undefined });
+      if (isTauri()) await load(currentPath, listId);
     } catch (reason) {
-      setError(String(reason));
+      patchFileList(listId, { error: String(reason) });
     }
   };
 
   const rename = async (file: RemoteFile) => {
+    const listId = activeList.id;
+    const currentPath = activeList.path;
     const name = prompt("重命名", file.name)?.trim();
     if (!name || name === file.name) return;
     if (name.includes("/")) {
-      setError("名称不能包含 /。");
+      patchFileList(listId, { error: "名称不能包含 /。" });
       return;
     }
     const targetPath = joinRemotePath(parentPath(file.path), name);
     try {
       if (isTauri()) await invoke("rename_remote_path", { server, sourcePath: file.path, targetPath });
-      else setFiles((current) => current.map((item) => item.path === file.path ? { ...item, name, path: targetPath } : item));
-      if (isTauri()) await load(session.cwd);
+      else patchFileList(listId, (current) => ({
+        files: current.files.map((item) => item.path === file.path ? { ...item, name, path: targetPath } : item),
+      }));
+      if (isTauri()) await load(currentPath, listId);
     } catch (reason) {
-      setError(String(reason));
+      patchFileList(listId, { error: String(reason) });
     }
   };
 
   const compress = async (file: RemoteFile) => {
+    const listId = activeList.id;
+    const currentPath = activeList.path;
     const archiveName = `${file.name}.tar.gz`;
     const archivePath = joinRemotePath(parentPath(file.path), archiveName);
     if (files.some((item) => item.path === archivePath) && !confirm(`覆盖 ${archiveName}？`)) return;
     try {
       if (isTauri()) await invoke("compress_remote_path", { server, sourcePath: file.path, archivePath });
-      else setFiles((current) => [...current, { name: archiveName, path: archivePath, isDir: false, size: 0, permissions: "-rw-r--r--", modified: Math.floor(Date.now() / 1000) }]);
-      if (isTauri()) await load(session.cwd);
+      else patchFileList(listId, (current) => ({
+        files: [...current.files, { name: archiveName, path: archivePath, isDir: false, size: 0, permissions: "-rw-r--r--", modified: Math.floor(Date.now() / 1000) }],
+      }));
+      if (isTauri()) await load(currentPath, listId);
     } catch (reason) {
-      setError(String(reason));
+      patchFileList(listId, { error: String(reason) });
     }
   };
 
-  const copyPath = async (file: RemoteFile) => {
+  const copyPath = async (path: string) => {
     try {
-      await navigator.clipboard.writeText(file.path);
+      await navigator.clipboard.writeText(path);
     } catch (reason) {
-      setError(`复制路径失败：${String(reason)}`);
+      patchFileList(activeList.id, { error: `复制路径失败：${String(reason)}` });
     }
   };
 
   const toggleSort = (key: SortKey) => {
-    setSort((current) => ({
-      key,
-      direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
+    patchFileList(activeList.id, (current) => ({
+      sort: {
+        key,
+        direction: current.sort.key === key && current.sort.direction === "asc" ? "desc" : "asc",
+      },
     }));
   };
 
@@ -409,9 +486,11 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
     const startX = event.clientX;
     const startWidth = columnWidths[key];
     const onMove = (moveEvent: PointerEvent) => {
-      setColumnWidths((current) => ({
-        ...current,
-        [key]: Math.max(minimumColumnWidths[key], startWidth + moveEvent.clientX - startX),
+      patchFileList(activeList.id, (current) => ({
+        columnWidths: {
+          ...current.columnWidths,
+          [key]: Math.max(minimumColumnWidths[key], startWidth + moveEvent.clientX - startX),
+        },
       }));
     };
     const onUp = () => {
@@ -435,6 +514,38 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
     });
   };
 
+  const activateFileList = (list: FileListState) => {
+    if (list.id === activeList.id) return;
+    activeListIdRef.current = list.id;
+    setActiveListId(list.id);
+    setMenu(undefined);
+    onUpdate({ cwd: list.path, selectedFile: list.selected });
+  };
+
+  const addFileList = () => {
+    const next = createFileListState(uid("file-list"), activeList.path);
+    activeListIdRef.current = next.id;
+    setFileLists((current) => [...current, next]);
+    setActiveListId(next.id);
+    setMenu(undefined);
+    onUpdate({ cwd: next.path, selectedFile: undefined });
+    void load(next.path, next.id);
+  };
+
+  const closeFileList = (listId: string) => {
+    if (fileLists.length === 1) return;
+    const closingIndex = fileLists.findIndex((list) => list.id === listId);
+    if (closingIndex < 0) return;
+    const remaining = fileLists.filter((list) => list.id !== listId);
+    setFileLists(remaining);
+    if (listId !== activeList.id) return;
+    const next = remaining[Math.min(closingIndex, remaining.length - 1)];
+    activeListIdRef.current = next.id;
+    setActiveListId(next.id);
+    setMenu(undefined);
+    onUpdate({ cwd: next.path, selectedFile: next.selected });
+  };
+
   const columns: Array<{ key: SortKey; label: string }> = [
     { key: "name", label: "名称" },
     { key: "size", label: "大小" },
@@ -451,7 +562,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
           <input
             aria-label="筛选文件"
             value={filter}
-            onChange={(event) => setFilter(event.target.value)}
+            onChange={(event) => patchFileList(activeList.id, { filter: event.target.value })}
             placeholder="筛选"
           />
         </label>
@@ -460,26 +571,62 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
         <button className="icon-button quiet" title="下载选中文件" disabled={!selected || files.find((file) => file.path === selected)?.isDir} onClick={() => void download()}><ArrowDownToLine size={13} /></button>
         <button className="icon-button quiet" title="新建文件夹" onClick={() => void createFolder()}><FolderPlus size={13} /></button>
         <button className="icon-button quiet danger-hover" title="删除" disabled={!selected} onClick={() => void remove()}><Trash2 size={13} /></button>
-        <button className={`icon-button quiet ${loading ? "spinning" : ""}`} title="刷新" onClick={() => void load(session.cwd)}><RefreshCw size={13} /></button>
+        <button className={`icon-button quiet ${loading ? "spinning" : ""}`} title="刷新" onClick={() => void load(activeList.path, activeList.id)}><RefreshCw size={13} /></button>
+      </div>
+      <div className="file-list-tabs" role="tablist" aria-label="文件目录列表">
+        <div className="file-list-tab-scroll">
+          {fileLists.map((list) => (
+            <div className={`file-list-tab ${list.id === activeList.id ? "active" : ""}`} key={list.id}>
+              <button
+                className="file-list-tab-select"
+                type="button"
+                role="tab"
+                aria-selected={list.id === activeList.id}
+                title={list.path}
+                onClick={() => activateFileList(list)}
+              >
+                <Folder size={11} />
+                <span>{fileListLabel(list.path)}</span>
+              </button>
+              {fileLists.length > 1 && (
+                <button
+                  className="file-list-tab-close"
+                  type="button"
+                  title={`关闭 ${list.path}`}
+                  aria-label={`关闭 ${list.path}`}
+                  onClick={() => closeFileList(list.id)}
+                >
+                  <X size={10} />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+        <button className="file-list-add" type="button" title="新增文件列表" aria-label="新增文件列表" onClick={addFileList}>
+          <Plus size={12} />
+        </button>
       </div>
       <div className="file-toolbar">
-        <button className="icon-button quiet" title="返回上级目录" disabled={session.cwd === "/"} onClick={() => void load(parentPath(session.cwd))}><ArrowLeft size={13} /></button>
-        <button className="icon-button quiet" title="根目录" onClick={() => void load("/")}><Home size={12} /></button>
-        <label className="path-field" title={session.cwd}>
+        <button className="icon-button quiet" title="返回上级目录" disabled={activeList.path === "/"} onClick={() => void load(parentPath(activeList.path), activeList.id)}><ArrowLeft size={13} /></button>
+        <button className="icon-button quiet" title="根目录" onClick={() => void load("/", activeList.id)}><Home size={12} /></button>
+        <label className="path-field" title={activeList.path}>
           <FolderOpen size={12} />
           <input
             aria-label="远程路径"
             value={pathDraft}
-            onChange={(event) => setPathDraft(event.target.value)}
-            onBlur={() => setPathDraft(session.cwd)}
+            onChange={(event) => patchFileList(activeList.id, { pathDraft: event.target.value })}
+            onBlur={() => patchFileList(activeList.id, { pathDraft: activeList.path })}
             onKeyDown={(event) => {
-              if (event.key === "Enter") void load(pathDraft);
-              if (event.key === "Escape") setPathDraft(session.cwd);
+              if (event.key === "Enter") void load(pathDraft, activeList.id);
+              if (event.key === "Escape") patchFileList(activeList.id, { pathDraft: activeList.path });
             }}
           />
         </label>
+        <button className="icon-button quiet path-copy-button" type="button" title="复制当前路径" aria-label="复制当前路径" onClick={() => void copyPath(activeList.path)}>
+          <Clipboard size={12} />
+        </button>
       </div>
-      {error ? <div className="pane-error">无法完成操作：{error}<button onClick={() => setError("")}>关闭</button></div> : (
+      {error ? <div className="pane-error">无法完成操作：{error}<button onClick={() => patchFileList(activeList.id, { error: "" })}>关闭</button></div> : (
         <div className="file-table-wrap" onContextMenu={(event) => openMenu(event)}>
           <table className="file-table">
             <colgroup>
@@ -543,7 +690,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
                 </>
               )}
               <button role="menuitem" onClick={() => { setMenu(undefined); void rename(menu.file!); }}><Pencil size={13} />重命名</button>
-              <button role="menuitem" onClick={() => { setMenu(undefined); void copyPath(menu.file!); }}><Clipboard size={13} />复制路径</button>
+              <button role="menuitem" onClick={() => { setMenu(undefined); void copyPath(menu.file!.path); }}><Clipboard size={13} />复制路径</button>
               <span className="context-separator" />
               <button role="menuitem" onClick={() => { setMenu(undefined); void compress(menu.file!); }}><FileArchive size={13} />压缩为 .tar.gz</button>
               <button role="menuitem" onClick={() => { setMenu(undefined); void createFolder(); }}><FolderPlus size={13} />新建文件夹</button>
@@ -554,7 +701,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
             <>
               <button role="menuitem" onClick={() => { setMenu(undefined); void upload(); }}><ArrowUpToLine size={13} />上传文件</button>
               <button role="menuitem" onClick={() => { setMenu(undefined); void createFolder(); }}><FolderPlus size={13} />新建文件夹</button>
-              <button role="menuitem" onClick={() => { setMenu(undefined); void load(session.cwd); }}><RefreshCw size={13} />刷新</button>
+              <button role="menuitem" onClick={() => { setMenu(undefined); void load(activeList.path, activeList.id); }}><RefreshCw size={13} />刷新</button>
             </>
           )}
         </div>

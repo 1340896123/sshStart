@@ -3,6 +3,7 @@ import {
   Suspense,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -237,16 +238,16 @@ function CopyAction({ text, label, className }: { text: string; label: string; c
 }
 
 function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
-  const [expanded, setExpanded] = useState(toolCall.status !== "completed");
-  const contentId = useId();
   const running = toolCall.status === "started" || toolCall.status === "running";
+  const [expanded, setExpanded] = useState(running);
+  const contentId = useId();
   const failed = toolCall.status === "error";
   const stopped = toolCall.status === "rejected" || toolCall.status === "cancelled";
   const duration = formatActionDuration(toolCall.startedAt, toolCall.completedAt);
 
   useEffect(() => {
-    if (toolCall.status === "completed") setExpanded(false);
-  }, [toolCall.status]);
+    setExpanded(running);
+  }, [running]);
 
   return (
     <div className={`tool-call ${expanded ? "expanded" : "collapsed"} status-${toolCall.status}`}>
@@ -314,6 +315,8 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   const messagesRef = useRef(session.aiMessages);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const historyControlRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const shouldStickToBottomRef = useRef(true);
   messagesRef.current = session.aiMessages;
 
   const replaceHistory = (next: AiConversation[]) => {
@@ -381,6 +384,12 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     });
   }, [session.aiMessages]);
   const tokenUsagePopoverId = `token-usage-${session.id}`;
+
+  useLayoutEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container || !shouldStickToBottomRef.current) return;
+    container.scrollTop = container.scrollHeight;
+  }, [session.aiMessages]);
 
   useEffect(() => {
     const syncHistory = (event: Event) => {
@@ -613,7 +622,14 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         <span>{contextLabel}</span>
       </div>
 
-      <div className="ai-messages">
+      <div
+        className="ai-messages"
+        ref={messagesContainerRef}
+        onScroll={({ currentTarget }) => {
+          const distanceFromBottom = currentTarget.scrollHeight - currentTarget.scrollTop - currentTarget.clientHeight;
+          shouldStickToBottomRef.current = distanceFromBottom <= 24;
+        }}
+      >
         {session.aiMessages.length === 0 && (
           <div className="ai-welcome">
             <div className="ai-mark"><Bot size={20} /></div>
