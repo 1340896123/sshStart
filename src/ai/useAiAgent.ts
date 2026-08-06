@@ -34,6 +34,7 @@ interface StartAiAgentInput {
 interface ActiveRun {
   runId: string;
   messageId: string;
+  cancelRequested: boolean;
   activeReasoningId?: string;
   activeTextSegmentId?: string;
   unlisten?: UnlistenFn;
@@ -105,10 +106,16 @@ export function useAiAgent({
   const [running, setRunning] = useState(false);
   const [resolvingApprovalId, setResolvingApprovalId] = useState<string>();
   const messagesRef = useRef(messages);
+  const lastPropMessagesRef = useRef(messages);
+  const pendingLocalMessagesRef = useRef<AiMessage[]>();
   const onMessagesChangeRef = useRef(onMessagesChange);
   const activeRunRef = useRef<ActiveRun>();
 
-  messagesRef.current = messages;
+  if (messages !== lastPropMessagesRef.current) {
+    lastPropMessagesRef.current = messages;
+    if (pendingLocalMessagesRef.current !== messages) messagesRef.current = messages;
+    pendingLocalMessagesRef.current = undefined;
+  }
   onMessagesChangeRef.current = onMessagesChange;
 
   const commit = (
@@ -117,6 +124,7 @@ export function useAiAgent({
   ) => {
     const next = updater(messagesRef.current);
     messagesRef.current = next;
+    pendingLocalMessagesRef.current = next;
     onMessagesChangeRef.current(next, persist);
   };
 
@@ -384,7 +392,7 @@ export function useAiAgent({
       status: "started",
     };
     const pendingMessages = [...messagesRef.current, userMessage, assistantMessage];
-    activeRunRef.current = { runId, messageId: assistantMessage.id };
+    activeRunRef.current = { runId, messageId: assistantMessage.id, cancelRequested: false };
     commit(() => pendingMessages, true);
     setRunning(true);
 
@@ -446,7 +454,17 @@ export function useAiAgent({
     } catch (reason) {
       if (activeRunRef.current?.runId !== runId) return;
       const error = String(reason);
-      if (!error.includes("AI 运行已取消")) {
+      if (error.includes("AI 运行已取消")) {
+        const completedAt = Date.now();
+        updateAssistant(assistantMessage.id, (message) => ({
+          ...message,
+          content: message.content || "已停止当前 Agent 运行。",
+          messageType: "text",
+          status: "cancelled",
+          updatedAt: completedAt,
+          completedAt,
+        }), true);
+      } else {
         const completedAt = Date.now();
         updateAssistant(assistantMessage.id, (message) => ({
           ...message,
@@ -458,8 +476,23 @@ export function useAiAgent({
         }), true);
       }
     } finally {
-      unlisten?.();
-      if (activeRunRef.current?.runId === runId) {
+      const activeRun = activeRunRef.current;
+      if (activeRun?.runId === runId) {
+        if (activeRun.cancelRequested) {
+          const message = messagesRef.current.find((candidate) => candidate.id === assistantMessage.id);
+          if (message && (message.status === "started" || message.status === "running")) {
+            const completedAt = Date.now();
+            updateAssistant(assistantMessage.id, (current) => ({
+              ...current,
+              content: current.content || "已停止当前 Agent 运行。",
+              messageType: "text",
+              status: "cancelled",
+              updatedAt: completedAt,
+              completedAt,
+            }), true);
+          }
+        }
+        unlisten?.();
         activeRunRef.current = undefined;
         setRunning(false);
       }
@@ -469,6 +502,7 @@ export function useAiAgent({
   const cancel = async () => {
     const activeRun = activeRunRef.current;
     if (!activeRun) return;
+    activeRun.cancelRequested = true;
     await invoke("cancel_ai_run", { runId: activeRun.runId }).catch(() => undefined);
   };
 
