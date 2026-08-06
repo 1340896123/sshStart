@@ -53,3 +53,5 @@ npm run sync-server
 ```
 
 Configure the desktop app with `http://127.0.0.1:8787` for local development. For a public deployment, serve it behind HTTPS. See `server/README.md` for environment variables, Docker usage, and tests.
+
+To build and publish the sync server image to Docker Hub, then deploy it with Docker Compose, see [`docs/docker-sync-deployment.md`](docs/docker-sync-deployment.md).

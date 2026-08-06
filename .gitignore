@@ -11,5 +11,6 @@ src-tauri/gen/schemas/
 output/
 tmp/
 server/data/
+deploy/portico-sync.env
 .claude/
 .codegraph/

@@ -46,6 +46,10 @@ npm test
 
 ## Docker
 
+从仓库根目录使用 Compose 部署的完整流程见 [`docs/docker-sync-deployment.md`](../docs/docker-sync-deployment.md)。
+
+也可以直接构建并运行镜像：
+
 ```powershell
 docker build -t portico-sync .
 docker run --rm -p 8787:8787 `

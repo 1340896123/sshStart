@@ -1,0 +1,31 @@
+services:
+  portico-sync:
+    image: ${DOCKERHUB_IMAGE:?Set DOCKERHUB_IMAGE to your Docker Hub image}
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${PORTICO_SYNC_BIND_ADDRESS:-127.0.0.1}:${PORTICO_SYNC_HOST_PORT:-8787}:8787"
+    environment:
+      PORTICO_SYNC_HOST: 0.0.0.0
+      PORTICO_SYNC_PORT: 8787
+      PORTICO_SYNC_DATABASE_PATH: /data/portico-sync.sqlite
+      PORTICO_SYNC_TOKEN_SECRET: ${PORTICO_SYNC_TOKEN_SECRET:?Set PORTICO_SYNC_TOKEN_SECRET to a random value of at least 32 bytes}
+      PORTICO_SYNC_TRUST_PROXY: ${PORTICO_SYNC_TRUST_PROXY:-false}
+    volumes:
+      - portico-sync-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/healthz').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
+
+volumes:
+  portico-sync-data:
