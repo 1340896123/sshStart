@@ -120,12 +120,45 @@ test("sync snapshots are opaque and isolated by account", async (context) => {
   assert.equal(otherAccount.response.status, 404);
 });
 
+test("encrypted key backups are opaque and isolated by account", async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.close());
+  const first = await register(fixture.baseUrl, "key-first@example.com");
+  const second = await register(fixture.baseUrl, "key-second@example.com");
+
+  const empty = await requestJson(fixture.baseUrl, "/sync/keys", {
+    headers: { authorization: `Bearer ${first.body.token}` },
+  });
+  assert.equal(empty.response.status, 404);
+
+  const ciphertext = "opaque-passphrase-encrypted-key-bundle";
+  const uploaded = await requestJson(fixture.baseUrl, "/sync/keys", {
+    method: "PUT",
+    headers: { authorization: `Bearer ${first.body.token}` },
+    body: JSON.stringify({ ciphertext, updatedAt: 1786032000 }),
+  });
+  assert.equal(uploaded.response.status, 204);
+
+  const downloaded = await requestJson(fixture.baseUrl, "/sync/keys", {
+    headers: { authorization: `Bearer ${first.body.token}` },
+  });
+  assert.equal(downloaded.response.status, 200);
+  assert.deepEqual(downloaded.body, { ciphertext, updatedAt: 1786032000 });
+
+  const otherAccount = await requestJson(fixture.baseUrl, "/sync/keys", {
+    headers: { authorization: `Bearer ${second.body.token}` },
+  });
+  assert.equal(otherAccount.response.status, 404);
+});
+
 test("sync routes reject missing authentication and invalid payloads", async (context) => {
   const fixture = await startFixture();
   context.after(() => fixture.close());
 
   const unauthorized = await requestJson(fixture.baseUrl, "/sync/data");
   assert.equal(unauthorized.response.status, 401);
+  const unauthorizedKeys = await requestJson(fixture.baseUrl, "/sync/keys");
+  assert.equal(unauthorizedKeys.response.status, 401);
 
   const registered = await register(fixture.baseUrl, "payload@example.com");
   const invalidPayload = await requestJson(fixture.baseUrl, "/sync/data", {
@@ -134,6 +167,13 @@ test("sync routes reject missing authentication and invalid payloads", async (co
     body: JSON.stringify({ ciphertext: "", updatedAt: "yesterday" }),
   });
   assert.equal(invalidPayload.response.status, 400);
+
+  const invalidKeyPayload = await requestJson(fixture.baseUrl, "/sync/keys", {
+    method: "PUT",
+    headers: { authorization: `Bearer ${registered.body.token}` },
+    body: JSON.stringify({ ciphertext: "", updatedAt: "yesterday" }),
+  });
+  assert.equal(invalidKeyPayload.response.status, 400);
 });
 
 test("expired bearer tokens are rejected", async (context) => {

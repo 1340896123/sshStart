@@ -36,7 +36,17 @@ import {
   X,
 } from "lucide-react";
 import { isTauri } from "../lib";
-import { getCloudSyncStatus, loginCloudSync, logoutCloudSync, registerCloudSync, type CloudSyncStatus } from "../storage";
+import {
+  downloadCloudSyncKeys,
+  getCloudSyncStatus,
+  listCloudSyncKeyFiles,
+  loginCloudSync,
+  logoutCloudSync,
+  registerCloudSync,
+  uploadCloudSyncKeys,
+  type CloudSyncStatus,
+  type KeyFileInfo,
+} from "../storage";
 import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiToolKey } from "../types";
 
 interface Props {
@@ -116,6 +126,10 @@ const SETTINGS_SECTIONS: Array<{
   { id: "cloud-sync", label: "云端同步", description: "登录、加密与自动同步", icon: Cloud },
 ];
 
+const formatKeyFileSize = (bytes: number) => bytes < 1024
+  ? `${bytes} B`
+  : `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KiB`;
+
 export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Props) {
   const [value, setValue] = useState(() => normalizeAiConfig(config));
   const [savedValue, setSavedValue] = useState(() => normalizeAiConfig(config));
@@ -131,15 +145,27 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
   const [syncEmail, setSyncEmail] = useState("");
   const [syncPassword, setSyncPassword] = useState("");
   const [syncBusy, setSyncBusy] = useState(false);
+  const [keyFiles, setKeyFiles] = useState<KeyFileInfo[]>([]);
+  const [keyPassphrase, setKeyPassphrase] = useState("");
+  const [keyPassphraseConfirmation, setKeyPassphraseConfirmation] = useState("");
+  const [keyPassphraseVisible, setKeyPassphraseVisible] = useState(false);
+  const [keySyncAction, setKeySyncAction] = useState<"refresh" | "upload" | "download">();
+  const [keySyncNotice, setKeySyncNotice] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSection>("model");
   const [navSearch, setNavSearch] = useState("");
   const modelPickerOpen = Boolean(modelPickerTarget);
   const selectedPickerModel = modelPickerTarget === "reviewer" ? value.reviewerModel : value.model;
   const isDirty = JSON.stringify(value) !== JSON.stringify(savedValue);
+  const keySyncBusy = Boolean(keySyncAction);
 
   useEffect(() => {
     if (!isTauri()) return;
-    void getCloudSyncStatus().then(setSyncStatus).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    void Promise.all([getCloudSyncStatus(), listCloudSyncKeyFiles()])
+      .then(([status, files]) => {
+        setSyncStatus(status);
+        setKeyFiles(files);
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, []);
 
   const authenticateSync = async (mode: "login" | "register") => {
@@ -164,6 +190,9 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     try {
       await logoutCloudSync();
       setSyncStatus((current) => ({ ...(current ?? { keyPath: "" }), authenticated: false, email: undefined }));
+      setKeyPassphrase("");
+      setKeyPassphraseConfirmation("");
+      setKeySyncNotice("");
       const nextValue = normalizeAiConfig({ ...value, cloudSync: { ...value.cloudSync, enabled: false } });
       await onSave(nextValue);
       setValue(nextValue);
@@ -272,10 +301,83 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     }
   };
 
+  const uploadKeys = async () => {
+    if (!syncStatus?.authenticated) {
+      setError("请先登录同步账号");
+      return;
+    }
+    if (keyPassphrase.length < 8) {
+      setError("密钥同步口令至少需要 8 位");
+      return;
+    }
+    if (keyPassphrase !== keyPassphraseConfirmation) {
+      setError("两次输入的密钥同步口令不一致");
+      return;
+    }
+    setKeySyncAction("upload");
+    setError("");
+    setKeySyncNotice("");
+    try {
+      const result = await uploadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase);
+      setKeyFiles(result.files);
+      setKeySyncNotice(`已加密上传 ${result.files.length} 个密钥文件；服务器仅保存密文。`);
+      setKeyPassphrase("");
+      setKeyPassphraseConfirmation("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setKeySyncAction(undefined);
+    }
+  };
+
+  const refreshKeyFiles = async () => {
+    setKeySyncAction("refresh");
+    setError("");
+    try {
+      setKeyFiles(await listCloudSyncKeyFiles());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setKeySyncAction(undefined);
+    }
+  };
+
+  const downloadKeys = async () => {
+    if (!syncStatus?.authenticated) {
+      setError("请先登录同步账号");
+      return;
+    }
+    if (keyPassphrase.length < 8) {
+      setError("请输入上传备份时使用的密钥同步口令");
+      return;
+    }
+    const overwrite = keyFiles.length > 0;
+    if (overwrite && !window.confirm("下载会覆盖备份中同名的本地 *.key 文件。确定继续吗？")) {
+      return;
+    }
+    setKeySyncAction("download");
+    setError("");
+    setKeySyncNotice("");
+    try {
+      const result = await downloadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, overwrite);
+      setKeyFiles(result.files);
+      setKeySyncNotice(`已解密恢复 ${result.files.length} 个密钥文件到 ~/.porticossh。`);
+      setKeyPassphrase("");
+      setKeyPassphraseConfirmation("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setKeySyncAction(undefined);
+    }
+  };
+
   const enabledToolCount = TOOL_GROUPS
     .flatMap((group) => group.tools)
     .filter((tool) => value.tools[tool.key]).length;
-  const busy = saving || removingKey;
+  const keyFileSummary = keyFiles.length === 0
+    ? "未找到 *.key 文件"
+    : `${keyFiles.slice(0, 5).map((file) => `${file.name} (${formatKeyFileSize(file.size)})`).join("、")}${keyFiles.length > 5 ? ` 等 ${keyFiles.length} 个文件` : ""}`;
+  const busy = saving || removingKey || syncBusy || keySyncBusy;
   const visibleSections = SETTINGS_SECTIONS.filter((section) => {
     const query = navSearch.trim().toLocaleLowerCase();
     return !query || `${section.label} ${section.description}`.toLocaleLowerCase().includes(query);
@@ -553,10 +655,36 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                       <div className="settings-action-row"><button className="secondary-button" type="button" disabled={syncBusy} onClick={() => void authenticateSync("login")}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <LogIn size={14} />}登录</button><button className="secondary-button" type="button" disabled={syncBusy} onClick={() => void authenticateSync("register")}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <UserPlus size={14} />}注册并登录</button></div>
                     </>
                   ) : (
-                    <div className="settings-config-row"><span className="settings-row-copy"><strong>当前账号</strong><small>令牌保存在系统凭据库；加密密钥保存在 {syncStatus.keyPath || "~/.porticossh/"}</small></span><button className="danger-button" type="button" disabled={syncBusy} onClick={() => void logoutSync()}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <LogOut size={14} />}退出登录</button></div>
+                    <div className="settings-config-row"><span className="settings-row-copy"><strong>当前账号</strong><small>令牌保存在系统凭据库；应用数据加密密钥保存在 {syncStatus.keyPath || "~/.porticossh/"}</small></span><button className="danger-button" type="button" disabled={syncBusy || keySyncBusy} onClick={() => void logoutSync()}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <LogOut size={14} />}退出登录</button></div>
                   )}
                 </section>
-                <div className="settings-note"><KeyRound size={15} /><span>同步密钥由桌面端首次运行时生成并保存在 ~/.porticossh/sync.key。密钥不会上传；丢失密钥时云端密文无法恢复。</span></div>
+                <section className="settings-panel">
+                  <header><strong>密钥文件备份</strong><small>手动加密上传或恢复 ~/.porticossh/*.key；文件名和内容都会被加密</small></header>
+                  <div className="settings-config-row">
+                    <span className="settings-row-copy"><strong>本地密钥</strong><small>{keyFileSummary}</small></span>
+                    <span className="settings-model-control">
+                      <span className="settings-static-value settings-key-file-status">{keyFiles.length} 个文件</span>
+                      <button type="button" disabled={keySyncBusy} onClick={() => void refreshKeyFiles()}><RefreshCw className={keySyncAction === "refresh" ? "spinning" : ""} size={14} />刷新</button>
+                    </span>
+                  </div>
+                  <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>加密口令</strong><small>上传时用于加密，下载时必须输入同一口令；不会保存或发送到服务器</small></span>
+                    <span className="settings-secret-control">
+                      <input className="settings-input" type={keyPassphraseVisible ? "text" : "password"} autoComplete="new-password" value={keyPassphrase} onChange={(event) => setKeyPassphrase(event.target.value)} placeholder="至少 8 位，请妥善保管" />
+                      <button className="settings-secret-toggle" type="button" onClick={() => setKeyPassphraseVisible((current) => !current)} aria-label={keyPassphraseVisible ? "隐藏密钥同步口令" : "显示密钥同步口令"}>{keyPassphraseVisible ? <EyeOff size={14} /> : <Eye size={14} />}</button>
+                    </span>
+                  </label>
+                  <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>确认加密口令</strong><small>仅上传备份时校验；下载恢复无需重复输入</small></span>
+                    <input className="settings-input" type={keyPassphraseVisible ? "text" : "password"} autoComplete="new-password" value={keyPassphraseConfirmation} onChange={(event) => setKeyPassphraseConfirmation(event.target.value)} placeholder="再次输入上传口令" />
+                  </label>
+                  <div className="settings-action-row">
+                    <button className="secondary-button" type="button" disabled={!syncStatus?.authenticated || keySyncBusy} onClick={() => void uploadKeys()}>{keySyncAction === "upload" ? <RefreshCw className="spinning" size={14} /> : <Upload size={14} />}加密上传全部密钥</button>
+                    <button className="secondary-button" type="button" disabled={!syncStatus?.authenticated || keySyncBusy} onClick={() => void downloadKeys()}>{keySyncAction === "download" ? <RefreshCw className="spinning" size={14} /> : <Download size={14} />}下载并恢复密钥</button>
+                  </div>
+                </section>
+                {keySyncNotice && <div className="settings-note"><Check size={15} /><span>{keySyncNotice}</span></div>}
+                <div className="settings-note"><KeyRound size={15} /><span>应用数据仍由本机 ~/.porticossh/sync.key 自动加密；密钥文件备份则使用上方自定义口令独立加密。忘记口令时，服务器无法帮助恢复。</span></div>
               </>
             )}
           </div>

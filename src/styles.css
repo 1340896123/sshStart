@@ -4732,6 +4732,12 @@ body.is-resizing-rows .system-dock {
   font-size: 11px;
 }
 
+.settings-key-file-status {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+}
+
 .settings-input:focus,
 .settings-prompt-field textarea:focus {
   border-color: var(--accent);

@@ -40,12 +40,14 @@ Cloud sync is intentionally backend-agnostic. Configure the API root in Settings
 - `POST /auth/register` and `POST /auth/login` with `{ "email": string, "password": string }`, returning `{ "token": string, "email": string }` (an `accessToken` field is also accepted).
 - `GET /sync/data` with a bearer token, returning `{ "ciphertext": string }`; return `404` when the account has no snapshot yet.
 - `PUT /sync/data` with a bearer token and `{ "ciphertext": string, "updatedAt": number }`.
+- `GET /sync/keys` with a bearer token, returning `{ "ciphertext": string, "updatedAt": number }`; return `404` before the first key backup.
+- `PUT /sync/keys` with a bearer token and `{ "ciphertext": string, "updatedAt": number }`.
 
-The `ciphertext` value is an AES-256-GCM envelope containing a random nonce and the complete server/settings snapshot. The encryption key is generated locally and stored at `~/.porticossh/sync.key`; it is never sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
+Application snapshot ciphertext uses a locally generated AES-256-GCM key stored at `~/.porticossh/sync.key`. Key backups contain the local `~/.porticossh/*.key` files and are independently encrypted with AES-256-GCM using a PBKDF2-SHA256 key derived from the user's custom passphrase. Neither encryption key nor passphrase is sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
 
 ## Included cloud sync backend
 
-The repository includes a self-hosted implementation in `server/`. It uses Node.js 24's built-in HTTP, cryptography, and SQLite support, hashes passwords with scrypt, issues seven-day HMAC-SHA256 bearer tokens, rate-limits authentication attempts, and stores snapshots per account without decrypting them.
+The repository includes a self-hosted implementation in `server/`. It uses Node.js 24's built-in HTTP, cryptography, and SQLite support, hashes passwords with scrypt, issues seven-day HMAC-SHA256 bearer tokens, rate-limits authentication attempts, and stores application snapshots and key backups per account without decrypting them.
 
 ```powershell
 $env:PORTICO_SYNC_TOKEN_SECRET = node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"

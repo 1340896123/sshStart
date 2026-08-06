@@ -239,6 +239,14 @@ function openDatabase(databasePath) {
       stored_at INTEGER NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS key_snapshots (
+      user_id INTEGER PRIMARY KEY,
+      ciphertext TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      stored_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) STRICT;
   `);
   return database;
 }
@@ -267,6 +275,15 @@ export function createSyncServer({
   const findSnapshot = database.prepare("SELECT ciphertext FROM sync_snapshots WHERE user_id = ?");
   const saveSnapshot = database.prepare(`
     INSERT INTO sync_snapshots (user_id, ciphertext, updated_at, stored_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      ciphertext = excluded.ciphertext,
+      updated_at = excluded.updated_at,
+      stored_at = excluded.stored_at
+  `);
+  const findKeySnapshot = database.prepare("SELECT ciphertext, updated_at FROM key_snapshots WHERE user_id = ?");
+  const saveKeySnapshot = database.prepare(`
+    INSERT INTO key_snapshots (user_id, ciphertext, updated_at, stored_at)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET
       ciphertext = excluded.ciphertext,
@@ -366,8 +383,31 @@ export function createSyncServer({
       sendEmpty(response, 204);
       return;
     }
+    if (path === "/sync/keys" && request.method === "GET") {
+      const user = authenticate(request);
+      const snapshot = findKeySnapshot.get(user.id);
+      if (!snapshot) throw new HttpError(404, "该账号还没有密钥备份");
+      sendJson(response, 200, { ciphertext: snapshot.ciphertext, updatedAt: snapshot.updated_at });
+      return;
+    }
+    if (path === "/sync/keys" && request.method === "PUT") {
+      const user = authenticate(request);
+      const body = await readJson(request, maxBodyBytes);
+      if (typeof body.ciphertext !== "string" || body.ciphertext.trim().length === 0) {
+        throw new HttpError(400, "ciphertext 必须是非空字符串");
+      }
+      if (Buffer.byteLength(body.ciphertext) > maxCiphertextBytes) {
+        throw new HttpError(413, "密钥备份密文过大");
+      }
+      if (!Number.isSafeInteger(body.updatedAt) || body.updatedAt < 0) {
+        throw new HttpError(400, "updatedAt 必须是非负整数时间戳");
+      }
+      saveKeySnapshot.run(user.id, body.ciphertext, body.updatedAt, Math.floor(now() / 1000));
+      sendEmpty(response, 204);
+      return;
+    }
 
-    if (path === "/auth/register" || path === "/auth/login" || path === "/sync/data") {
+    if (path === "/auth/register" || path === "/auth/login" || path === "/sync/data" || path === "/sync/keys") {
       throw new HttpError(405, "请求方法不受支持");
     }
     throw new HttpError(404, "接口不存在");

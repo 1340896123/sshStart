@@ -17,6 +17,16 @@ export interface CloudSyncStatus {
   keyPath: string;
 }
 
+export interface KeyFileInfo {
+  name: string;
+  size: number;
+}
+
+export interface KeySyncResult {
+  files: KeyFileInfo[];
+  updatedAt: number;
+}
+
 const EMPTY_SNAPSHOT: AppStorageSnapshot = {
   servers: [],
   savedGroups: [],
@@ -72,3 +82,16 @@ export const pushCloudSync = (endpoint: string, snapshot: AppStorageSnapshot) =>
 
 export const pullCloudSync = (endpoint: string) =>
   isTauri() ? invoke<AppStorageSnapshot | null>("sync_pull", { endpoint }) : Promise.resolve(null);
+
+export const listCloudSyncKeyFiles = () =>
+  isTauri() ? invoke<KeyFileInfo[]>("sync_list_key_files") : Promise.resolve([]);
+
+export const uploadCloudSyncKeys = (endpoint: string, passphrase: string) =>
+  isTauri()
+    ? invoke<KeySyncResult>("sync_upload_keys", { endpoint, passphrase })
+    : Promise.reject(new Error("密钥同步仅可在桌面应用中使用"));
+
+export const downloadCloudSyncKeys = (endpoint: string, passphrase: string, overwrite: boolean) =>
+  isTauri()
+    ? invoke<KeySyncResult>("sync_download_keys", { endpoint, passphrase, overwrite })
+    : Promise.reject(new Error("密钥同步仅可在桌面应用中使用"));
