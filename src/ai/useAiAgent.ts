@@ -400,10 +400,12 @@ export function useAiAgent({
         server,
         messages: pendingMessages
           .filter((message) => message.id !== assistantMessage.id)
-          .filter((message) => message.status !== "error" && message.status !== "cancelled")
+          .filter((message) => message.status !== "error")
           .map((message) => ({
             role: message.role,
-            content: message.content,
+            content: message.role === "assistant" && message.status === "cancelled"
+              ? `${message.content}\n\n[上一轮回复在此处被用户停止，请基于已有内容继续对话。]`
+              : message.content,
             attachments: message.attachments?.map(({ kind, name, remotePath, mimeType, size }) => ({
               kind,
               name,
