@@ -4786,6 +4786,13 @@ body.is-resizing-rows .system-dock {
   gap: 8px;
 }
 
+.settings-sync-endpoint-control {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
 .settings-model-control button {
   position: relative;
   height: 34px;

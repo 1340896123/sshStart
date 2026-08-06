@@ -37,7 +37,7 @@ import {
 } from "lucide-react";
 import { isTauri } from "../lib";
 import { getCloudSyncStatus, loginCloudSync, logoutCloudSync, registerCloudSync, type CloudSyncStatus } from "../storage";
-import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, type AiConfig, type AiToolKey } from "../types";
+import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiToolKey } from "../types";
 
 interface Props {
   config: AiConfig;
@@ -532,7 +532,10 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                   <header><strong>云端同步</strong><small>服务器列表和全部设置会在本地加密后再上传，云端永远只保存密文</small></header>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>同步服务地址</strong><small>填写团队或自建同步服务的 API 根地址</small></span>
-                    <input className="settings-input settings-mono-input" value={value.cloudSync.endpoint} onChange={(event) => setValue({ ...value, cloudSync: { ...value.cloudSync, endpoint: event.target.value } })} placeholder="https://sync.example.com/api" />
+                    <span className="settings-sync-endpoint-control">
+                      <input className="settings-input settings-mono-input" value={value.cloudSync.endpoint} onChange={(event) => setValue({ ...value, cloudSync: { ...value.cloudSync, endpoint: event.target.value } })} placeholder="https://sync.example.com/api" />
+                      <button className="secondary-button" type="button" onClick={() => setValue((current) => ({ ...current, cloudSync: { ...current.cloudSync, endpoint: OFFICIAL_CLOUD_SYNC_ENDPOINT } }))}>使用官方同步地址</button>
+                    </span>
                   </label>
                   <label className="mutating-tools-toggle">
                     <span className="tool-permission-icon"><Cloud size={14} /></span>

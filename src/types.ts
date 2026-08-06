@@ -273,9 +273,11 @@ export interface CloudSyncSettings {
   endpoint: string;
 }
 
+export const OFFICIAL_CLOUD_SYNC_ENDPOINT = "http://81.71.66.200:18787/";
+
 export const DEFAULT_CLOUD_SYNC_SETTINGS: CloudSyncSettings = {
   enabled: false,
-  endpoint: import.meta.env.VITE_PORTICO_SYNC_API_URL ?? "",
+  endpoint: import.meta.env.VITE_PORTICO_SYNC_API_URL ?? OFFICIAL_CLOUD_SYNC_ENDPOINT,
 };
 
 export interface AiConfig {
