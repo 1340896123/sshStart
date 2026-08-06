@@ -10,7 +10,9 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  GripVertical,
   MoreHorizontal,
+  Move,
   Pencil,
   Play,
   Plus,
@@ -23,7 +25,8 @@ import {
 import { connectionLabel } from "../lib";
 import {
   GROUP_SEPARATOR,
-  groupAncestors,
+  canMoveGroup,
+  collectOrderedGroupPaths,
   groupBreadcrumb,
   groupLeaf,
   groupParent,
@@ -33,6 +36,7 @@ import {
   removeGroupLevel,
   replaceGroupPrefix,
 } from "../serverGroups";
+import type { GroupMoveTarget, ServerDropPosition } from "../serverGroups";
 import type { ServerProfile, SessionState } from "../types";
 import { GroupDeleteDialog } from "./GroupDeleteDialog";
 
@@ -54,7 +58,13 @@ interface Props {
   onCopyServer: (server: ServerProfile) => void;
   onEditServer: (server: ServerProfile) => void;
   onDeleteServer: (server: ServerProfile) => void;
-  onMoveServer: (server: ServerProfile, group: string) => void;
+  onMoveServer: (
+    serverId: string,
+    group: string,
+    targetServerId?: string,
+    position?: ServerDropPosition,
+  ) => void;
+  onMoveGroup: (sourceGroup: string, target: GroupMoveTarget) => void;
   onCreateGroup: (group: string) => void;
   onRenameGroup: (currentGroup: string, nextGroup: string) => void;
   onDeleteGroup: (group: string, deleteServers: boolean) => void;
@@ -83,6 +93,15 @@ type GroupEditor =
   | { mode: "create"; parent: string; value: string }
   | { mode: "rename"; group: string; value: string };
 
+type DraggedTreeItem =
+  | { kind: "server"; serverId: string }
+  | { kind: "group"; group: string };
+
+type TreeDropTarget =
+  | { kind: "server"; serverId: string; position: ServerDropPosition }
+  | { kind: "group"; group: string; position: "before" | "inside" | "after" }
+  | { kind: "root" };
+
 const groupKey = (group: string) => group || UNGROUPED_KEY;
 const groupLabel = (group: string) => group ? groupLeaf(group) : "未分组";
 const treeDepthStyle = (level: number, editor = false) => ({
@@ -98,15 +117,7 @@ const flattenGroups = (nodes: GroupNode[]): GroupNode[] =>
   nodes.flatMap((node) => [node, ...flattenGroups(node.children)]);
 
 const buildGroupTree = (savedGroups: string[], servers: ServerProfile[]) => {
-  const orderedPaths: string[] = [];
-  const addPath = (path: string) => {
-    groupAncestors(path).forEach((ancestor) => {
-      if (!orderedPaths.includes(ancestor)) orderedPaths.push(ancestor);
-    });
-  };
-
-  savedGroups.forEach(addPath);
-  servers.forEach((server) => addPath(server.group));
+  const orderedPaths = collectOrderedGroupPaths(savedGroups, servers);
 
   const nodes = new Map(orderedPaths.map((path) => [path, {
     path,
@@ -177,6 +188,7 @@ export function ServerTree({
   onEditServer,
   onDeleteServer,
   onMoveServer,
+  onMoveGroup,
   onCreateGroup,
   onRenameGroup,
   onDeleteGroup,
@@ -195,11 +207,12 @@ export function ServerTree({
   const [groupError, setGroupError] = useState("");
   const [pendingGroupDelete, setPendingGroupDelete] = useState<{ group: string; serverCount: number }>();
   const [focusedKey, setFocusedKey] = useState<string>();
-  const [draggedServerId, setDraggedServerId] = useState<string>();
-  const [dropGroup, setDropGroup] = useState<string>();
+  const [draggedItem, setDraggedItem] = useState<DraggedTreeItem>();
+  const [dropTarget, setDropTarget] = useState<TreeDropTarget>();
 
   const allGroupTree = useMemo(() => buildGroupTree(savedGroups, servers), [savedGroups, servers]);
   const allGroups = useMemo(() => flattenGroups(allGroupTree), [allGroupTree]);
+  const allGroupPaths = useMemo(() => allGroups.map((node) => node.path).filter(Boolean), [allGroups]);
   const query = search.trim().toLocaleLowerCase();
   const groupTree = useMemo(() => filterGroupTree(allGroupTree, query), [allGroupTree, query]);
   const visibleGroups = useMemo(() => flattenGroups(groupTree), [groupTree]);
@@ -293,6 +306,51 @@ export function ServerTree({
     event.stopPropagation();
     const rect = event.currentTarget.getBoundingClientRect();
     openContextMenu(menu, rect.right - 6, rect.bottom - 2);
+  };
+
+  const finishDrag = () => {
+    setDraggedItem(undefined);
+    setDropTarget(undefined);
+  };
+
+  const beginDrag = (event: React.DragEvent<HTMLElement>, item: DraggedTreeItem) => {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", item.kind === "server" ? item.serverId : item.group);
+    setContextMenu(undefined);
+    setDraggedItem(item);
+    setDropTarget(undefined);
+  };
+
+  const groupDropPosition = (event: React.DragEvent<HTMLElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const ratio = (event.clientY - bounds.top) / bounds.height;
+    if (ratio < 0.28) return "before" as const;
+    if (ratio > 0.72) return "after" as const;
+    return "inside" as const;
+  };
+
+  const serverDropPosition = (event: React.DragEvent<HTMLElement>): ServerDropPosition => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    return event.clientY < bounds.top + bounds.height / 2 ? "before" : "after";
+  };
+
+  const groupMoveTarget = (
+    targetGroup: string,
+    position: "before" | "inside" | "after",
+  ): GroupMoveTarget => position === "inside"
+    ? { parent: targetGroup, position: "end" }
+    : { parent: groupParent(targetGroup), anchor: targetGroup, position };
+
+  const canDropGroup = (sourceGroup: string, target: GroupMoveTarget) =>
+    canMoveGroup(allGroupPaths, sourceGroup, target);
+
+  const expandAfterDrop = (group: string) => {
+    const key = groupKey(group);
+    if (!collapsedGroups.has(key)) return;
+    const next = new Set(collapsedGroups);
+    next.delete(key);
+    setCollapsedGroups(next);
+    onCollapsedGroupsChange([...next]);
   };
 
   const startCreateGroup = (parent = "") => {
@@ -415,19 +473,24 @@ export function ServerTree({
     const isSelected = selectedServerId === server.id;
     const isActive = activeServerId === server.id;
     const isConnected = serverSessions.some((session) => session.connected);
+    const serverDrop = dropTarget?.kind === "server" && dropTarget.serverId === server.id
+      ? `drop-${dropTarget.position}`
+      : "";
+    const isDragging = draggedItem?.kind === "server" && draggedItem.serverId === server.id;
 
     return (
       <div
         ref={(node) => { if (node) itemRefs.current.set(key, node); else itemRefs.current.delete(key); }}
-        className={`server-tree-row ${isSelected ? "selected" : ""} ${isActive ? "active-session" : ""} ${draggedServerId === server.id ? "dragging" : ""}`}
+        className={`server-tree-row ${isSelected ? "selected" : ""} ${isActive ? "active-session" : ""} ${isDragging ? "dragging" : ""} ${serverDrop}`}
         key={server.id}
         role="treeitem"
         aria-level={level}
         aria-selected={isSelected}
+        aria-grabbed={isDragging}
         tabIndex={focusedKey === key ? 0 : -1}
         title={connectionLabel(server)}
         style={treeDepthStyle(level)}
-        draggable
+        draggable={!query}
         onFocus={() => setFocusedKey(key)}
         onClick={() => onSelect(server)}
         onDoubleClick={() => onOpen(server)}
@@ -459,11 +522,33 @@ export function ServerTree({
           openContextMenu({ kind: "server", server }, event.clientX, event.clientY);
         }}
         onDragStart={(event) => {
-          event.dataTransfer.effectAllowed = "move";
-          event.dataTransfer.setData("text/plain", server.id);
-          setDraggedServerId(server.id);
+          if (query) {
+            event.preventDefault();
+            return;
+          }
+          beginDrag(event, { kind: "server", serverId: server.id });
         }}
-        onDragEnd={() => { setDraggedServerId(undefined); setDropGroup(undefined); }}
+        onDragOver={(event) => {
+          if (draggedItem?.kind !== "server" || draggedItem.serverId === server.id) {
+            setDropTarget(undefined);
+            return;
+          }
+          event.preventDefault();
+          event.stopPropagation();
+          event.dataTransfer.dropEffect = "move";
+          setDropTarget({ kind: "server", serverId: server.id, position: serverDropPosition(event) });
+        }}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTarget(undefined);
+        }}
+        onDrop={(event) => {
+          if (draggedItem?.kind !== "server" || draggedItem.serverId === server.id) return;
+          event.preventDefault();
+          event.stopPropagation();
+          onMoveServer(draggedItem.serverId, parentGroup, server.id, serverDropPosition(event));
+          finishDrag();
+        }}
+        onDragEnd={finishDrag}
       >
         <span className="tree-branch-line" />
         <span className={`tree-server-icon ${isConnected ? "connected" : ""}`}><Server size={14} /></span>
@@ -472,6 +557,11 @@ export function ServerTree({
           <span>{connectionLabel(server)}</span>
         </span>
         {serverSessions.length > 0 && <span className="session-count">{serverSessions.length}</span>}
+        <span
+          className={`tree-drag-handle ${query ? "disabled" : ""}`}
+          title={query ? "清除搜索后可拖动排序" : "拖动服务器排序或移动分组"}
+          aria-hidden="true"
+        ><GripVertical size={13} /></span>
         <button
           className="tree-row-menu"
           title={`${server.name} 操作`}
@@ -485,7 +575,10 @@ export function ServerTree({
   const renderGroup = (node: GroupNode, level: number): React.ReactNode => {
     const key = `group:${groupKey(node.path)}`;
     const expanded = isExpanded(node.path);
-    const isDropTarget = dropGroup === groupKey(node.path);
+    const groupDrop = dropTarget?.kind === "group" && dropTarget.group === node.path
+      ? `drop-${dropTarget.position}`
+      : (!node.path && dropTarget?.kind === "root" && draggedItem?.kind === "group" ? "drop-before" : "");
+    const isDragging = draggedItem?.kind === "group" && draggedItem.group === node.path;
     const hasContents = node.children.length > 0 || node.items.length > 0
       || (groupEditor?.mode === "create" && groupEditor.parent === node.path);
     const parentKey = groupParent(node.path);
@@ -495,13 +588,15 @@ export function ServerTree({
         {groupEditor?.mode === "rename" && groupEditor.group === node.path ? renderGroupEditor(level) : (
           <div
             ref={(element) => { if (element) itemRefs.current.set(key, element); else itemRefs.current.delete(key); }}
-            className={`server-tree-group-row ${isDropTarget ? "drop-target" : ""}`}
+            className={`server-tree-group-row ${groupDrop} ${isDragging ? "dragging" : ""}`}
             role="treeitem"
             aria-expanded={hasContents ? expanded : undefined}
             aria-level={level}
+            aria-grabbed={isDragging}
             tabIndex={focusedKey === key ? 0 : -1}
             style={treeDepthStyle(level)}
             title={node.path ? groupBreadcrumb(node.path) : "未分组"}
+            draggable={!query && Boolean(node.path)}
             onFocus={() => setFocusedKey(key)}
             onClick={() => toggleGroup(node.path)}
             onKeyDown={(event) => {
@@ -530,17 +625,72 @@ export function ServerTree({
               event.preventDefault();
               openContextMenu({ kind: "group", group: node.path }, event.clientX, event.clientY);
             }}
-            onDragOver={(event) => { event.preventDefault(); setDropGroup(groupKey(node.path)); }}
+            onDragStart={(event) => {
+              if (query || !node.path) {
+                event.preventDefault();
+                return;
+              }
+              beginDrag(event, { kind: "group", group: node.path });
+            }}
+            onDragOver={(event) => {
+              if (!draggedItem) return;
+              if (draggedItem.kind === "server") {
+                event.preventDefault();
+                event.stopPropagation();
+                event.dataTransfer.dropEffect = "move";
+                setDropTarget({ kind: "group", group: node.path, position: "inside" });
+                return;
+              }
+
+              if (!node.path) {
+                const target: GroupMoveTarget = { parent: "", position: "end" };
+                if (!canDropGroup(draggedItem.group, target)) {
+                  setDropTarget(undefined);
+                  return;
+                }
+                event.preventDefault();
+                event.stopPropagation();
+                event.dataTransfer.dropEffect = "move";
+                setDropTarget({ kind: "root" });
+                return;
+              }
+
+              const position = groupDropPosition(event);
+              const target = groupMoveTarget(node.path, position);
+              if (!canDropGroup(draggedItem.group, target)) {
+                setDropTarget(undefined);
+                return;
+              }
+              event.preventDefault();
+              event.stopPropagation();
+              event.dataTransfer.dropEffect = "move";
+              setDropTarget({ kind: "group", group: node.path, position });
+            }}
             onDragLeave={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropGroup(undefined);
+              if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTarget(undefined);
             }}
             onDrop={(event) => {
+              if (!draggedItem) return;
               event.preventDefault();
-              const server = servers.find((item) => item.id === draggedServerId);
-              if (server && normalizeGroupPath(server.group) !== node.path) onMoveServer(server, node.path);
-              setDraggedServerId(undefined);
-              setDropGroup(undefined);
+              event.stopPropagation();
+              if (draggedItem.kind === "server") {
+                onMoveServer(draggedItem.serverId, node.path);
+                expandAfterDrop(node.path);
+                finishDrag();
+                return;
+              }
+
+              const position = node.path ? groupDropPosition(event) : undefined;
+              const target: GroupMoveTarget = node.path && position
+                ? groupMoveTarget(node.path, position)
+                : { parent: "", position: "end" };
+              if (canDropGroup(draggedItem.group, target)) {
+                onMoveGroup(draggedItem.group, target);
+                if (position === "inside") expandAfterDrop(node.path);
+              }
+              finishDrag();
             }}
+            onDragEnd={finishDrag}
           >
             <span className="tree-chevron">
               {hasContents ? (expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />) : null}
@@ -548,6 +698,11 @@ export function ServerTree({
             <span className="tree-folder">{expanded && hasContents ? <FolderOpen size={15} /> : <Folder size={15} />}</span>
             <span className="tree-label">{node.name}</span>
             <small>{node.totalServers}</small>
+            <span
+              className={`tree-drag-handle ${query || !node.path ? "disabled" : ""}`}
+              title={query ? "清除搜索后可拖动排序" : node.path ? "拖动分组排序或嵌套" : "未分组不能移动"}
+              aria-hidden="true"
+            ><GripVertical size={13} /></span>
             <button
               className="tree-row-menu"
               title={`${node.name} 操作`}
@@ -610,7 +765,11 @@ export function ServerTree({
       </label>
 
       <div className="tree-toolbar">
-        <span>{visibleServerCount} 台服务器 · {visibleGroups.length} 个分组</span>
+        <span>{draggedItem
+          ? draggedItem.kind === "group"
+            ? "边缘排序 · 中部嵌套"
+            : "拖到服务器间排序 · 拖到分组内移动"
+          : `${visibleServerCount} 台服务器 · ${visibleGroups.length} 个分组`}</span>
         <button
           className="tree-tool-button"
           title={allGroupsCollapsed ? "全部展开" : "全部折叠"}
@@ -624,6 +783,38 @@ export function ServerTree({
       <div className="server-tree" role="tree" aria-label="服务器连接">
         {groupEditor?.mode === "create" && !groupEditor.parent && renderGroupEditor(1)}
         {groupTree.map((node) => renderGroup(node, 1))}
+
+        {draggedItem && !query && (
+          <div
+            className={`tree-root-drop-zone ${dropTarget?.kind === "root" ? "drop-target" : ""}`}
+            onDragOver={(event) => {
+              if (draggedItem.kind === "group") {
+                const target: GroupMoveTarget = { parent: "", position: "end" };
+                if (!canDropGroup(draggedItem.group, target)) return;
+              }
+              event.preventDefault();
+              event.stopPropagation();
+              event.dataTransfer.dropEffect = "move";
+              setDropTarget({ kind: "root" });
+            }}
+            onDragLeave={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTarget(undefined);
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (draggedItem.kind === "server") onMoveServer(draggedItem.serverId, "");
+              else {
+                const target: GroupMoveTarget = { parent: "", position: "end" };
+                if (canDropGroup(draggedItem.group, target)) onMoveGroup(draggedItem.group, target);
+              }
+              finishDrag();
+            }}
+          >
+            <Move size={13} />
+            <span>{draggedItem.kind === "group" ? "移至顶层末尾" : "移至未分组末尾"}</span>
+          </div>
+        )}
 
         {groupTree.length === 0 && groupEditor?.mode !== "create" && (
           <div className="sidebar-empty">
@@ -677,7 +868,7 @@ export function ServerTree({
                         key={groupKey(group)}
                         disabled={currentGroup === group}
                         title={group ? groupBreadcrumb(group) : "未分组"}
-                        onClick={() => { onMoveServer(contextMenu.server, group); setContextMenu(undefined); }}
+                        onClick={() => { onMoveServer(contextMenu.server.id, group); setContextMenu(undefined); }}
                       >
                         {currentGroup === group ? <Check size={14} /> : <Folder size={14} />}
                         <span>{group ? groupBreadcrumb(group) : "未分组"}</span>

@@ -30,7 +30,14 @@ import { SystemDock } from "./components/SystemDock";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
 import { initializeAiConversations, readAiConversations } from "./aiHistory";
 import { DEMO_SERVER, isTauri, uid } from "./lib";
-import { isGroupWithin, normalizeGroupPath, removeGroupLevel, replaceGroupPrefix } from "./serverGroups";
+import {
+  isGroupWithin,
+  moveGroupToPosition,
+  moveServerToPosition,
+  normalizeGroupPath,
+  removeGroupLevel,
+  replaceGroupPrefix,
+} from "./serverGroups";
 import {
   AI_IMPORT_GROUP,
   materializeServerDrafts,
@@ -50,6 +57,7 @@ import {
   type AppStorageSnapshot,
 } from "./storage";
 import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
+import type { GroupMoveTarget, ServerDropPosition } from "./serverGroups";
 import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
 import type { ServerImportDraft, ServerImportSummary } from "./serverImportExport";
 
@@ -669,10 +677,28 @@ export default function App() {
     });
   };
 
-  const moveServer = (server: ServerProfile, group: string) => {
+  const moveServer = (
+    serverId: string,
+    group: string,
+    targetServerId?: string,
+    position?: ServerDropPosition,
+  ) => {
     const normalized = normalizeGroupPath(group);
-    setServers((current) => current.map((item) => item.id === server.id ? { ...item, group: normalized } : item));
+    setServers((current) => moveServerToPosition(current, serverId, normalized, targetServerId, position));
     if (normalized) setSavedGroups((current) => current.includes(normalized) ? current : [...current, normalized]);
+    setCollapsedGroups((current) => current.filter((item) => item !== (normalized || "__ungrouped__")));
+  };
+
+  const moveGroup = (sourceGroup: string, target: GroupMoveTarget) => {
+    const result = moveGroupToPosition(savedGroups, servers, sourceGroup, target);
+    if (!result) return;
+    setServers(result.servers);
+    setSavedGroups(result.groups);
+    setCollapsedGroups((current) => [...new Set(
+      current
+        .map((group) => replaceGroupPrefix(group, sourceGroup, result.movedGroup))
+        .filter((group) => group !== normalizeGroupPath(target.parent)),
+    )]);
   };
 
   const downloadInBrowser = (content: string, fileName: string) => {
@@ -902,6 +928,7 @@ export default function App() {
               onEditServer={(server) => openServerDialog(server)}
               onDeleteServer={(server) => deleteServer(server.id)}
               onMoveServer={moveServer}
+              onMoveGroup={moveGroup}
               onCreateGroup={createGroup}
               onRenameGroup={renameGroup}
               onDeleteGroup={deleteGroup}
