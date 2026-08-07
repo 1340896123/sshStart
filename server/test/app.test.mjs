@@ -112,7 +112,7 @@ test("sync snapshots are opaque and isolated by account", async (context) => {
     headers: { authorization: `Bearer ${first.body.token}` },
   });
   assert.equal(downloaded.response.status, 200);
-  assert.deepEqual(downloaded.body, { ciphertext });
+  assert.deepEqual(downloaded.body, { ciphertext, updatedAt: 1785945600 });
 
   const otherAccount = await requestJson(fixture.baseUrl, "/sync/data", {
     headers: { authorization: `Bearer ${second.body.token}` },

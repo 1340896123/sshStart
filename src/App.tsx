@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -6,6 +6,7 @@ import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plug
 import {
   Bell,
   Braces,
+  Cloud,
   CircleHelp,
   Command,
   FolderSync,
@@ -55,6 +56,7 @@ import {
   pullCloudSync,
   pushCloudSync,
   type AppStorageSnapshot,
+  type CloudSyncProgress,
   type ServerKeyPathUpdate,
 } from "./storage";
 import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
@@ -130,6 +132,7 @@ export default function App() {
   const [aiImportOpen, setAiImportOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
+  const [cloudSyncActivity, setCloudSyncActivity] = useState<CloudSyncProgress>();
   const cancelledTransfers = useRef(new Set<string>());
   const transferProgressSamples = useRef(new Map<string, {
     transferredBytes: number;
@@ -142,9 +145,68 @@ export default function App() {
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const activeServer = servers.find((server) => server.id === activeSession?.serverId);
 
+  const createCurrentSnapshot = useCallback((): AppStorageSnapshot => ({
+    servers,
+    savedGroups,
+    aiConfig: serializeAiConfigForStorage(aiConfig),
+    aiConversations: readAiConversations(),
+    collapsedGroups,
+  }), [aiConfig, collapsedGroups, savedGroups, servers]);
+
+  const startCloudSyncPush = useCallback(async (endpoint: string, snapshot: AppStorageSnapshot) => {
+    const operationId = uid("cloud-push");
+    setCloudSyncActivity({ operationId, operation: "push", status: "running", phase: "queued", progress: 4, message: "等待上传应用数据" });
+    try {
+      await pushCloudSync(endpoint, snapshot, operationId);
+      setCloudSyncActivity((current) => current?.operationId === operationId
+        ? { ...current, status: "success", phase: "completed", progress: 100, message: "应用数据已同步" }
+        : current);
+    } catch (error) {
+      setCloudSyncActivity({ operationId, operation: "push", status: "error", phase: "failed", progress: 0, message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }, []);
+
+  const startCloudSyncPull = useCallback(async (endpoint: string) => {
+    const operationId = uid("cloud-pull");
+    setCloudSyncActivity({ operationId, operation: "pull", status: "running", phase: "queued", progress: 4, message: "等待下载应用数据" });
+    try {
+      const snapshot = await pullCloudSync(endpoint, operationId);
+      setCloudSyncActivity((current) => current?.operationId === operationId
+        ? { ...current, status: "success", phase: "completed", progress: 100, message: snapshot ? "应用数据已同步" : "云端暂无应用快照，保留当前设备数据" }
+        : current);
+      return snapshot;
+    } catch (error) {
+      setCloudSyncActivity({ operationId, operation: "pull", status: "error", phase: "failed", progress: 0, message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }, []);
+
+  const syncNow = useCallback(() => {
+    if (!aiConfig.cloudSync.endpoint.trim()) return Promise.reject(new Error("请先配置云端同步服务地址"));
+    return startCloudSyncPush(aiConfig.cloudSync.endpoint, createCurrentSnapshot());
+  }, [aiConfig.cloudSync.endpoint, createCurrentSnapshot, startCloudSyncPush]);
+
+  const cloudSyncActivityLabel = cloudSyncActivity?.operation === "pull"
+    ? "下载同步"
+    : cloudSyncActivity?.operation === "keys-upload"
+      ? "上传密钥"
+      : cloudSyncActivity?.operation === "keys-download"
+        ? "恢复密钥"
+        : "上传同步";
+
   useEffect(() => {
-    if (!isTauri()) return;
     let disposed = false;
+    let unlisten: (() => void) | undefined;
+    if (isTauri()) {
+      void listen<CloudSyncProgress>("cloud-sync-progress", ({ payload }) => {
+        if (!disposed) setCloudSyncActivity(payload);
+      }).then((dispose) => {
+        if (disposed) dispose();
+        else unlisten = dispose;
+      });
+    }
+    if (!isTauri()) return () => { disposed = true; };
     void loadAppStorage()
       .then((state) => {
         if (disposed) return;
@@ -169,7 +231,7 @@ export default function App() {
           finish(state);
           return;
         }
-        void pullCloudSync(localConfig.cloudSync.endpoint)
+        void startCloudSyncPull(localConfig.cloudSync.endpoint)
           .then((remote) => finish(remote ?? state))
           .catch((error) => {
             console.warn("Failed to pull cloud sync state", error);
@@ -183,26 +245,21 @@ export default function App() {
       });
     return () => {
       disposed = true;
+      unlisten?.();
     };
-  }, []);
+  }, [startCloudSyncPull]);
 
   useEffect(() => {
     if (!storageReady || !syncHydrated.current || !isTauri()) return;
     if (!aiConfig.cloudSync.enabled || !aiConfig.cloudSync.endpoint.trim()) return;
-    const snapshot: AppStorageSnapshot = {
-      servers,
-      savedGroups,
-      aiConfig: serializeAiConfigForStorage(aiConfig),
-      aiConversations: readAiConversations(),
-      collapsedGroups,
-    };
+    const snapshot = createCurrentSnapshot();
     const timer = window.setTimeout(() => {
-      void pushCloudSync(aiConfig.cloudSync.endpoint, snapshot).catch((error) => {
+      void startCloudSyncPush(aiConfig.cloudSync.endpoint, snapshot).catch((error) => {
         console.warn("Failed to push cloud sync state", error);
       });
     }, 700);
     return () => window.clearTimeout(timer);
-  }, [aiConfig, collapsedGroups, savedGroups, servers, storageReady]);
+  }, [aiConfig, collapsedGroups, createCurrentSnapshot, savedGroups, servers, startCloudSyncPush, storageReady]);
 
   useEffect(() => {
     if (!storageReady) return;
@@ -895,6 +952,13 @@ export default function App() {
         <div className="titlebar-status">
           <span className="environment-dot" />
           <span>{isTauri() ? "Native core ready" : "Browser preview"}</span>
+          {cloudSyncActivity && (
+            <span className={`titlebar-sync-status ${cloudSyncActivity.status}`} title={cloudSyncActivity.message}>
+              <Cloud size={12} />
+              <span>{cloudSyncActivity.status === "running" ? cloudSyncActivityLabel : cloudSyncActivity.status === "success" ? "已同步" : "同步失败"}</span>
+              {cloudSyncActivity.status === "running" && <em>{cloudSyncActivity.progress}%</em>}
+            </span>
+          )}
         </div>
         <div className="titlebar-actions">
           <button className="icon-button quiet" aria-label="通知" title="通知"><Bell size={14} /></button>
@@ -1112,7 +1176,7 @@ export default function App() {
           onImport={importAiServerList}
         />
       )}
-      {settingsOpen && <SettingsDialog config={aiConfig} servers={servers} onSave={saveAiConfig} onRemoveSavedKey={removeSavedAiKey} onManageServerKeyPaths={manageServerKeyPaths} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsDialog config={aiConfig} servers={servers} cloudSyncActivity={cloudSyncActivity} onSyncNow={syncNow} onSave={saveAiConfig} onRemoveSavedKey={removeSavedAiKey} onManageServerKeyPaths={manageServerKeyPaths} onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }

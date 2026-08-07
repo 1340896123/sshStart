@@ -38,7 +38,7 @@ AI settings accept endpoints implementing the OpenAI `chat/completions` schema a
 Cloud sync is intentionally backend-agnostic. Configure the API root in Settings → Cloud Sync (or set `VITE_PORTICO_SYNC_API_URL` before building). The service must expose:
 
 - `POST /auth/register` and `POST /auth/login` with `{ "email": string, "password": string }`, returning `{ "token": string, "email": string }` (an `accessToken` field is also accepted).
-- `GET /sync/data` with a bearer token, returning `{ "ciphertext": string }`; return `404` when the account has no snapshot yet.
+- `GET /sync/data` with a bearer token, returning `{ "ciphertext": string, "updatedAt": number }`; return `404` when the account has no snapshot yet.
 - `PUT /sync/data` with a bearer token and `{ "ciphertext": string, "updatedAt": number }`.
 - `GET /sync/keys` with a bearer token, returning `{ "ciphertext": string, "updatedAt": number }`; return `404` before the first key backup.
 - `PUT /sync/keys` with a bearer token and `{ "ciphertext": string, "updatedAt": number }`.

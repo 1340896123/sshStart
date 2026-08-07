@@ -32,7 +32,7 @@ For an internet-facing deployment, terminate TLS at a reverse proxy, keep the se
 
 - `POST /auth/register` creates an account and returns `{ "token", "email" }`.
 - `POST /auth/login` verifies an account and returns `{ "token", "email" }`.
-- `GET /sync/data` returns `{ "ciphertext" }`, or `404` before the first upload.
+- `GET /sync/data` returns `{ "ciphertext", "updatedAt" }`, or `404` before the first upload.
 - `PUT /sync/data` stores `{ "ciphertext", "updatedAt" }` for the authenticated account.
 - `GET /sync/keys` returns the opaque passphrase-encrypted `*.key` backup, or `404` before the first upload.
 - `PUT /sync/keys` stores `{ "ciphertext", "updatedAt" }` for the authenticated account.

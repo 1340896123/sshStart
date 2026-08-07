@@ -12,8 +12,10 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tauri::{AppHandle, Emitter};
 
 const TOKEN_ACCOUNT: &str = "sync:token";
 const EMAIL_ACCOUNT: &str = "sync:email";
@@ -21,6 +23,9 @@ const MAX_KEY_FILES: usize = 128;
 const MAX_KEY_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_KEY_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const PORTABLE_KEY_PREFIX: &str = "portico-key://";
+const SYNC_STATE_FILE: &str = "sync-state.json";
+
+static SYNC_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +33,57 @@ pub struct SyncStatus {
     pub authenticated: bool,
     pub email: Option<String>,
     pub key_path: String,
+    pub last_data_sync: Option<SyncRecord>,
+    pub last_key_sync: Option<KeySyncRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncContentSummary {
+    pub server_count: usize,
+    pub group_count: usize,
+    pub conversation_count: usize,
+    pub collapsed_group_count: usize,
+    pub has_ai_config: bool,
+    pub encrypted_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncRecord {
+    pub direction: String,
+    pub completed_at: u64,
+    pub remote_updated_at: Option<u64>,
+    pub content: SyncContentSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeySyncRecord {
+    pub direction: String,
+    pub completed_at: u64,
+    pub updated_at: u64,
+    pub file_count: usize,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedSyncState {
+    email: Option<String>,
+    last_data_sync: Option<SyncRecord>,
+    last_key_sync: Option<KeySyncRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncProgressEvent {
+    operation_id: String,
+    operation: String,
+    status: String,
+    phase: String,
+    progress: u8,
+    message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -176,6 +232,108 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn sync_state_path() -> Result<PathBuf, String> {
+    Ok(portico_directory()?.join(SYNC_STATE_FILE))
+}
+
+fn load_sync_state() -> Result<PersistedSyncState, String> {
+    let path = sync_state_path()?;
+    match fs::read_to_string(path) {
+        Ok(value) => {
+            serde_json::from_str(&value).map_err(|error| format!("读取同步状态失败: {error}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(PersistedSyncState::default())
+        }
+        Err(error) => Err(format!("读取同步状态失败: {error}")),
+    }
+}
+
+fn save_sync_state_unlocked(mut state: PersistedSyncState) -> Result<(), String> {
+    let directory = portico_directory()?;
+    fs::create_dir_all(&directory).map_err(|error| format!("创建同步状态目录失败: {error}"))?;
+    state.email = email();
+    let payload = serde_json::to_vec_pretty(&state)
+        .map_err(|error| format!("序列化同步状态失败: {error}"))?;
+    fs::write(directory.join(SYNC_STATE_FILE), payload)
+        .map_err(|error| format!("保存同步状态失败: {error}"))
+}
+
+fn sync_state_lock() -> &'static Mutex<()> {
+    SYNC_STATE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn sync_state_for_current_account() -> Result<PersistedSyncState, String> {
+    let _guard = sync_state_lock()
+        .lock()
+        .map_err(|_| "同步状态锁已损坏".to_string())?;
+    let state = load_sync_state()?;
+    if state.email == email() {
+        Ok(state)
+    } else {
+        Ok(PersistedSyncState::default())
+    }
+}
+
+fn update_data_sync_state(record: SyncRecord) -> Result<(), String> {
+    let _guard = sync_state_lock()
+        .lock()
+        .map_err(|_| "同步状态锁已损坏".to_string())?;
+    let mut state = load_sync_state()?;
+    state.last_data_sync = Some(record);
+    save_sync_state_unlocked(state)
+}
+
+fn update_key_sync_state(record: KeySyncRecord) -> Result<(), String> {
+    let _guard = sync_state_lock()
+        .lock()
+        .map_err(|_| "同步状态锁已损坏".to_string())?;
+    let mut state = load_sync_state()?;
+    state.last_key_sync = Some(record);
+    save_sync_state_unlocked(state)
+}
+
+fn summarize_snapshot(snapshot: &Value, encrypted_bytes: usize) -> SyncContentSummary {
+    let array_len = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    SyncContentSummary {
+        server_count: array_len("servers"),
+        group_count: array_len("savedGroups"),
+        conversation_count: array_len("aiConversations"),
+        collapsed_group_count: array_len("collapsedGroups"),
+        has_ai_config: snapshot
+            .get("aiConfig")
+            .is_some_and(|value| !value.is_null()),
+        encrypted_bytes,
+    }
+}
+
+fn emit_progress(
+    app: &AppHandle,
+    operation_id: &str,
+    operation: &str,
+    status: &str,
+    phase: &str,
+    progress: u8,
+    message: &str,
+) {
+    let _ = app.emit(
+        "cloud-sync-progress",
+        SyncProgressEvent {
+            operation_id: operation_id.to_string(),
+            operation: operation.to_string(),
+            status: status.to_string(),
+            phase: phase.to_string(),
+            progress,
+            message: message.to_string(),
+        },
+    );
 }
 
 fn validate_key_passphrase(passphrase: &str) -> Result<(), String> {
@@ -725,10 +883,13 @@ pub async fn sync_login(
 
 #[tauri::command]
 pub fn sync_status() -> Result<SyncStatus, String> {
+    let state = sync_state_for_current_account()?;
     Ok(SyncStatus {
         authenticated: token().is_some(),
         email: email(),
         key_path: key_file_path()?,
+        last_data_sync: state.last_data_sync,
+        last_key_sync: state.last_key_sync,
     })
 }
 
@@ -915,37 +1076,117 @@ fn strip_snapshot_secrets(mut snapshot: Value) -> Value {
     snapshot
 }
 
-fn push_sync(endpoint: String, snapshot: Value) -> Result<(), String> {
+fn push_sync(
+    app: AppHandle,
+    operation_id: String,
+    endpoint: String,
+    snapshot: Value,
+) -> Result<(), String> {
+    emit_progress(
+        &app,
+        &operation_id,
+        "push",
+        "running",
+        "preparing",
+        12,
+        "正在整理应用数据",
+    );
     let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
     let client = request_client()?;
     let snapshot =
         make_snapshot_key_paths_portable(hydrate_snapshot(snapshot), &portico_directory()?)?;
+    let summary_without_size = summarize_snapshot(&snapshot, 0);
+    emit_progress(
+        &app,
+        &operation_id,
+        "push",
+        "running",
+        "encrypting",
+        38,
+        "正在加密应用快照",
+    );
     let encrypted = encrypt_json(&snapshot)?;
+    let content = SyncContentSummary {
+        encrypted_bytes: encrypted.len(),
+        ..summary_without_size
+    };
+    emit_progress(
+        &app,
+        &operation_id,
+        "push",
+        "running",
+        "uploading",
+        68,
+        "正在上传加密快照",
+    );
+    let updated_at = unix_timestamp();
     let response = client
         .put(format!("{endpoint}/sync/data"))
         .bearer_auth(token)
         .json(&json!({
             "ciphertext": encrypted,
-            "updatedAt": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            "updatedAt": updated_at,
         }))
         .send()
         .map_err(|error| format!("上传同步数据失败: {error}"))?;
     if response.status().is_success() {
+        update_data_sync_state(SyncRecord {
+            direction: "upload".to_string(),
+            completed_at: unix_timestamp(),
+            remote_updated_at: Some(updated_at),
+            content,
+        })?;
+        emit_progress(
+            &app,
+            &operation_id,
+            "push",
+            "success",
+            "completed",
+            100,
+            "应用数据已同步",
+        );
         Ok(())
     } else {
         Err(response_error(response))
     }
 }
 
-fn pull_sync(endpoint: String) -> Result<Value, String> {
+fn pull_sync(app: AppHandle, operation_id: String, endpoint: String) -> Result<Value, String> {
+    emit_progress(
+        &app,
+        &operation_id,
+        "pull",
+        "running",
+        "connecting",
+        12,
+        "正在连接同步服务",
+    );
     let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
     let client = request_client()?;
+    emit_progress(
+        &app,
+        &operation_id,
+        "pull",
+        "running",
+        "downloading",
+        38,
+        "正在下载加密快照",
+    );
     let response = client
         .get(format!("{endpoint}/sync/data"))
         .bearer_auth(token)
         .send()
         .map_err(|error| format!("下载同步数据失败: {error}"))?;
     if response.status().as_u16() == 404 {
+        emit_progress(
+            &app,
+            &operation_id,
+            "pull",
+            "success",
+            "completed",
+            100,
+            "云端暂无应用快照，保留当前设备数据",
+        );
         return Ok(Value::Null);
     }
     if !response.status().is_success() {
@@ -959,32 +1200,91 @@ fn pull_sync(endpoint: String) -> Result<Value, String> {
         .or_else(|| payload.get("data"))
         .and_then(Value::as_str)
         .ok_or_else(|| "同步服务没有返回密文".to_string())?;
+    let remote_updated_at = payload.get("updatedAt").and_then(Value::as_u64);
+    emit_progress(
+        &app,
+        &operation_id,
+        "pull",
+        "running",
+        "decrypting",
+        66,
+        "正在解密并校验快照",
+    );
     let snapshot = resolve_snapshot_key_paths(decrypt_json(ciphertext)?, &portico_directory()?)?;
+    let content = summarize_snapshot(&snapshot, ciphertext.len());
+    emit_progress(
+        &app,
+        &operation_id,
+        "pull",
+        "running",
+        "applying",
+        86,
+        "正在应用已同步内容",
+    );
     store_snapshot_secrets(&snapshot)?;
+    update_data_sync_state(SyncRecord {
+        direction: "download".to_string(),
+        completed_at: unix_timestamp(),
+        remote_updated_at,
+        content,
+    })?;
+    emit_progress(
+        &app,
+        &operation_id,
+        "pull",
+        "success",
+        "completed",
+        100,
+        "应用数据已同步",
+    );
     Ok(strip_snapshot_secrets(snapshot))
 }
 
 #[tauri::command]
-pub async fn sync_push(endpoint: String, snapshot: Value) -> Result<(), String> {
+pub async fn sync_push(
+    app: AppHandle,
+    endpoint: String,
+    snapshot: Value,
+    operation_id: String,
+) -> Result<(), String> {
     let endpoint = normalize_endpoint(&endpoint)?;
-    tauri::async_runtime::spawn_blocking(move || push_sync(endpoint, snapshot))
-        .await
-        .map_err(|error| format!("上传同步任务失败: {error}"))?
+    let operation_id_for_task = operation_id.clone();
+    let app_for_task = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        push_sync(app_for_task, operation_id_for_task, endpoint, snapshot)
+    })
+    .await
+    .map_err(|error| format!("上传同步任务失败: {error}"))?;
+    if let Err(error) = &result {
+        emit_progress(&app, &operation_id, "push", "error", "failed", 0, error);
+    }
+    result
 }
 
 #[tauri::command]
-pub async fn sync_pull(endpoint: String) -> Result<Option<Value>, String> {
+pub async fn sync_pull(
+    app: AppHandle,
+    endpoint: String,
+    operation_id: String,
+) -> Result<Option<Value>, String> {
     let endpoint = normalize_endpoint(&endpoint)?;
-    tauri::async_runtime::spawn_blocking(move || pull_sync(endpoint))
-        .await
-        .map_err(|error| format!("下载同步任务失败: {error}"))?
-        .map(|snapshot| {
-            if snapshot.is_null() {
-                None
-            } else {
-                Some(snapshot)
-            }
-        })
+    let operation_id_for_task = operation_id.clone();
+    let app_for_task = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        pull_sync(app_for_task, operation_id_for_task, endpoint)
+    })
+    .await
+    .map_err(|error| format!("下载同步任务失败: {error}"))?;
+    if let Err(error) = &result {
+        emit_progress(&app, &operation_id, "pull", "error", "failed", 0, error);
+    }
+    result.map(|snapshot| {
+        if snapshot.is_null() {
+            None
+        } else {
+            Some(snapshot)
+        }
+    })
 }
 
 #[tauri::command]
@@ -993,17 +1293,46 @@ pub fn sync_list_key_files(servers: Vec<ServerKeyProfile>) -> Result<Vec<KeyFile
 }
 
 fn upload_keys(
+    app: AppHandle,
+    operation_id: String,
     endpoint: String,
     passphrase: String,
     servers: Vec<ServerKeyProfile>,
 ) -> Result<KeySyncResult, String> {
+    emit_progress(
+        &app,
+        &operation_id,
+        "keys-upload",
+        "running",
+        "collecting",
+        14,
+        "正在整理本地密钥文件",
+    );
     let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
     let prepared = build_key_bundle(&servers)?;
     persist_managed_key_copies(&prepared.managed_copies)?;
+    emit_progress(
+        &app,
+        &operation_id,
+        "keys-upload",
+        "running",
+        "encrypting",
+        42,
+        "正在加密密钥备份",
+    );
     let plaintext = serde_json::to_vec(&prepared.bundle)
         .map_err(|error| format!("序列化密钥备份失败: {error}"))?;
     let ciphertext = encrypt_with_passphrase(&plaintext, &passphrase)?;
     let client = request_client()?;
+    emit_progress(
+        &app,
+        &operation_id,
+        "keys-upload",
+        "running",
+        "uploading",
+        72,
+        "正在上传密钥备份",
+    );
     let response = client
         .put(format!("{endpoint}/sync/keys"))
         .bearer_auth(token)
@@ -1016,31 +1345,83 @@ fn upload_keys(
     if !response.status().is_success() {
         return Err(response_error(response));
     }
-    Ok(KeySyncResult {
+    let result = KeySyncResult {
         files: prepared.files,
         updated_at: prepared.bundle.created_at,
         path_updates: prepared.path_updates,
-    })
+    };
+    update_key_sync_state(KeySyncRecord {
+        direction: "upload".to_string(),
+        completed_at: unix_timestamp(),
+        updated_at: result.updated_at,
+        file_count: result.files.len(),
+        total_bytes: result.files.iter().map(|file| file.size).sum(),
+    })?;
+    emit_progress(
+        &app,
+        &operation_id,
+        "keys-upload",
+        "success",
+        "completed",
+        100,
+        "密钥备份已同步",
+    );
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn sync_upload_keys(
+    app: AppHandle,
     endpoint: String,
     passphrase: String,
     servers: Vec<ServerKeyProfile>,
+    operation_id: String,
 ) -> Result<KeySyncResult, String> {
     let endpoint = normalize_endpoint(&endpoint)?;
     validate_key_passphrase(&passphrase)?;
-    tauri::async_runtime::spawn_blocking(move || upload_keys(endpoint, passphrase, servers))
-        .await
-        .map_err(|error| format!("上传密钥备份任务失败: {error}"))?
+    let operation_id_for_task = operation_id.clone();
+    let app_for_task = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        upload_keys(
+            app_for_task,
+            operation_id_for_task,
+            endpoint,
+            passphrase,
+            servers,
+        )
+    })
+    .await
+    .map_err(|error| format!("上传密钥备份任务失败: {error}"))?;
+    if let Err(error) = &result {
+        emit_progress(
+            &app,
+            &operation_id,
+            "keys-upload",
+            "error",
+            "failed",
+            0,
+            error,
+        );
+    }
+    result
 }
 
 fn download_keys(
+    app: AppHandle,
+    operation_id: String,
     endpoint: String,
     passphrase: String,
     overwrite: bool,
 ) -> Result<KeySyncResult, String> {
+    emit_progress(
+        &app,
+        &operation_id,
+        "keys-download",
+        "running",
+        "downloading",
+        24,
+        "正在下载密钥备份",
+    );
     let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
     let client = request_client()?;
     let response = client
@@ -1062,26 +1443,84 @@ fn download_keys(
         .and_then(Value::as_str)
         .ok_or_else(|| "同步服务没有返回密钥备份密文".to_string())?;
     let server_updated_at = payload.get("updatedAt").and_then(Value::as_u64);
+    emit_progress(
+        &app,
+        &operation_id,
+        "keys-download",
+        "running",
+        "decrypting",
+        58,
+        "正在解密密钥备份",
+    );
     let plaintext = decrypt_with_passphrase(ciphertext, &passphrase)?;
     let (bundle, files) = decode_key_bundle(&plaintext)?;
+    emit_progress(
+        &app,
+        &operation_id,
+        "keys-download",
+        "running",
+        "restoring",
+        82,
+        "正在恢复密钥文件",
+    );
     let mut result = restore_key_bundle(&bundle, files, overwrite)?;
     if let Some(updated_at) = server_updated_at {
         result.updated_at = updated_at;
     }
+    update_key_sync_state(KeySyncRecord {
+        direction: "download".to_string(),
+        completed_at: unix_timestamp(),
+        updated_at: result.updated_at,
+        file_count: result.files.len(),
+        total_bytes: result.files.iter().map(|file| file.size).sum(),
+    })?;
+    emit_progress(
+        &app,
+        &operation_id,
+        "keys-download",
+        "success",
+        "completed",
+        100,
+        "密钥备份已恢复",
+    );
     Ok(result)
 }
 
 #[tauri::command]
 pub async fn sync_download_keys(
+    app: AppHandle,
     endpoint: String,
     passphrase: String,
     overwrite: bool,
+    operation_id: String,
 ) -> Result<KeySyncResult, String> {
     let endpoint = normalize_endpoint(&endpoint)?;
     validate_key_passphrase(&passphrase)?;
-    tauri::async_runtime::spawn_blocking(move || download_keys(endpoint, passphrase, overwrite))
-        .await
-        .map_err(|error| format!("下载密钥备份任务失败: {error}"))?
+    let operation_id_for_task = operation_id.clone();
+    let app_for_task = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        download_keys(
+            app_for_task,
+            operation_id_for_task,
+            endpoint,
+            passphrase,
+            overwrite,
+        )
+    })
+    .await
+    .map_err(|error| format!("下载密钥备份任务失败: {error}"))?;
+    if let Err(error) = &result {
+        emit_progress(
+            &app,
+            &operation_id,
+            "keys-download",
+            "error",
+            "failed",
+            0,
+            error,
+        );
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1131,6 +1570,24 @@ mod tests {
             Ok("https://sync.example.com/api".to_string())
         );
         assert!(super::normalize_endpoint("ftp://sync.example.com").is_err());
+    }
+
+    #[test]
+    fn sync_summary_reports_the_saved_content_scope() {
+        let snapshot = json!({
+            "servers": [{ "id": "server-1" }, { "id": "server-2" }],
+            "savedGroups": ["Production"],
+            "collapsedGroups": ["Production"],
+            "aiConfig": { "model": "gpt-5" },
+            "aiConversations": [{ "id": "conversation-1" }]
+        });
+        let summary = super::summarize_snapshot(&snapshot, 512);
+        assert_eq!(summary.server_count, 2);
+        assert_eq!(summary.group_count, 1);
+        assert_eq!(summary.collapsed_group_count, 1);
+        assert_eq!(summary.conversation_count, 1);
+        assert!(summary.has_ai_config);
+        assert_eq!(summary.encrypted_bytes, 512);
     }
 
     #[test]

@@ -272,7 +272,7 @@ export function createSyncServer({
   const findUserByEmail = database.prepare("SELECT id, email, password_hash FROM users WHERE email = ?");
   const findUserById = database.prepare("SELECT id, email FROM users WHERE id = ?");
   const insertUser = database.prepare("INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)");
-  const findSnapshot = database.prepare("SELECT ciphertext FROM sync_snapshots WHERE user_id = ?");
+  const findSnapshot = database.prepare("SELECT ciphertext, updated_at FROM sync_snapshots WHERE user_id = ?");
   const saveSnapshot = database.prepare(`
     INSERT INTO sync_snapshots (user_id, ciphertext, updated_at, stored_at)
     VALUES (?, ?, ?, ?)
@@ -364,7 +364,7 @@ export function createSyncServer({
       const user = authenticate(request);
       const snapshot = findSnapshot.get(user.id);
       if (!snapshot) throw new HttpError(404, "该账号还没有同步快照");
-      sendJson(response, 200, { ciphertext: snapshot.ciphertext });
+      sendJson(response, 200, { ciphertext: snapshot.ciphertext, updatedAt: snapshot.updated_at });
       return;
     }
     if (path === "/sync/data" && request.method === "PUT") {

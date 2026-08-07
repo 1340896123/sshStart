@@ -19,6 +19,7 @@ import {
   ListTree,
   LogIn,
   LogOut,
+  MessageSquare,
   Network,
   Play,
   RefreshCw,
@@ -45,6 +46,7 @@ import {
   registerCloudSync,
   uploadCloudSyncKeys,
   type CloudSyncStatus,
+  type CloudSyncProgress,
   type KeyFileInfo,
   type ServerKeyPathUpdate,
 } from "../storage";
@@ -53,6 +55,8 @@ import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOI
 interface Props {
   config: AiConfig;
   servers: ServerProfile[];
+  cloudSyncActivity?: CloudSyncProgress;
+  onSyncNow: () => void | Promise<void>;
   onSave: (config: AiConfig) => void | Promise<void>;
   onRemoveSavedKey: () => void | Promise<void>;
   onManageServerKeyPaths: (updates: ServerKeyPathUpdate[]) => void | Promise<void>;
@@ -133,7 +137,13 @@ const formatKeyFileSize = (bytes: number) => bytes < 1024
   ? `${bytes} B`
   : `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KiB`;
 
-export function SettingsDialog({ config, servers, onSave, onRemoveSavedKey, onManageServerKeyPaths, onClose }: Props) {
+const formatSyncTimestamp = (seconds?: number) => seconds
+  ? new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(seconds * 1000))
+  : "尚未同步";
+
+const syncDirectionLabel = (direction?: "upload" | "download") => direction === "download" ? "从云端下载" : "上传到云端";
+
+export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, onSave, onRemoveSavedKey, onManageServerKeyPaths, onClose }: Props) {
   const [value, setValue] = useState(() => normalizeAiConfig(config));
   const [savedValue, setSavedValue] = useState(() => normalizeAiConfig(config));
   const [models, setModels] = useState<string[]>([]);
@@ -169,7 +179,12 @@ export function SettingsDialog({ config, servers, onSave, onRemoveSavedKey, onMa
         setKeyFiles(files);
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
-  }, []);
+  }, [servers]);
+
+  useEffect(() => {
+    if (!isTauri() || !cloudSyncActivity || cloudSyncActivity.status === "running") return;
+    void getCloudSyncStatus().then(setSyncStatus).catch(() => undefined);
+  }, [cloudSyncActivity]);
 
   const authenticateSync = async (mode: "login" | "register") => {
     setSyncBusy(true);
@@ -321,7 +336,7 @@ export function SettingsDialog({ config, servers, onSave, onRemoveSavedKey, onMa
     setError("");
     setKeySyncNotice("");
     try {
-      const result = await uploadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, servers);
+      const result = await uploadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, servers, `keys-upload-${crypto.randomUUID()}`);
       await onManageServerKeyPaths(result.pathUpdates);
       setKeyFiles(result.files);
       setKeySyncNotice(`已加密上传 ${result.files.length} 个密钥文件，并托管服务器列表中的私钥；服务器仅保存密文。`);
@@ -363,7 +378,7 @@ export function SettingsDialog({ config, servers, onSave, onRemoveSavedKey, onMa
     setError("");
     setKeySyncNotice("");
     try {
-      const result = await downloadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, overwrite);
+      const result = await downloadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, overwrite, `keys-download-${crypto.randomUUID()}`);
       setKeyFiles(result.files);
       setKeySyncNotice(`已解密恢复 ${result.files.length} 个密钥文件到 ~/.porticossh。`);
       setKeyPassphrase("");
@@ -381,6 +396,35 @@ export function SettingsDialog({ config, servers, onSave, onRemoveSavedKey, onMa
   const keyFileSummary = keyFiles.length === 0
     ? "未找到 ~/.porticossh/*.key 或服务器私钥"
     : `${keyFiles.slice(0, 5).map((file) => `${file.name} (${formatKeyFileSize(file.size)})`).join("、")}${keyFiles.length > 5 ? ` 等 ${keyFiles.length} 个文件` : ""}`;
+  const lastDataSync = syncStatus?.lastDataSync;
+  const lastKeySync = syncStatus?.lastKeySync;
+  const syncOperationRunning = cloudSyncActivity?.status === "running";
+  const syncActivityTitle = cloudSyncActivity?.status === "running"
+    ? cloudSyncActivity.message
+    : cloudSyncActivity?.status === "error"
+      ? "最近一次同步失败"
+      : lastDataSync
+        ? `最近一次${syncDirectionLabel(lastDataSync.direction)}于 ${formatSyncTimestamp(lastDataSync.completedAt)}`
+        : cloudSyncActivity?.status === "success"
+          ? cloudSyncActivity.message
+          : "等待首次同步";
+  const syncActivityOperation = cloudSyncActivity?.operation === "pull"
+    ? "应用数据下载"
+    : cloudSyncActivity?.operation === "keys-upload"
+      ? "密钥备份上传"
+      : cloudSyncActivity?.operation === "keys-download"
+        ? "密钥备份恢复"
+        : "应用数据上传";
+
+  const triggerSyncNow = async () => {
+    setError("");
+    try {
+      await onSyncNow();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
   const busy = saving || removingKey || syncBusy || keySyncBusy;
   const visibleSections = SETTINGS_SECTIONS.filter((section) => {
     const query = navSearch.trim().toLocaleLowerCase();
@@ -649,6 +693,35 @@ export function SettingsDialog({ config, servers, onSave, onRemoveSavedKey, onMa
                     <input type="checkbox" checked={value.cloudSync.enabled} onChange={(event) => setValue({ ...value, cloudSync: { ...value.cloudSync, enabled: event.target.checked } })} />
                     <span className="switch" aria-hidden="true" />
                   </label>
+                </section>
+                <section className="settings-panel sync-overview-panel">
+                  <header className="settings-panel-header-with-action">
+                    <div><strong>同步概览</strong><small>这里显示最近一次成功同步的范围，不会显示密码、API 密钥或私钥内容</small></div>
+                    <button className="secondary-button" type="button" disabled={!syncStatus?.authenticated || syncOperationRunning || isDirty} onClick={() => void triggerSyncNow()} title={isDirty ? "请先保存当前设置" : "立即上传当前应用数据"}>
+                      {syncOperationRunning && cloudSyncActivity?.operation === "push" ? <RefreshCw className="spinning" size={14} /> : <Cloud size={14} />}
+                      立即同步
+                    </button>
+                  </header>
+                  <div className={`sync-overview-status ${cloudSyncActivity?.status ?? (lastDataSync ? "success" : "idle")}`}>
+                    <span className="sync-overview-status-icon">
+                      {cloudSyncActivity?.status === "error" ? <CircleAlert size={15} /> : cloudSyncActivity?.status === "running" ? <RefreshCw className="spinning" size={15} /> : lastDataSync || cloudSyncActivity?.status === "success" ? <Check size={15} /> : <Cloud size={15} />}
+                    </span>
+                    <span className="sync-overview-status-copy"><strong>{syncActivityTitle}</strong><small>{cloudSyncActivity?.status === "running" ? `${syncActivityOperation} · ${cloudSyncActivity.progress}%` : cloudSyncActivity?.status === "error" ? cloudSyncActivity.message : lastDataSync ? `云端快照 ${lastDataSync.content.encryptedBytes.toLocaleString()} bytes` : "开启自动同步并保存设置后会自动上传"}</small></span>
+                    {cloudSyncActivity?.status === "running" && <span className="sync-overview-percent">{cloudSyncActivity.progress}%</span>}
+                  </div>
+                  {cloudSyncActivity?.status === "running" && (
+                    <div className="sync-progress-block" aria-label={`同步进度 ${cloudSyncActivity.progress}%`}>
+                      <div className="sync-progress-track"><span style={{ width: `${cloudSyncActivity.progress}%` }} /></div>
+                      <small>{cloudSyncActivity.phase}</small>
+                    </div>
+                  )}
+                  <div className="sync-content-list">
+                    <div className="sync-content-row"><span className="sync-content-icon"><ServerCog size={14} /></span><span><strong>服务器配置</strong><small>连接信息与本地加密凭据</small></span><em>{lastDataSync ? `${lastDataSync.content.serverCount} 个` : "待同步"}</em></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><FolderTree size={14} /></span><span><strong>服务器分组</strong><small>分组名称与展开状态</small></span><em>{lastDataSync ? `${lastDataSync.content.groupCount} 个 · ${lastDataSync.content.collapsedGroupCount} 个状态` : "待同步"}</em></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><Bot size={14} /></span><span><strong>AI 配置</strong><small>模型、Agent、工具与加密 API 密钥</small></span><em>{lastDataSync?.content.hasAiConfig ? "已包含" : "待同步"}</em></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><MessageSquare size={14} /></span><span><strong>AI 会话</strong><small>历史对话与当前工作区上下文</small></span><em>{lastDataSync ? `${lastDataSync.content.conversationCount} 条` : "待同步"}</em></div>
+                    <div className="sync-content-row sync-content-row-muted"><span className="sync-content-icon"><KeyRound size={14} /></span><span><strong>SSH 私钥文件</strong><small>不随应用快照上传，需在下方单独加密备份</small></span><em>{lastKeySync ? `${lastKeySync.fileCount} 个 · ${formatSyncTimestamp(lastKeySync.completedAt)}` : "单独备份"}</em></div>
+                  </div>
                 </section>
                 <section className="settings-panel">
                   <header><strong>同步账号</strong><small>{syncStatus?.authenticated ? `已登录：${syncStatus.email ?? "当前账号"}` : "必须登录后才能开启同步"}</small></header>
