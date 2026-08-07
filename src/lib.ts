@@ -25,15 +25,3 @@ export const parentPath = (path: string) => {
 
 export const joinRemotePath = (base: string, child: string) =>
   base === "/" ? `/${child}` : `${base.replace(/\/$/, "")}/${child}`;
-
-export const DEMO_SERVER: ServerProfile = {
-  id: "demo-server",
-  name: "Production Web",
-  group: "生产环境",
-  host: "172.16.24.18",
-  port: 22,
-  username: "deploy",
-  authType: "password",
-  color: "var(--accent)",
-  lastConnected: "刚刚",
-};

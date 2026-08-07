@@ -29,7 +29,7 @@ import { TransferPanel } from "./components/TransferPanel";
 import { SystemDock } from "./components/SystemDock";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
 import { initializeAiConversations, readAiConversations } from "./aiHistory";
-import { DEMO_SERVER, isTauri, uid } from "./lib";
+import { isTauri, uid } from "./lib";
 import {
   isGroupWithin,
   moveGroupToPosition,
@@ -111,7 +111,7 @@ export default function App() {
   const hadStoredAiConfig = useRef(false);
   const syncHydrated = useRef(!isTauri());
   const [storageReady, setStorageReady] = useState(!isTauri());
-  const [servers, setServers] = useState<ServerProfile[]>([DEMO_SERVER]);
+  const [servers, setServers] = useState<ServerProfile[]>([]);
   const [savedGroups, setSavedGroups] = useState<string[]>([]);
   const [aiConfig, setAiConfig] = useState<AiConfig>(DEFAULT_AI_CONFIG);
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
@@ -149,7 +149,7 @@ export default function App() {
       .then((state) => {
         if (disposed) return;
         const localConfig = state.aiConfig ? normalizeAiConfig(state.aiConfig) : DEFAULT_AI_CONFIG;
-        setServers(state.servers.length ? state.servers : [DEMO_SERVER]);
+        setServers(state.servers);
         setSavedGroups(state.savedGroups);
         setAiConfig(localConfig);
         setCollapsedGroups(state.collapsedGroups);
@@ -157,7 +157,7 @@ export default function App() {
         initializeAiConversations(state.aiConversations);
         const finish = (nextState: AppStorageSnapshot) => {
           if (disposed) return;
-          setServers(nextState.servers.length ? nextState.servers : [DEMO_SERVER]);
+          setServers(nextState.servers);
           setSavedGroups(nextState.savedGroups);
           setAiConfig(nextState.aiConfig ? normalizeAiConfig(nextState.aiConfig) : DEFAULT_AI_CONFIG);
           setCollapsedGroups(nextState.collapsedGroups);

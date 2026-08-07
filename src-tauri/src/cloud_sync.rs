@@ -141,12 +141,6 @@ fn normalize_endpoint(value: &str) -> Result<String, String> {
     if !value.starts_with("https://") && !value.starts_with("http://") {
         return Err("云端同步服务地址必须以 http:// 或 https:// 开头".to_string());
     }
-    if value.starts_with("http://")
-        && !value.starts_with("http://127.0.0.1")
-        && !value.starts_with("http://localhost")
-    {
-        return Err("云端同步必须使用 HTTPS；HTTP 仅允许本机开发地址".to_string());
-    }
     Ok(value.to_string())
 }
 
@@ -1124,6 +1118,19 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with("server-production-web-primary-"));
         assert!(super::is_key_file_name(&first));
+    }
+
+    #[test]
+    fn cloud_sync_endpoints_accept_http_and_https() {
+        assert_eq!(
+            super::normalize_endpoint("http://sync.example.com/api/"),
+            Ok("http://sync.example.com/api".to_string())
+        );
+        assert_eq!(
+            super::normalize_endpoint("https://sync.example.com/api/"),
+            Ok("https://sync.example.com/api".to_string())
+        );
+        assert!(super::normalize_endpoint("ftp://sync.example.com").is_err());
     }
 
     #[test]
