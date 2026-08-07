@@ -46,13 +46,16 @@ import {
   uploadCloudSyncKeys,
   type CloudSyncStatus,
   type KeyFileInfo,
+  type ServerKeyPathUpdate,
 } from "../storage";
-import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiToolKey } from "../types";
+import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiToolKey, type ServerProfile } from "../types";
 
 interface Props {
   config: AiConfig;
+  servers: ServerProfile[];
   onSave: (config: AiConfig) => void | Promise<void>;
   onRemoveSavedKey: () => void | Promise<void>;
+  onManageServerKeyPaths: (updates: ServerKeyPathUpdate[]) => void | Promise<void>;
   onClose: () => void;
 }
 
@@ -130,7 +133,7 @@ const formatKeyFileSize = (bytes: number) => bytes < 1024
   ? `${bytes} B`
   : `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KiB`;
 
-export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Props) {
+export function SettingsDialog({ config, servers, onSave, onRemoveSavedKey, onManageServerKeyPaths, onClose }: Props) {
   const [value, setValue] = useState(() => normalizeAiConfig(config));
   const [savedValue, setSavedValue] = useState(() => normalizeAiConfig(config));
   const [models, setModels] = useState<string[]>([]);
@@ -160,7 +163,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
 
   useEffect(() => {
     if (!isTauri()) return;
-    void Promise.all([getCloudSyncStatus(), listCloudSyncKeyFiles()])
+    void Promise.all([getCloudSyncStatus(), listCloudSyncKeyFiles(servers)])
       .then(([status, files]) => {
         setSyncStatus(status);
         setKeyFiles(files);
@@ -318,9 +321,10 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     setError("");
     setKeySyncNotice("");
     try {
-      const result = await uploadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase);
+      const result = await uploadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, servers);
+      await onManageServerKeyPaths(result.pathUpdates);
       setKeyFiles(result.files);
-      setKeySyncNotice(`已加密上传 ${result.files.length} 个密钥文件；服务器仅保存密文。`);
+      setKeySyncNotice(`已加密上传 ${result.files.length} 个密钥文件，并托管服务器列表中的私钥；服务器仅保存密文。`);
       setKeyPassphrase("");
       setKeyPassphraseConfirmation("");
     } catch (reason) {
@@ -334,7 +338,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     setKeySyncAction("refresh");
     setError("");
     try {
-      setKeyFiles(await listCloudSyncKeyFiles());
+      setKeyFiles(await listCloudSyncKeyFiles(servers));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -375,7 +379,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
     .flatMap((group) => group.tools)
     .filter((tool) => value.tools[tool.key]).length;
   const keyFileSummary = keyFiles.length === 0
-    ? "未找到 *.key 文件"
+    ? "未找到 ~/.porticossh/*.key 或服务器私钥"
     : `${keyFiles.slice(0, 5).map((file) => `${file.name} (${formatKeyFileSize(file.size)})`).join("、")}${keyFiles.length > 5 ? ` 等 ${keyFiles.length} 个文件` : ""}`;
   const busy = saving || removingKey || syncBusy || keySyncBusy;
   const visibleSections = SETTINGS_SECTIONS.filter((section) => {
@@ -659,7 +663,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                   )}
                 </section>
                 <section className="settings-panel">
-                  <header><strong>密钥文件备份</strong><small>手动加密上传或恢复 ~/.porticossh/*.key；文件名和内容都会被加密</small></header>
+                  <header><strong>密钥文件备份</strong><small>包含 ~/.porticossh/*.key，以及服务器和跳板机配置中引用的私钥；文件名和内容都会被加密</small></header>
                   <div className="settings-config-row">
                     <span className="settings-row-copy"><strong>本地密钥</strong><small>{keyFileSummary}</small></span>
                     <span className="settings-model-control">
@@ -684,7 +688,7 @@ export function SettingsDialog({ config, onSave, onRemoveSavedKey, onClose }: Pr
                   </div>
                 </section>
                 {keySyncNotice && <div className="settings-note"><Check size={15} /><span>{keySyncNotice}</span></div>}
-                <div className="settings-note"><KeyRound size={15} /><span>应用数据仍由本机 ~/.porticossh/sync.key 自动加密；密钥文件备份则使用上方自定义口令独立加密。忘记口令时，服务器无法帮助恢复。</span></div>
+                <div className="settings-note"><KeyRound size={15} /><span>服务器列表中的外部私钥会复制到 ~/.porticossh 并更新为可跨设备恢复的托管路径。密钥备份使用上方自定义口令独立加密；忘记口令时服务器无法帮助恢复。</span></div>
               </>
             )}
           </div>

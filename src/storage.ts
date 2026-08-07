@@ -25,6 +25,13 @@ export interface KeyFileInfo {
 export interface KeySyncResult {
   files: KeyFileInfo[];
   updatedAt: number;
+  pathUpdates: ServerKeyPathUpdate[];
+}
+
+export interface ServerKeyPathUpdate {
+  serverId: string;
+  jumpHost: boolean;
+  privateKeyPath: string;
 }
 
 const EMPTY_SNAPSHOT: AppStorageSnapshot = {
@@ -44,6 +51,20 @@ const stripServerSecrets = (server: ServerProfile) => {
       : undefined,
   };
 };
+
+const cloudKeyServers = (servers: ServerProfile[]) => servers.map((server) => ({
+  id: server.id,
+  name: server.name,
+  authType: server.authType,
+  privateKeyPath: server.privateKeyPath,
+  jumpHost: server.jumpHost
+    ? {
+        enabled: server.jumpHost.enabled,
+        authType: server.jumpHost.authType,
+        privateKeyPath: server.jumpHost.privateKeyPath,
+      }
+    : undefined,
+}));
 
 export const loadAppStorage = () =>
   isTauri() ? invoke<AppStorageSnapshot>("load_app_state") : Promise.resolve(EMPTY_SNAPSHOT);
@@ -83,12 +104,12 @@ export const pushCloudSync = (endpoint: string, snapshot: AppStorageSnapshot) =>
 export const pullCloudSync = (endpoint: string) =>
   isTauri() ? invoke<AppStorageSnapshot | null>("sync_pull", { endpoint }) : Promise.resolve(null);
 
-export const listCloudSyncKeyFiles = () =>
-  isTauri() ? invoke<KeyFileInfo[]>("sync_list_key_files") : Promise.resolve([]);
+export const listCloudSyncKeyFiles = (servers: ServerProfile[]) =>
+  isTauri() ? invoke<KeyFileInfo[]>("sync_list_key_files", { servers: cloudKeyServers(servers) }) : Promise.resolve([]);
 
-export const uploadCloudSyncKeys = (endpoint: string, passphrase: string) =>
+export const uploadCloudSyncKeys = (endpoint: string, passphrase: string, servers: ServerProfile[]) =>
   isTauri()
-    ? invoke<KeySyncResult>("sync_upload_keys", { endpoint, passphrase })
+    ? invoke<KeySyncResult>("sync_upload_keys", { endpoint, passphrase, servers: cloudKeyServers(servers) })
     : Promise.reject(new Error("密钥同步仅可在桌面应用中使用"));
 
 export const downloadCloudSyncKeys = (endpoint: string, passphrase: string, overwrite: boolean) =>

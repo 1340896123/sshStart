@@ -55,6 +55,7 @@ import {
   pullCloudSync,
   pushCloudSync,
   type AppStorageSnapshot,
+  type ServerKeyPathUpdate,
 } from "./storage";
 import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
 import type { GroupMoveTarget, ServerDropPosition } from "./serverGroups";
@@ -387,6 +388,28 @@ export default function App() {
     setEditingServer(undefined);
     setSelectedServerId(nextServer.id);
     openSession(nextServer, true);
+  };
+
+  const manageServerKeyPaths = (updates: ServerKeyPathUpdate[]) => {
+    if (updates.length === 0) return;
+    const paths = new Map<string, { primary?: string; jump?: string }>();
+    updates.forEach((update) => {
+      const current = paths.get(update.serverId) ?? {};
+      if (update.jumpHost) current.jump = update.privateKeyPath;
+      else current.primary = update.privateKeyPath;
+      paths.set(update.serverId, current);
+    });
+    setServers((current) => current.map((server) => {
+      const update = paths.get(server.id);
+      if (!update) return server;
+      return {
+        ...server,
+        privateKeyPath: update.primary ?? server.privateKeyPath,
+        jumpHost: server.jumpHost
+          ? { ...server.jumpHost, privateKeyPath: update.jump ?? server.jumpHost.privateKeyPath }
+          : undefined,
+      };
+    }));
   };
 
   const copyServer = async (server: ServerProfile) => {
@@ -1089,7 +1112,7 @@ export default function App() {
           onImport={importAiServerList}
         />
       )}
-      {settingsOpen && <SettingsDialog config={aiConfig} onSave={saveAiConfig} onRemoveSavedKey={removeSavedAiKey} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsDialog config={aiConfig} servers={servers} onSave={saveAiConfig} onRemoveSavedKey={removeSavedAiKey} onManageServerKeyPaths={manageServerKeyPaths} onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }
