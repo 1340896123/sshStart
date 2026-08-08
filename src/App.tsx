@@ -30,6 +30,13 @@ import { TransferPanel } from "./components/TransferPanel";
 import { SystemDock } from "./components/SystemDock";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
 import { initializeAiConversations, readAiConversations } from "./aiHistory";
+import {
+  mergeAiConversations,
+  mergeAppStorageSnapshots,
+  mergeServerProfiles,
+  mergeStringValues,
+  snapshotsEqual,
+} from "./cloudSyncMerge";
 import { isTauri, uid } from "./lib";
 import {
   isGroupWithin,
@@ -51,6 +58,7 @@ import {
   loadAppStorage,
   saveAiConfig as saveAiConfigToStorage,
   saveCollapsedGroups,
+  saveDeletedServerIds,
   saveServerGroups,
   saveServers,
   pullCloudSync,
@@ -86,6 +94,8 @@ interface ServerSecretBundle {
 }
 
 const clampWidth = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+const keepCurrentWhenEqual = <T,>(current: T, next: T) =>
+  JSON.stringify(current) === JSON.stringify(next) ? current : next;
 
 const copyServerName = (servers: ServerProfile[], sourceName: string) => {
   const baseName = `${sourceName} 副本`;
@@ -114,6 +124,7 @@ export default function App() {
   const syncHydrated = useRef(!isTauri());
   const [storageReady, setStorageReady] = useState(!isTauri());
   const [servers, setServers] = useState<ServerProfile[]>([]);
+  const [deletedServerIds, setDeletedServerIds] = useState<string[]>([]);
   const [savedGroups, setSavedGroups] = useState<string[]>([]);
   const [aiConfig, setAiConfig] = useState<AiConfig>(DEFAULT_AI_CONFIG);
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
@@ -139,6 +150,9 @@ export default function App() {
     sampledAt: number;
     speedBytesPerSecond: number;
   }>());
+  const deletedServerIdsRef = useRef(deletedServerIds);
+  deletedServerIdsRef.current = deletedServerIds;
+  const cloudSyncQueue = useRef<Promise<unknown>>(Promise.resolve());
   const appBodyRef = useRef<HTMLDivElement>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
 
@@ -147,11 +161,43 @@ export default function App() {
 
   const createCurrentSnapshot = useCallback((): AppStorageSnapshot => ({
     servers,
+    deletedServerIds,
     savedGroups,
     aiConfig: serializeAiConfigForStorage(aiConfig),
     aiConversations: readAiConversations(),
     collapsedGroups,
-  }), [aiConfig, collapsedGroups, savedGroups, servers]);
+  }), [aiConfig, collapsedGroups, deletedServerIds, savedGroups, servers]);
+
+  const replaceStorageSnapshot = useCallback((snapshot: AppStorageSnapshot) => {
+    const deletedServers = new Set(snapshot.deletedServerIds ?? []);
+    setServers(snapshot.servers.filter((server) => !deletedServers.has(server.id)));
+    deletedServerIdsRef.current = snapshot.deletedServerIds ?? [];
+    setDeletedServerIds(snapshot.deletedServerIds ?? []);
+    setSavedGroups(snapshot.savedGroups);
+    setAiConfig((current) => snapshot.aiConfig ? normalizeAiConfig(snapshot.aiConfig, current) : current);
+    setCollapsedGroups(snapshot.collapsedGroups);
+    initializeAiConversations(snapshot.aiConversations);
+  }, []);
+
+  const mergeStorageSnapshot = useCallback((snapshot: AppStorageSnapshot) => {
+    const mergedDeletedServerIds = mergeStringValues(
+      deletedServerIdsRef.current,
+      snapshot.deletedServerIds ?? [],
+    );
+    const deletedServers = new Set(mergedDeletedServerIds);
+    setServers((current) => keepCurrentWhenEqual(
+      current,
+      mergeServerProfiles(current, snapshot.servers).filter((server) => !deletedServers.has(server.id)),
+    ));
+    deletedServerIdsRef.current = mergedDeletedServerIds;
+    setDeletedServerIds((current) => keepCurrentWhenEqual(current, mergedDeletedServerIds));
+    setSavedGroups((current) => keepCurrentWhenEqual(current, mergeStringValues(current, snapshot.savedGroups)));
+    setAiConfig((current) => snapshot.aiConfig
+      ? keepCurrentWhenEqual(current, normalizeAiConfig(current, normalizeAiConfig(snapshot.aiConfig)))
+      : current);
+    setCollapsedGroups((current) => keepCurrentWhenEqual(current, mergeStringValues(current, snapshot.collapsedGroups)));
+    initializeAiConversations(mergeAiConversations(readAiConversations(), snapshot.aiConversations));
+  }, []);
 
   const startCloudSyncPush = useCallback(async (endpoint: string, snapshot: AppStorageSnapshot) => {
     const operationId = uid("cloud-push");
@@ -182,10 +228,28 @@ export default function App() {
     }
   }, []);
 
-  const syncNow = useCallback(() => {
+  const synchronizeCloudSnapshot = useCallback(async (endpoint: string, localSnapshot: AppStorageSnapshot) => {
+    const remoteSnapshot = await startCloudSyncPull(endpoint);
+    const mergedSnapshot = mergeAppStorageSnapshots(localSnapshot, remoteSnapshot);
+    if (!remoteSnapshot || !snapshotsEqual(mergedSnapshot, remoteSnapshot)) {
+      await startCloudSyncPush(endpoint, mergedSnapshot);
+    }
+    return mergedSnapshot;
+  }, [startCloudSyncPull, startCloudSyncPush]);
+
+  const enqueueCloudSync = useCallback((endpoint: string, snapshot: AppStorageSnapshot) => {
+    const task = cloudSyncQueue.current
+      .catch(() => undefined)
+      .then(() => synchronizeCloudSnapshot(endpoint, snapshot));
+    cloudSyncQueue.current = task;
+    return task;
+  }, [synchronizeCloudSnapshot]);
+
+  const syncNow = useCallback(async () => {
     if (!aiConfig.cloudSync.endpoint.trim()) return Promise.reject(new Error("请先配置云端同步服务地址"));
-    return startCloudSyncPush(aiConfig.cloudSync.endpoint, createCurrentSnapshot());
-  }, [aiConfig.cloudSync.endpoint, createCurrentSnapshot, startCloudSyncPush]);
+    const mergedSnapshot = await enqueueCloudSync(aiConfig.cloudSync.endpoint, createCurrentSnapshot());
+    mergeStorageSnapshot(mergedSnapshot);
+  }, [aiConfig.cloudSync.endpoint, createCurrentSnapshot, enqueueCloudSync, mergeStorageSnapshot]);
 
   const cloudSyncActivityLabel = cloudSyncActivity?.operation === "pull"
     ? "下载同步"
@@ -212,6 +276,7 @@ export default function App() {
         if (disposed) return;
         const localConfig = state.aiConfig ? normalizeAiConfig(state.aiConfig) : DEFAULT_AI_CONFIG;
         setServers(state.servers);
+        setDeletedServerIds(state.deletedServerIds ?? []);
         setSavedGroups(state.savedGroups);
         setAiConfig(localConfig);
         setCollapsedGroups(state.collapsedGroups);
@@ -219,11 +284,7 @@ export default function App() {
         initializeAiConversations(state.aiConversations);
         const finish = (nextState: AppStorageSnapshot) => {
           if (disposed) return;
-          setServers(nextState.servers);
-          setSavedGroups(nextState.savedGroups);
-          setAiConfig(nextState.aiConfig ? normalizeAiConfig(nextState.aiConfig) : DEFAULT_AI_CONFIG);
-          setCollapsedGroups(nextState.collapsedGroups);
-          initializeAiConversations(nextState.aiConversations);
+          replaceStorageSnapshot(nextState);
           syncHydrated.current = true;
           setStorageReady(true);
         };
@@ -231,8 +292,8 @@ export default function App() {
           finish(state);
           return;
         }
-        void startCloudSyncPull(localConfig.cloudSync.endpoint)
-          .then((remote) => finish(remote ?? state))
+        void enqueueCloudSync(localConfig.cloudSync.endpoint, state)
+          .then(finish)
           .catch((error) => {
             console.warn("Failed to pull cloud sync state", error);
             finish(state);
@@ -247,24 +308,32 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [startCloudSyncPull]);
+  }, [enqueueCloudSync, replaceStorageSnapshot]);
 
   useEffect(() => {
     if (!storageReady || !syncHydrated.current || !isTauri()) return;
     if (!aiConfig.cloudSync.enabled || !aiConfig.cloudSync.endpoint.trim()) return;
     const snapshot = createCurrentSnapshot();
     const timer = window.setTimeout(() => {
-      void startCloudSyncPush(aiConfig.cloudSync.endpoint, snapshot).catch((error) => {
-        console.warn("Failed to push cloud sync state", error);
-      });
+      void enqueueCloudSync(aiConfig.cloudSync.endpoint, snapshot)
+        .then(mergeStorageSnapshot)
+        .catch((error) => {
+          console.warn("Failed to synchronize cloud state", error);
+        });
     }, 700);
     return () => window.clearTimeout(timer);
-  }, [aiConfig, collapsedGroups, createCurrentSnapshot, savedGroups, servers, startCloudSyncPush, storageReady]);
+  }, [aiConfig, collapsedGroups, createCurrentSnapshot, deletedServerIds, enqueueCloudSync, mergeStorageSnapshot, savedGroups, servers, storageReady]);
 
   useEffect(() => {
     if (!storageReady) return;
     void saveServers(servers).catch((error) => console.error("Failed to save servers", error));
   }, [servers, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void saveDeletedServerIds(deletedServerIds)
+      .catch((error) => console.error("Failed to save deleted server ids", error));
+  }, [deletedServerIds, storageReady]);
 
   useEffect(() => {
     if (!storageReady) return;
@@ -499,6 +568,11 @@ export default function App() {
         void invoke("delete_server_secret", { serverId }).catch(() => undefined);
       });
     }
+    setDeletedServerIds((current) => {
+      const next = [...new Set([...current, ...deletedIds])];
+      deletedServerIdsRef.current = next;
+      return next;
+    });
     setServers((current) => current.filter((server) => !deletedIds.has(server.id)));
     setSelectedServerId((current) => current && deletedIds.has(current) ? undefined : current);
     sessions

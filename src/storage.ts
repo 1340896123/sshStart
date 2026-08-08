@@ -5,6 +5,7 @@ import type { AiConfig, ServerProfile } from "./types";
 
 export interface AppStorageSnapshot {
   servers: ServerProfile[];
+  deletedServerIds?: string[];
   savedGroups: string[];
   aiConfig: Partial<AiConfig> | null;
   aiConversations: AiConversation[];
@@ -74,6 +75,7 @@ export interface ServerKeyPathUpdate {
 
 const EMPTY_SNAPSHOT: AppStorageSnapshot = {
   servers: [],
+  deletedServerIds: [],
   savedGroups: [],
   aiConfig: null,
   aiConversations: [],
@@ -111,6 +113,9 @@ export const saveServers = (servers: ServerProfile[]) =>
   isTauri()
     ? invoke("save_servers", { servers: servers.map(stripServerSecrets) })
     : Promise.resolve();
+
+export const saveDeletedServerIds = (serverIds: string[]) =>
+  isTauri() ? invoke("save_deleted_server_ids", { serverIds }) : Promise.resolve();
 
 export const saveServerGroups = (groups: string[]) =>
   isTauri() ? invoke("save_server_groups", { groups }) : Promise.resolve();

@@ -45,6 +45,8 @@ Cloud sync is intentionally backend-agnostic. Configure the API root in Settings
 
 Application snapshot ciphertext uses a locally generated AES-256-GCM key stored at `~/.porticossh/sync.key`. Key backups contain the local `~/.porticossh/*.key` files plus private keys referenced by server and jump-host profiles. Referenced keys are copied into the managed `~/.porticossh` directory, and synchronized profiles use portable key paths that resolve against each device's home directory. Key backups are independently encrypted with AES-256-GCM using a PBKDF2-SHA256 key derived from the user's custom passphrase. Neither encryption key nor passphrase is sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
 
+Desktop clients merge cloud snapshots before uploading them. Server profiles are matched by their stable IDs, profiles that exist on only one device are retained, and explicit server deletions are synchronized with tombstones so deleted profiles are not restored by an older device snapshot.
+
 ## Included cloud sync backend
 
 The repository includes a self-hosted implementation in `server/`. It uses Node.js 24's built-in HTTP, cryptography, and SQLite support, hashes passwords with scrypt, issues seven-day HMAC-SHA256 bearer tokens, rate-limits authentication attempts, and stores application snapshots and key backups per account without decrypting them.

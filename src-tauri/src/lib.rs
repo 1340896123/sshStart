@@ -2812,6 +2812,7 @@ pub fn run() {
             cloud_sync::sync_download_keys,
             storage::load_app_state,
             storage::save_servers,
+            storage::save_deleted_server_ids,
             storage::save_server_groups,
             storage::save_ai_config,
             storage::save_ai_conversations,

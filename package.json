@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:sync": "node --test test/cloudSyncMerge.test.mjs",
     "preview": "vite preview",
     "sync-server": "npm --prefix server start",
     "sync-server:test": "npm --prefix server test",

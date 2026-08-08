@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
 const SERVERS_KEY: &str = "servers";
+const DELETED_SERVER_IDS_KEY: &str = "deleted_server_ids";
 const SERVER_GROUPS_KEY: &str = "server_groups";
 const AI_CONFIG_KEY: &str = "ai_config";
 const AI_CONVERSATIONS_KEY: &str = "ai_conversations";
@@ -111,6 +112,7 @@ impl AppDatabase {
 #[serde(rename_all = "camelCase")]
 pub struct AppStorageState {
     servers: Vec<Value>,
+    deleted_server_ids: Vec<String>,
     saved_groups: Vec<String>,
     ai_config: Option<Value>,
     ai_conversations: Vec<Value>,
@@ -159,6 +161,7 @@ fn strip_ai_secret(value: &mut Value) {
 pub fn load_app_state(database: State<'_, AppDatabase>) -> Result<AppStorageState, String> {
     Ok(AppStorageState {
         servers: read_array(&database, SERVERS_KEY)?,
+        deleted_server_ids: read_string_array(&database, DELETED_SERVER_IDS_KEY)?,
         saved_groups: read_string_array(&database, SERVER_GROUPS_KEY)?,
         ai_config: database.read_value(AI_CONFIG_KEY)?,
         ai_conversations: read_array(&database, AI_CONVERSATIONS_KEY)?,
@@ -173,6 +176,17 @@ pub fn save_servers(
 ) -> Result<(), String> {
     servers.iter_mut().for_each(strip_secret_fields);
     database.write_value(SERVERS_KEY, &Value::Array(servers))
+}
+
+#[tauri::command]
+pub fn save_deleted_server_ids(
+    database: State<'_, AppDatabase>,
+    server_ids: Vec<String>,
+) -> Result<(), String> {
+    database.write_value(
+        DELETED_SERVER_IDS_KEY,
+        &Value::Array(server_ids.into_iter().map(Value::String).collect()),
+    )
 }
 
 #[tauri::command]
