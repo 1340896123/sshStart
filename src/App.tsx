@@ -29,13 +29,14 @@ import { TerminalPane } from "./components/TerminalPane";
 import { TransferPanel } from "./components/TransferPanel";
 import { SystemDock } from "./components/SystemDock";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
-import { initializeAiConversations, readAiConversations } from "./aiHistory";
+import { AI_HISTORY_UPDATED_EVENT, initializeAiConversations, readAiConversations } from "./aiHistory";
 import {
-  mergeAiConversations,
+  advanceSyncMetadata,
+  createSyncMetadata,
   mergeAppStorageSnapshots,
-  mergeServerProfiles,
-  mergeStringValues,
+  normalizeSyncMetadata,
   snapshotsEqual,
+  stampUnversionedSnapshot,
 } from "./cloudSyncMerge";
 import { isTauri, uid } from "./lib";
 import {
@@ -61,9 +62,11 @@ import {
   saveDeletedServerIds,
   saveServerGroups,
   saveServers,
+  saveSyncMetadata,
   pullCloudSync,
   pushCloudSync,
   type AppStorageSnapshot,
+  type CloudSyncMetadata,
   type CloudSyncProgress,
   type ServerKeyPathUpdate,
 } from "./storage";
@@ -93,10 +96,10 @@ interface ServerSecretBundle {
   jumpPassphrase?: string;
 }
 
-const clampWidth = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 const keepCurrentWhenEqual = <T,>(current: T, next: T) =>
   JSON.stringify(current) === JSON.stringify(next) ? current : next;
 
+const clampWidth = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 const copyServerName = (servers: ServerProfile[], sourceName: string) => {
   const baseName = `${sourceName} 副本`;
   const existingNames = new Set(servers.map((server) => server.name.toLocaleLowerCase()));
@@ -128,6 +131,8 @@ export default function App() {
   const [savedGroups, setSavedGroups] = useState<string[]>([]);
   const [aiConfig, setAiConfig] = useState<AiConfig>(DEFAULT_AI_CONFIG);
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
+  const [syncMeta, setSyncMeta] = useState<CloudSyncMetadata>(() => createSyncMetadata());
+  const [aiHistoryVersion, setAiHistoryVersion] = useState(0);
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -152,6 +157,8 @@ export default function App() {
   }>());
   const deletedServerIdsRef = useRef(deletedServerIds);
   deletedServerIdsRef.current = deletedServerIds;
+  const syncMetaRef = useRef(syncMeta);
+  syncMetaRef.current = syncMeta;
   const cloudSyncQueue = useRef<Promise<unknown>>(Promise.resolve());
   const appBodyRef = useRef<HTMLDivElement>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
@@ -159,69 +166,90 @@ export default function App() {
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const activeServer = servers.find((server) => server.id === activeSession?.serverId);
 
-  const createCurrentSnapshot = useCallback((): AppStorageSnapshot => ({
+  const currentSnapshot: AppStorageSnapshot = {
     servers,
     deletedServerIds,
     savedGroups,
     aiConfig: serializeAiConfigForStorage(aiConfig),
     aiConversations: readAiConversations(),
     collapsedGroups,
-  }), [aiConfig, collapsedGroups, deletedServerIds, savedGroups, servers]);
+    syncMeta,
+  };
+  const snapshotRef = useRef(currentSnapshot);
+  snapshotRef.current = currentSnapshot;
+  const createCurrentSnapshot = useCallback(() => snapshotRef.current, []);
+
+  const markSyncChange = useCallback((change: Parameters<typeof advanceSyncMetadata>[1]) => {
+    const next = advanceSyncMetadata(syncMetaRef.current, change);
+    syncMetaRef.current = next;
+    setSyncMeta(next);
+  }, []);
 
   const replaceStorageSnapshot = useCallback((snapshot: AppStorageSnapshot) => {
     const deletedServers = new Set(snapshot.deletedServerIds ?? []);
-    setServers(snapshot.servers.filter((server) => !deletedServers.has(server.id)));
-    deletedServerIdsRef.current = snapshot.deletedServerIds ?? [];
-    setDeletedServerIds(snapshot.deletedServerIds ?? []);
-    setSavedGroups(snapshot.savedGroups);
-    setAiConfig((current) => snapshot.aiConfig ? normalizeAiConfig(snapshot.aiConfig, current) : current);
-    setCollapsedGroups(snapshot.collapsedGroups);
-    initializeAiConversations(snapshot.aiConversations);
-  }, []);
-
-  const mergeStorageSnapshot = useCallback((snapshot: AppStorageSnapshot) => {
-    const mergedDeletedServerIds = mergeStringValues(
-      deletedServerIdsRef.current,
-      snapshot.deletedServerIds ?? [],
-    );
-    const deletedServers = new Set(mergedDeletedServerIds);
     setServers((current) => keepCurrentWhenEqual(
       current,
-      mergeServerProfiles(current, snapshot.servers).filter((server) => !deletedServers.has(server.id)),
+      snapshot.servers.filter((server) => !deletedServers.has(server.id)),
     ));
-    deletedServerIdsRef.current = mergedDeletedServerIds;
-    setDeletedServerIds((current) => keepCurrentWhenEqual(current, mergedDeletedServerIds));
-    setSavedGroups((current) => keepCurrentWhenEqual(current, mergeStringValues(current, snapshot.savedGroups)));
+    deletedServerIdsRef.current = snapshot.deletedServerIds ?? [];
+    setDeletedServerIds((current) => keepCurrentWhenEqual(current, snapshot.deletedServerIds ?? []));
+    setSavedGroups((current) => keepCurrentWhenEqual(current, snapshot.savedGroups));
     setAiConfig((current) => snapshot.aiConfig
-      ? keepCurrentWhenEqual(current, normalizeAiConfig(current, normalizeAiConfig(snapshot.aiConfig)))
+      ? keepCurrentWhenEqual(current, normalizeAiConfig(snapshot.aiConfig, current))
       : current);
-    setCollapsedGroups((current) => keepCurrentWhenEqual(current, mergeStringValues(current, snapshot.collapsedGroups)));
-    initializeAiConversations(mergeAiConversations(readAiConversations(), snapshot.aiConversations));
+    setCollapsedGroups((current) => keepCurrentWhenEqual(current, snapshot.collapsedGroups));
+    const nextSyncMeta = normalizeSyncMetadata(snapshot.syncMeta, syncMetaRef.current.deviceId);
+    syncMetaRef.current = nextSyncMeta;
+    setSyncMeta((current) => keepCurrentWhenEqual(current, nextSyncMeta));
+    if (JSON.stringify(readAiConversations()) !== JSON.stringify(snapshot.aiConversations)) {
+      initializeAiConversations(snapshot.aiConversations);
+    }
   }, []);
 
-  const startCloudSyncPush = useCallback(async (endpoint: string, snapshot: AppStorageSnapshot) => {
+  const mergeStorageSnapshot = useCallback(async (snapshot: AppStorageSnapshot) => {
+    const merged = stampUnversionedSnapshot(mergeAppStorageSnapshots(snapshotRef.current, snapshot));
+    replaceStorageSnapshot(merged);
+    if (isTauri()) {
+      const apiKey = await invoke<string | null>("load_ai_key").catch(() => null);
+      setAiConfig((current) => ({ ...current, apiKey: apiKey ?? "" }));
+    }
+    return merged;
+  }, [replaceStorageSnapshot]);
+
+  const startCloudSyncPush = useCallback(async (
+    endpoint: string,
+    snapshot: AppStorageSnapshot,
+    expectedUpdatedAt?: number,
+  ) => {
     const operationId = uid("cloud-push");
     setCloudSyncActivity({ operationId, operation: "push", status: "running", phase: "queued", progress: 4, message: "等待上传应用数据" });
     try {
-      await pushCloudSync(endpoint, snapshot, operationId);
+      const pushed = await pushCloudSync(endpoint, snapshot, operationId, expectedUpdatedAt);
+      if (!pushed) {
+        setCloudSyncActivity((current) => current?.operationId === operationId
+          ? { ...current, phase: "conflict", progress: 82, message: "检测到其他设备的新版本，正在重新合并" }
+          : current);
+        return false;
+      }
       setCloudSyncActivity((current) => current?.operationId === operationId
         ? { ...current, status: "success", phase: "completed", progress: 100, message: "应用数据已同步" }
         : current);
+      return true;
     } catch (error) {
       setCloudSyncActivity({ operationId, operation: "push", status: "error", phase: "failed", progress: 0, message: error instanceof Error ? error.message : String(error) });
       throw error;
     }
   }, []);
 
-  const startCloudSyncPull = useCallback(async (endpoint: string) => {
+  const startCloudSyncPull = useCallback(async (endpoint: string, localSnapshot: AppStorageSnapshot) => {
     const operationId = uid("cloud-pull");
     setCloudSyncActivity({ operationId, operation: "pull", status: "running", phase: "queued", progress: 4, message: "等待下载应用数据" });
     try {
-      const snapshot = await pullCloudSync(endpoint, operationId);
+      const result = await pullCloudSync(endpoint, operationId, localSnapshot);
       setCloudSyncActivity((current) => current?.operationId === operationId
-        ? { ...current, status: "success", phase: "completed", progress: 100, message: snapshot ? "应用数据已同步" : "云端暂无应用快照，保留当前设备数据" }
+        ? { ...current, status: "success", phase: "completed", progress: 100, message: result.snapshot ? "应用数据已同步" : "云端暂无应用快照，保留当前设备数据" }
         : current);
-      return snapshot;
+      return result;
     } catch (error) {
       setCloudSyncActivity({ operationId, operation: "pull", status: "error", phase: "failed", progress: 0, message: error instanceof Error ? error.message : String(error) });
       throw error;
@@ -229,12 +257,15 @@ export default function App() {
   }, []);
 
   const synchronizeCloudSnapshot = useCallback(async (endpoint: string, localSnapshot: AppStorageSnapshot) => {
-    const remoteSnapshot = await startCloudSyncPull(endpoint);
-    const mergedSnapshot = mergeAppStorageSnapshots(localSnapshot, remoteSnapshot);
-    if (!remoteSnapshot || !snapshotsEqual(mergedSnapshot, remoteSnapshot)) {
-      await startCloudSyncPush(endpoint, mergedSnapshot);
+    let candidate = localSnapshot;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const remote = await startCloudSyncPull(endpoint, candidate);
+      const mergedSnapshot = stampUnversionedSnapshot(mergeAppStorageSnapshots(candidate, remote.snapshot));
+      if (remote.snapshot && snapshotsEqual(mergedSnapshot, remote.snapshot)) return mergedSnapshot;
+      if (await startCloudSyncPush(endpoint, mergedSnapshot, remote.updatedAt)) return mergedSnapshot;
+      candidate = mergedSnapshot;
     }
-    return mergedSnapshot;
+    throw new Error("云端数据持续被其他设备更新，请稍后重试");
   }, [startCloudSyncPull, startCloudSyncPush]);
 
   const enqueueCloudSync = useCallback((endpoint: string, snapshot: AppStorageSnapshot) => {
@@ -245,10 +276,11 @@ export default function App() {
     return task;
   }, [synchronizeCloudSnapshot]);
 
-  const syncNow = useCallback(async () => {
-    if (!aiConfig.cloudSync.endpoint.trim()) return Promise.reject(new Error("请先配置云端同步服务地址"));
-    const mergedSnapshot = await enqueueCloudSync(aiConfig.cloudSync.endpoint, createCurrentSnapshot());
-    mergeStorageSnapshot(mergedSnapshot);
+  const syncNow = useCallback(async (endpointOverride?: string) => {
+    const endpoint = endpointOverride?.trim() || aiConfig.cloudSync.endpoint.trim();
+    if (!endpoint) return Promise.reject(new Error("请先配置云端同步服务地址"));
+    const mergedSnapshot = await enqueueCloudSync(endpoint, createCurrentSnapshot());
+    await mergeStorageSnapshot(mergedSnapshot);
   }, [aiConfig.cloudSync.endpoint, createCurrentSnapshot, enqueueCloudSync, mergeStorageSnapshot]);
 
   const cloudSyncActivityLabel = cloudSyncActivity?.operation === "pull"
@@ -275,6 +307,10 @@ export default function App() {
       .then((state) => {
         if (disposed) return;
         const localConfig = state.aiConfig ? normalizeAiConfig(state.aiConfig) : DEFAULT_AI_CONFIG;
+        const localSyncMeta = normalizeSyncMetadata(state.syncMeta, syncMetaRef.current.deviceId);
+        state.syncMeta = localSyncMeta;
+        syncMetaRef.current = localSyncMeta;
+        setSyncMeta(localSyncMeta);
         setServers(state.servers);
         setDeletedServerIds(state.deletedServerIds ?? []);
         setSavedGroups(state.savedGroups);
@@ -322,7 +358,7 @@ export default function App() {
         });
     }, 700);
     return () => window.clearTimeout(timer);
-  }, [aiConfig, collapsedGroups, createCurrentSnapshot, deletedServerIds, enqueueCloudSync, mergeStorageSnapshot, savedGroups, servers, storageReady]);
+  }, [aiConfig, aiHistoryVersion, collapsedGroups, createCurrentSnapshot, deletedServerIds, enqueueCloudSync, mergeStorageSnapshot, savedGroups, servers, storageReady, syncMeta]);
 
   useEffect(() => {
     if (!storageReady) return;
@@ -351,6 +387,18 @@ export default function App() {
     void saveCollapsedGroups(collapsedGroups)
       .catch((error) => console.error("Failed to save collapsed groups", error));
   }, [collapsedGroups, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void saveSyncMetadata(syncMeta)
+      .catch((error) => console.error("Failed to save cloud sync metadata", error));
+  }, [storageReady, syncMeta]);
+
+  useEffect(() => {
+    const handleHistoryUpdated = () => setAiHistoryVersion((current) => current + 1);
+    window.addEventListener(AI_HISTORY_UPDATED_EVENT, handleHistoryUpdated);
+    return () => window.removeEventListener(AI_HISTORY_UPDATED_EVENT, handleHistoryUpdated);
+  }, []);
 
   useEffect(() => {
     if (!isTauri() || !storageReady) return;
@@ -492,6 +540,8 @@ export default function App() {
 
   const saveServer = async (server: ServerProfile) => {
     const nextServer = { ...server, group: normalizeGroupPath(server.group) };
+    const isNewServer = !servers.some((item) => item.id === nextServer.id);
+    const addsGroup = Boolean(nextServer.group && !savedGroups.includes(nextServer.group));
     if (isTauri()) {
       await invoke("store_server_secret", {
         serverId: nextServer.id,
@@ -510,6 +560,11 @@ export default function App() {
     if (nextServer.group) {
       setSavedGroups((current) => current.includes(nextServer.group) ? current : [...current, nextServer.group]);
     }
+    markSyncChange({
+      serverIds: [nextServer.id],
+      serverOrder: isNewServer,
+      groups: addsGroup,
+    });
     setServerDialogOpen(false);
     setEditingServer(undefined);
     setSelectedServerId(nextServer.id);
@@ -536,6 +591,7 @@ export default function App() {
           : undefined,
       };
     }));
+    markSyncChange({ serverIds: paths.keys() });
   };
 
   const copyServer = async (server: ServerProfile) => {
@@ -553,6 +609,7 @@ export default function App() {
         });
       }
       setServers((current) => [...current, copy]);
+      markSyncChange({ serverIds: [copy.id], serverOrder: true });
       setSelectedServerId(copy.id);
     } catch (error) {
       console.error("Failed to copy server", error);
@@ -574,6 +631,7 @@ export default function App() {
       return next;
     });
     setServers((current) => current.filter((server) => !deletedIds.has(server.id)));
+    markSyncChange({ serverIds: deletedIds, serverOrder: true });
     setSelectedServerId((current) => current && deletedIds.has(current) ? undefined : current);
     sessions
       .filter((session) => deletedIds.has(session.serverId))
@@ -588,6 +646,7 @@ export default function App() {
       await invoke("store_ai_key", { apiKey: nextConfig.apiKey.trim() });
     }
     setAiConfig(nextConfig);
+    markSyncChange({ aiConfig: true });
   };
 
   const removeSavedAiKey = async () => {
@@ -595,6 +654,7 @@ export default function App() {
       await invoke("delete_ai_key");
     }
     setAiConfig((current) => ({ ...current, apiKey: "" }));
+    markSyncChange({ aiConfig: true });
   };
 
   const startTransfer = async (
@@ -800,10 +860,15 @@ export default function App() {
 
   const createGroup = (group: string) => {
     const normalized = normalizeGroupPath(group);
+    if (!normalized || savedGroups.includes(normalized)) return;
     setSavedGroups((current) => current.includes(normalized) ? current : [...current, normalized]);
+    markSyncChange({ groups: true });
   };
 
   const renameGroup = (currentGroup: string, nextGroup: string) => {
+    const affectedServerIds = servers
+      .filter((server) => isGroupWithin(server.group, currentGroup))
+      .map((server) => server.id);
     setServers((current) => current.map((server) =>
       ({ ...server, group: replaceGroupPrefix(server.group, currentGroup, nextGroup) }),
     ));
@@ -812,6 +877,7 @@ export default function App() {
       if (!next.includes(nextGroup)) next.push(nextGroup);
       return next.filter((group, index) => group && next.indexOf(group) === index);
     });
+    markSyncChange({ serverIds: affectedServerIds, groups: true });
   };
 
   const deleteGroup = (group: string, deleteContainedServers: boolean) => {
@@ -820,8 +886,12 @@ export default function App() {
         .filter((server) => isGroupWithin(server.group, group))
         .map((server) => server.id));
       setSavedGroups((current) => current.filter((item) => !isGroupWithin(item, group)));
+      markSyncChange({ groups: true });
       return;
     }
+    const affectedServerIds = servers
+      .filter((server) => isGroupWithin(server.group, group))
+      .map((server) => server.id);
     setServers((current) => current.map((server) =>
       ({ ...server, group: removeGroupLevel(server.group, group) }),
     ));
@@ -829,6 +899,7 @@ export default function App() {
       const next = current.map((item) => removeGroupLevel(item, group));
       return next.filter((item, index) => item && next.indexOf(item) === index);
     });
+    markSyncChange({ serverIds: affectedServerIds, groups: true });
   };
 
   const moveServer = (
@@ -841,6 +912,12 @@ export default function App() {
     setServers((current) => moveServerToPosition(current, serverId, normalized, targetServerId, position));
     if (normalized) setSavedGroups((current) => current.includes(normalized) ? current : [...current, normalized]);
     setCollapsedGroups((current) => current.filter((item) => item !== (normalized || "__ungrouped__")));
+    markSyncChange({
+      serverIds: [serverId],
+      serverOrder: true,
+      groups: Boolean(normalized && !savedGroups.includes(normalized)),
+      collapsedGroups: true,
+    });
   };
 
   const moveGroup = (sourceGroup: string, target: GroupMoveTarget) => {
@@ -853,6 +930,11 @@ export default function App() {
         .map((group) => replaceGroupPrefix(group, sourceGroup, result.movedGroup))
         .filter((group) => group !== normalizeGroupPath(target.parent)),
     )]);
+    markSyncChange({
+      serverIds: servers.filter((server) => isGroupWithin(server.group, sourceGroup)).map((server) => server.id),
+      groups: true,
+      collapsedGroups: true,
+    });
   };
 
   const downloadInBrowser = (content: string, fileName: string) => {
@@ -937,6 +1019,11 @@ export default function App() {
     setServers((current) => [...current, ...materialized.servers]);
     const nextGroups = [...new Set([...groups, ...materialized.groups].map(normalizeGroupPath).filter(Boolean))];
     if (nextGroups.length) setSavedGroups((current) => [...new Set([...current, ...nextGroups])]);
+    markSyncChange({
+      serverIds: materialized.servers.map((server) => server.id),
+      serverOrder: true,
+      groups: nextGroups.length > 0,
+    });
     setSelectedServerId(materialized.servers[materialized.servers.length - 1]?.id);
     return {
       imported: materialized.servers.length,
@@ -1093,7 +1180,11 @@ export default function App() {
               onCreateGroup={createGroup}
               onRenameGroup={renameGroup}
               onDeleteGroup={deleteGroup}
-              onCollapsedGroupsChange={setCollapsedGroups}
+              onCollapsedGroupsChange={(groups) => {
+                if (JSON.stringify(collapsedGroups) === JSON.stringify(groups)) return;
+                setCollapsedGroups(groups);
+                markSyncChange({ collapsedGroups: true });
+              }}
               onExportAll={() => { void exportServerList(); }}
               onImport={() => { void importServerList(); }}
               onAiImport={() => setAiImportOpen(true)}

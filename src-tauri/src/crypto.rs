@@ -14,6 +14,7 @@ const PASSPHRASE_MIN_ITERATIONS: u32 = 100_000;
 const PASSPHRASE_MAX_ITERATIONS: u32 = 2_000_000;
 const KEY_BACKUP_AAD: &[u8] = b"portico-key-backup-v1";
 const KEY_FILE: &str = "sync.key";
+const CLOUD_KEY_FILE: &str = "cloud.key";
 
 pub fn portico_directory() -> Result<PathBuf, String> {
     let home = env::var_os("USERPROFILE")
@@ -26,30 +27,58 @@ fn key_path() -> Result<PathBuf, String> {
     Ok(portico_directory()?.join(KEY_FILE))
 }
 
+fn cloud_key_path() -> Result<PathBuf, String> {
+    Ok(portico_directory()?.join(CLOUD_KEY_FILE))
+}
+
+fn decode_key_file(path: &std::path::Path, label: &str) -> Result<Option<[u8; KEY_BYTES]>, String> {
+    let encoded = match fs::read_to_string(path) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("读取{label}失败: {error}")),
+    };
+    let decoded = BASE64_STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| format!("读取{label}失败: {error}"))?;
+    if decoded.len() != KEY_BYTES {
+        return Err(format!("{label}长度无效"));
+    }
+    let mut key = [0_u8; KEY_BYTES];
+    key.copy_from_slice(&decoded);
+    Ok(Some(key))
+}
+
+fn write_key_file(
+    path: &std::path::Path,
+    key: &[u8; KEY_BYTES],
+    label: &str,
+) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| format!("{label}目录无效"))?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建{label}目录失败: {error}"))?;
+    fs::write(path, BASE64_STANDARD.encode(key))
+        .map_err(|error| format!("保存{label}失败: {error}"))
+}
+
 fn load_key() -> Result<[u8; KEY_BYTES], String> {
     let path = key_path()?;
-    if let Ok(encoded) = fs::read_to_string(&path) {
-        let decoded = BASE64_STANDARD
-            .decode(encoded.trim())
-            .map_err(|error| format!("读取同步密钥失败: {error}"))?;
-        if decoded.len() != KEY_BYTES {
-            return Err("同步密钥长度无效".to_string());
-        }
-        let mut key = [0_u8; KEY_BYTES];
-        key.copy_from_slice(&decoded);
+    if let Some(key) = decode_key_file(&path, "本地存储密钥")? {
         return Ok(key);
     }
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| "同步密钥目录无效".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| format!("创建同步密钥目录失败: {error}"))?;
     let mut key = [0_u8; KEY_BYTES];
     SystemRandom::new()
         .fill(&mut key)
         .map_err(|_| "生成同步密钥失败".to_string())?;
-    let encoded = BASE64_STANDARD.encode(key);
-    fs::write(&path, encoded).map_err(|error| format!("保存同步密钥失败: {error}"))?;
+    write_key_file(&path, &key, "本地存储密钥")?;
+    Ok(key)
+}
+
+fn load_cloud_key() -> Result<[u8; KEY_BYTES], String> {
+    let path = cloud_key_path()?;
+    if let Some(key) = decode_key_file(&path, "云端同步密钥")? {
+        return Ok(key);
+    }
+    let key = load_key()?;
+    write_key_file(&path, &key, "云端同步密钥")?;
     Ok(key)
 }
 
@@ -57,14 +86,17 @@ pub fn ensure_key() -> Result<(), String> {
     load_key().map(|_| ())
 }
 
-pub fn key_file_path() -> Result<String, String> {
-    Ok(key_path()?.to_string_lossy().to_string())
+pub fn ensure_cloud_key() -> Result<(), String> {
+    load_cloud_key().map(|_| ())
 }
 
-pub fn encrypt_json(value: &Value) -> Result<String, String> {
+pub fn cloud_key_file_path() -> Result<String, String> {
+    Ok(cloud_key_path()?.to_string_lossy().to_string())
+}
+
+fn encrypt_json_with_key(value: &Value, key: [u8; KEY_BYTES]) -> Result<String, String> {
     let plaintext =
         serde_json::to_vec(value).map_err(|error| format!("序列化加密数据失败: {error}"))?;
-    let key = load_key()?;
     let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &key)
         .map_err(|_| "初始化加密密钥失败".to_string())?;
     let sealing_key = aead::LessSafeKey::new(unbound);
@@ -86,7 +118,19 @@ pub fn encrypt_json(value: &Value) -> Result<String, String> {
     .to_string())
 }
 
-pub fn decrypt_json(raw: &str) -> Result<Value, String> {
+pub fn encrypt_json(value: &Value) -> Result<String, String> {
+    encrypt_json_with_key(value, load_key()?)
+}
+
+pub fn encrypt_cloud_json(value: &Value) -> Result<String, String> {
+    encrypt_json_with_key(value, load_cloud_key()?)
+}
+
+fn decrypt_json_with_key(
+    raw: &str,
+    key: [u8; KEY_BYTES],
+    error_message: &str,
+) -> Result<Value, String> {
     let envelope: Value =
         serde_json::from_str(raw).map_err(|error| format!("解析加密数据失败: {error}"))?;
     let object = envelope
@@ -111,7 +155,6 @@ pub fn decrypt_json(raw: &str) -> Result<Value, String> {
                 .unwrap_or_default(),
         )
         .map_err(|error| format!("解析密文失败: {error}"))?;
-    let key = load_key()?;
     let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &key)
         .map_err(|_| "初始化解密密钥失败".to_string())?;
     let opening_key = aead::LessSafeKey::new(unbound);
@@ -121,8 +164,20 @@ pub fn decrypt_json(raw: &str) -> Result<Value, String> {
     let nonce = aead::Nonce::assume_unique_for_key(nonce_array);
     let bytes = opening_key
         .open_in_place(nonce, aead::Aad::empty(), &mut plaintext)
-        .map_err(|_| "解密数据失败，请确认同步密钥未被替换".to_string())?;
+        .map_err(|_| error_message.to_string())?;
     serde_json::from_slice(bytes).map_err(|error| format!("解析解密数据失败: {error}"))
+}
+
+pub fn decrypt_json(raw: &str) -> Result<Value, String> {
+    decrypt_json_with_key(raw, load_key()?, "解密数据失败，请确认本地存储密钥未被替换")
+}
+
+pub fn decrypt_cloud_json(raw: &str) -> Result<Value, String> {
+    decrypt_json_with_key(
+        raw,
+        load_cloud_key()?,
+        "无法解密云端数据，请先在云端同步设置中下载并恢复密钥",
+    )
 }
 
 pub fn encrypt_with_passphrase(plaintext: &[u8], passphrase: &str) -> Result<String, String> {

@@ -10,6 +10,23 @@ export interface AppStorageSnapshot {
   aiConfig: Partial<AiConfig> | null;
   aiConversations: AiConversation[];
   collapsedGroups: string[];
+  syncMeta?: CloudSyncMetadata;
+}
+
+export interface SyncRevision {
+  clock: number;
+  deviceId: string;
+}
+
+export interface CloudSyncMetadata {
+  version: 2;
+  deviceId: string;
+  clock: number;
+  serverRevisions: Record<string, SyncRevision>;
+  serverOrderRevision?: SyncRevision;
+  groupsRevision?: SyncRevision;
+  aiConfigRevision?: SyncRevision;
+  collapsedGroupsRevision?: SyncRevision;
 }
 
 export interface CloudSyncStatus {
@@ -66,6 +83,11 @@ export interface KeySyncResult {
   files: KeyFileInfo[];
   updatedAt: number;
   pathUpdates: ServerKeyPathUpdate[];
+}
+
+export interface CloudSyncPullResult {
+  snapshot: AppStorageSnapshot | null;
+  updatedAt?: number;
 }
 
 export interface ServerKeyPathUpdate {
@@ -130,6 +152,9 @@ export const saveAiConversations = (conversations: AiConversation[]) =>
 export const saveCollapsedGroups = (groups: string[]) =>
   isTauri() ? invoke("save_collapsed_groups", { groups }) : Promise.resolve();
 
+export const saveSyncMetadata = (syncMeta: CloudSyncMetadata) =>
+  isTauri() ? invoke("save_sync_metadata", { syncMeta }) : Promise.resolve();
+
 export const getCloudSyncStatus = () =>
   isTauri() ? invoke<CloudSyncStatus>("sync_status") : Promise.resolve({ authenticated: false, keyPath: "" });
 
@@ -142,11 +167,19 @@ export const loginCloudSync = (endpoint: string, email: string, password: string
 export const logoutCloudSync = () =>
   isTauri() ? invoke("sync_logout") : Promise.resolve();
 
-export const pushCloudSync = (endpoint: string, snapshot: AppStorageSnapshot, operationId: string) =>
-  isTauri() ? invoke("sync_push", { endpoint, snapshot, operationId }) : Promise.resolve();
+export const pushCloudSync = (
+  endpoint: string,
+  snapshot: AppStorageSnapshot,
+  operationId: string,
+  expectedUpdatedAt?: number,
+) => isTauri()
+  ? invoke<boolean>("sync_push", { endpoint, snapshot, operationId, expectedUpdatedAt: expectedUpdatedAt ?? null })
+  : Promise.resolve(true);
 
-export const pullCloudSync = (endpoint: string, operationId: string) =>
-  isTauri() ? invoke<AppStorageSnapshot | null>("sync_pull", { endpoint, operationId }) : Promise.resolve(null);
+export const pullCloudSync = (endpoint: string, operationId: string, localSnapshot: AppStorageSnapshot) =>
+  isTauri()
+    ? invoke<CloudSyncPullResult>("sync_pull", { endpoint, operationId, localSnapshot })
+    : Promise.resolve<CloudSyncPullResult>({ snapshot: null, updatedAt: undefined });
 
 export const clearCloudSyncData = (endpoint: string, scope: CloudDataScope) =>
   isTauri()

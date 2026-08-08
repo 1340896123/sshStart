@@ -39,16 +39,16 @@ Cloud sync is intentionally backend-agnostic. Configure the API root in Settings
 
 - `POST /auth/register` and `POST /auth/login` with `{ "email": string, "password": string }`, returning `{ "token": string, "email": string }` (an `accessToken` field is also accepted).
 - `GET /sync/data` with a bearer token, returning `{ "ciphertext": string, "updatedAt": number }`; return `404` when the account has no snapshot yet.
-- `PUT /sync/data` with a bearer token and `{ "ciphertext": string, "updatedAt": number }`.
+- `PUT /sync/data` with a bearer token and `{ "ciphertext": string, "updatedAt": number, "expectedUpdatedAt"?: number | null }`. When `expectedUpdatedAt` is supplied, return `409` if the current version differs.
 - `DELETE /sync/data` with a bearer token to remove the application snapshot.
 - `GET /sync/keys` with a bearer token, returning `{ "ciphertext": string, "updatedAt": number }`; return `404` before the first key backup.
-- `PUT /sync/keys` with a bearer token and `{ "ciphertext": string, "updatedAt": number }`.
+- `PUT /sync/keys` with a bearer token and `{ "ciphertext": string, "updatedAt": number, "expectedUpdatedAt"?: number | null }`. When `expectedUpdatedAt` is supplied, return `409` if the current version differs.
 - `DELETE /sync/keys` with a bearer token to remove the encrypted key backup.
 - `DELETE /sync` with a bearer token to remove both snapshots.
 
-Application snapshot ciphertext uses a locally generated AES-256-GCM key stored at `~/.porticossh/sync.key`. Key backups contain the local `~/.porticossh/*.key` files plus private keys referenced by server and jump-host profiles. Referenced keys are copied into the managed `~/.porticossh` directory, and synchronized profiles use portable key paths that resolve against each device's home directory. Key backups are independently encrypted with AES-256-GCM using a PBKDF2-SHA256 key derived from the user's custom passphrase. Neither encryption key nor passphrase is sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
+Application snapshot ciphertext uses a dedicated AES-256-GCM key stored at `~/.porticossh/cloud.key`; `~/.porticossh/sync.key` remains local to the device and encrypts its SQLite state. Key backups contain `cloud.key`, other managed `~/.porticossh/*.key` files, and private keys referenced by server and jump-host profiles, but never upload the device-local `sync.key`. Legacy backups that contain only `sync.key` migrate it to `cloud.key` during restore. Referenced keys are copied into the managed `~/.porticossh` directory, and synchronized profiles use portable key paths that resolve against each device's home directory. Key backups are independently encrypted with AES-256-GCM using a PBKDF2-SHA256 key derived from the user's custom passphrase. Neither encryption key nor passphrase is sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
 
-Desktop clients merge cloud snapshots before uploading them. Server profiles are matched by their stable IDs, profiles that exist on only one device are retained, and explicit server deletions are synchronized with tombstones so deleted profiles are not restored by an older device snapshot.
+Desktop clients merge cloud snapshots before uploading them. Server profiles use per-record logical revisions, the server list order has its own revision, and groups, collapsed state, and settings use category revisions. Profiles that exist on only one device are retained, explicit server deletions are synchronized with tombstones, and conditional writes retry after concurrent updates instead of overwriting another device's snapshot.
 
 ## Included cloud sync backend
 

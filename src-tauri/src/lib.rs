@@ -2818,6 +2818,7 @@ pub fn run() {
             storage::save_ai_config,
             storage::save_ai_conversations,
             storage::save_collapsed_groups,
+            storage::save_sync_metadata,
             server_transfer::read_server_import_file,
             server_transfer::write_server_export_file,
             get_diagnostic_log_path,

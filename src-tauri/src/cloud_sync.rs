@@ -1,6 +1,6 @@
 use crate::crypto::{
-    decrypt_json, decrypt_with_passphrase, encrypt_json, encrypt_with_passphrase, key_file_path,
-    portico_directory,
+    cloud_key_file_path, decrypt_cloud_json, decrypt_with_passphrase, encrypt_cloud_json,
+    encrypt_with_passphrase, ensure_cloud_key, portico_directory,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::blocking::Client;
@@ -24,6 +24,8 @@ const MAX_KEY_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_KEY_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const PORTABLE_KEY_PREFIX: &str = "portico-key://";
 const SYNC_STATE_FILE: &str = "sync-state.json";
+const LOCAL_STORAGE_KEY_FILE: &str = "sync.key";
+const CLOUD_SYNC_KEY_FILE: &str = "cloud.key";
 
 static SYNC_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -92,6 +94,13 @@ pub struct SyncAuthResult {
     pub email: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPullResult {
+    pub snapshot: Option<Value>,
+    pub updated_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyFileInfo {
@@ -137,7 +146,7 @@ struct JumpKeyProfile {
     private_key_path: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KeyBundle {
     version: u32,
@@ -145,7 +154,7 @@ struct KeyBundle {
     files: Vec<KeyBundleFile>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KeyBundleFile {
     name: String,
@@ -176,7 +185,6 @@ struct KeyInventory {
 
 struct PreparedKeyBundle {
     bundle: KeyBundle,
-    files: Vec<KeyFileInfo>,
     path_updates: Vec<ServerKeyPathUpdate>,
     managed_copies: Vec<(String, Vec<u8>)>,
 }
@@ -542,6 +550,7 @@ fn collect_key_inventory(
     servers: &[ServerKeyProfile],
     strict_references: bool,
 ) -> Result<KeyInventory, String> {
+    ensure_cloud_key()?;
     let directory = portico_directory()?;
     collect_key_inventory_in(&directory, servers, strict_references)
 }
@@ -554,6 +563,9 @@ fn collect_key_inventory_in(
     let mut used_names = HashSet::new();
     let mut files = Vec::new();
     for info in list_portico_key_files(directory)? {
+        if info.name.eq_ignore_ascii_case(LOCAL_STORAGE_KEY_FILE) {
+            continue;
+        }
         let source_path = directory.join(&info.name);
         let canonical = fs::canonicalize(&source_path)
             .map_err(|error| format!("解析密钥文件 {} 路径失败: {error}", info.name))?;
@@ -654,10 +666,9 @@ fn build_key_bundle(servers: &[ServerKeyProfile]) -> Result<PreparedKeyBundle, S
         return Err(format!("密钥文件数量不能超过 {MAX_KEY_FILES} 个"));
     }
     let mut total_bytes = 0_u64;
-    let mut files = Vec::with_capacity(inventory.files.len());
     let mut bundle_files = Vec::with_capacity(inventory.files.len());
     let mut managed_copies = Vec::new();
-    for mut file in inventory.files {
+    for file in inventory.files {
         let bytes = fs::read(&file.source_path)
             .map_err(|error| format!("读取密钥文件 {} 失败: {error}", file.info.name))?;
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -668,7 +679,6 @@ fn build_key_bundle(servers: &[ServerKeyProfile]) -> Result<PreparedKeyBundle, S
         if total_bytes > MAX_KEY_TOTAL_BYTES {
             return Err("密钥文件总大小超过 8 MiB 限制".to_string());
         }
-        file.info.size = size;
         bundle_files.push(KeyBundleFile {
             name: file.info.name.clone(),
             content: BASE64_STANDARD.encode(&bytes),
@@ -676,7 +686,6 @@ fn build_key_bundle(servers: &[ServerKeyProfile]) -> Result<PreparedKeyBundle, S
         if !file.managed {
             managed_copies.push((file.info.name.clone(), bytes));
         }
-        files.push(file.info);
     }
     Ok(PreparedKeyBundle {
         bundle: KeyBundle {
@@ -685,7 +694,6 @@ fn build_key_bundle(servers: &[ServerKeyProfile]) -> Result<PreparedKeyBundle, S
             files: bundle_files,
         },
         path_updates: inventory.path_updates,
-        files,
         managed_copies,
     })
 }
@@ -746,27 +754,54 @@ fn decode_key_bundle(raw: &[u8]) -> Result<(KeyBundle, Vec<(String, Vec<u8>)>), 
     if bundle.files.is_empty() || bundle.files.len() > MAX_KEY_FILES {
         return Err("密钥备份中的文件数量无效".to_string());
     }
+    let has_cloud_key = bundle
+        .files
+        .iter()
+        .any(|file| file.name.eq_ignore_ascii_case(CLOUD_SYNC_KEY_FILE));
     let mut names = HashSet::new();
     let mut total_bytes = 0_u64;
     let mut decoded = Vec::with_capacity(bundle.files.len());
+    let mut normalized_files = Vec::with_capacity(bundle.files.len());
     for file in &bundle.files {
-        if !is_key_file_name(&file.name) || !names.insert(file.name.to_lowercase()) {
+        if !is_key_file_name(&file.name) {
+            return Err("密钥备份包含无效或重复的文件名".to_string());
+        }
+        if has_cloud_key && file.name.eq_ignore_ascii_case(LOCAL_STORAGE_KEY_FILE) {
+            continue;
+        }
+        let name = if file.name.eq_ignore_ascii_case(LOCAL_STORAGE_KEY_FILE) {
+            CLOUD_SYNC_KEY_FILE.to_string()
+        } else {
+            file.name.clone()
+        };
+        if !names.insert(name.to_lowercase()) {
             return Err("密钥备份包含无效或重复的文件名".to_string());
         }
         let bytes = BASE64_STANDARD
             .decode(&file.content)
-            .map_err(|error| format!("解析密钥文件 {} 失败: {error}", file.name))?;
+            .map_err(|error| format!("解析密钥文件 {name} 失败: {error}"))?;
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if size > MAX_KEY_FILE_BYTES {
-            return Err(format!("密钥文件 {} 超过 2 MiB 限制", file.name));
+            return Err(format!("密钥文件 {name} 超过 2 MiB 限制"));
         }
         total_bytes = total_bytes.saturating_add(size);
         if total_bytes > MAX_KEY_TOTAL_BYTES {
             return Err("密钥备份总大小超过 8 MiB 限制".to_string());
         }
-        decoded.push((file.name.clone(), bytes));
+        normalized_files.push(KeyBundleFile {
+            name: name.clone(),
+            content: file.content.clone(),
+        });
+        decoded.push((name, bytes));
     }
-    Ok((bundle, decoded))
+    Ok((
+        KeyBundle {
+            version: bundle.version,
+            created_at: bundle.created_at,
+            files: normalized_files,
+        },
+        decoded,
+    ))
 }
 
 fn restore_key_bundle(
@@ -830,6 +865,74 @@ fn restore_key_bundle(
         updated_at: bundle.created_at,
         path_updates: Vec::new(),
     })
+}
+
+fn merge_key_bundles(local: &KeyBundle, remote: Option<KeyBundle>) -> Result<KeyBundle, String> {
+    let Some(remote) = remote else {
+        return Ok(KeyBundle {
+            version: local.version,
+            created_at: local.created_at,
+            files: local.files.clone(),
+        });
+    };
+    let local_cloud_key = local
+        .files
+        .iter()
+        .find(|file| file.name.eq_ignore_ascii_case(CLOUD_SYNC_KEY_FILE));
+    let remote_cloud_key = remote
+        .files
+        .iter()
+        .find(|file| file.name.eq_ignore_ascii_case(CLOUD_SYNC_KEY_FILE));
+    if let (Some(local_key), Some(remote_key)) = (local_cloud_key, remote_cloud_key) {
+        if local_key.content != remote_key.content {
+            return Err(
+                "本机云端同步密钥与账号备份不一致，请先下载并恢复密钥，再重新上传".to_string(),
+            );
+        }
+    }
+    let remote_created_at = remote.created_at;
+    let mut files = remote
+        .files
+        .into_iter()
+        .map(|file| (file.name.to_lowercase(), file))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for file in &local.files {
+        files.insert(file.name.to_lowercase(), file.clone());
+    }
+    Ok(KeyBundle {
+        version: 1,
+        created_at: local.created_at.max(remote_created_at),
+        files: files.into_values().collect(),
+    })
+}
+
+fn key_bundle_file_infos(bundle: &KeyBundle) -> Result<Vec<KeyFileInfo>, String> {
+    if bundle.files.is_empty() || bundle.files.len() > MAX_KEY_FILES {
+        return Err("合并后的密钥文件数量无效".to_string());
+    }
+    let mut total_bytes = 0_u64;
+    bundle
+        .files
+        .iter()
+        .map(|file| {
+            let size = BASE64_STANDARD
+                .decode(&file.content)
+                .map_err(|error| format!("解析密钥文件 {} 失败: {error}", file.name))?
+                .len();
+            let size = u64::try_from(size).unwrap_or(u64::MAX);
+            if size > MAX_KEY_FILE_BYTES {
+                return Err(format!("密钥文件 {} 超过 2 MiB 限制", file.name));
+            }
+            total_bytes = total_bytes.saturating_add(size);
+            if total_bytes > MAX_KEY_TOTAL_BYTES {
+                return Err("合并后的密钥文件总大小超过 8 MiB 限制".to_string());
+            }
+            Ok(KeyFileInfo {
+                name: file.name.clone(),
+                size,
+            })
+        })
+        .collect()
 }
 
 fn auth_request(
@@ -910,7 +1013,7 @@ pub fn sync_status() -> Result<SyncStatus, String> {
     Ok(SyncStatus {
         authenticated: token().is_some(),
         email: email(),
-        key_path: key_file_path()?,
+        key_path: cloud_key_file_path()?,
         last_data_sync: state.last_data_sync,
         last_key_sync: state.last_key_sync,
     })
@@ -1024,7 +1127,63 @@ fn hydrate_snapshot(mut snapshot: Value) -> Value {
     snapshot
 }
 
-fn store_snapshot_secrets(snapshot: &Value) -> Result<(), String> {
+fn sync_revision(snapshot: &Value, field: &str, server_id: Option<&str>) -> Option<(u64, String)> {
+    let metadata = snapshot.get("syncMeta")?.as_object()?;
+    let revision = if let Some(server_id) = server_id {
+        metadata
+            .get("serverRevisions")?
+            .as_object()?
+            .get(server_id)?
+    } else {
+        metadata.get(field)?
+    };
+    Some((
+        revision.get("clock")?.as_u64()?,
+        revision.get("deviceId")?.as_str()?.to_string(),
+    ))
+}
+
+fn revision_compare(
+    left: Option<(u64, String)>,
+    right: Option<(u64, String)>,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn snapshot_has_server_state(snapshot: &Value, server_id: &str) -> bool {
+    snapshot
+        .get("servers")
+        .and_then(Value::as_array)
+        .is_some_and(|servers| {
+            servers
+                .iter()
+                .any(|server| server.get("id").and_then(Value::as_str) == Some(server_id))
+        })
+        || snapshot
+            .get("deletedServerIds")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(server_id)))
+}
+
+fn remote_server_state_wins(remote: &Value, local: &Value, server_id: &str) -> bool {
+    if !snapshot_has_server_state(remote, server_id) {
+        return false;
+    }
+    if !snapshot_has_server_state(local, server_id) {
+        return true;
+    }
+    revision_compare(
+        sync_revision(remote, "", Some(server_id)),
+        sync_revision(local, "", Some(server_id)),
+    ) != std::cmp::Ordering::Less
+}
+
+fn store_snapshot_secrets(snapshot: &Value, local_snapshot: &Value) -> Result<(), String> {
     let set_or_delete = |account: String, value: Option<&str>| -> Result<(), String> {
         let entry = super::keyring_entry(&account)?;
         if let Some(value) = value.filter(|value| !value.is_empty()) {
@@ -1047,6 +1206,9 @@ fn store_snapshot_secrets(snapshot: &Value) -> Result<(), String> {
             let Some(id) = object.get("id").and_then(Value::as_str) else {
                 continue;
             };
+            if !remote_server_state_wins(snapshot, local_snapshot, id) {
+                continue;
+            }
             let jump_host = object.get("jumpHost").and_then(Value::as_object);
             set_or_delete(
                 format!("server:{id}:password"),
@@ -1069,6 +1231,27 @@ fn store_snapshot_secrets(snapshot: &Value) -> Result<(), String> {
                     .and_then(Value::as_str),
             )?;
         }
+    }
+    if let Some(deleted_ids) = snapshot.get("deletedServerIds").and_then(Value::as_array) {
+        for id in deleted_ids.iter().filter_map(Value::as_str) {
+            if !remote_server_state_wins(snapshot, local_snapshot, id) {
+                continue;
+            }
+            for suffix in ["password", "passphrase", "jump:password", "jump:passphrase"] {
+                set_or_delete(format!("server:{id}:{suffix}"), None)?;
+            }
+        }
+    }
+    let remote_ai_wins = snapshot
+        .get("aiConfig")
+        .is_some_and(|value| !value.is_null())
+        && (local_snapshot.get("aiConfig").is_none_or(Value::is_null)
+            || revision_compare(
+                sync_revision(snapshot, "aiConfigRevision", None),
+                sync_revision(local_snapshot, "aiConfigRevision", None),
+            ) != std::cmp::Ordering::Less);
+    if !remote_ai_wins {
+        return Ok(());
     }
     let api_key = snapshot
         .get("aiConfig")
@@ -1144,10 +1327,11 @@ fn rewrite_cloud_snapshot_without(endpoint: &str, token: &str, scope: &str) -> R
         .or_else(|| payload.get("data"))
         .and_then(Value::as_str)
         .ok_or_else(|| "同步服务没有返回密文".to_string())?;
-    let mut snapshot = decrypt_json(ciphertext)?;
+    let expected_updated_at = payload.get("updatedAt").and_then(Value::as_u64);
+    let mut snapshot = decrypt_cloud_json(ciphertext)?;
     clear_snapshot_category(&mut snapshot, scope)?;
     let summary_without_size = summarize_snapshot(&snapshot, 0);
-    let encrypted = encrypt_json(&snapshot)?;
+    let encrypted = encrypt_cloud_json(&snapshot)?;
     let content = SyncContentSummary {
         encrypted_bytes: encrypted.len(),
         ..summary_without_size
@@ -1159,6 +1343,7 @@ fn rewrite_cloud_snapshot_without(endpoint: &str, token: &str, scope: &str) -> R
         .json(&json!({
             "ciphertext": encrypted,
             "updatedAt": updated_at,
+            "expectedUpdatedAt": expected_updated_at,
         }))
         .send()
         .map_err(|error| format!("更新云端应用快照失败: {error}"))?;
@@ -1211,7 +1396,8 @@ fn push_sync(
     operation_id: String,
     endpoint: String,
     snapshot: Value,
-) -> Result<(), String> {
+    expected_updated_at: Option<u64>,
+) -> Result<bool, String> {
     emit_progress(
         &app,
         &operation_id,
@@ -1235,7 +1421,7 @@ fn push_sync(
         38,
         "正在加密应用快照",
     );
-    let encrypted = encrypt_json(&snapshot)?;
+    let encrypted = encrypt_cloud_json(&snapshot)?;
     let content = SyncContentSummary {
         encrypted_bytes: encrypted.len(),
         ..summary_without_size
@@ -1256,10 +1442,22 @@ fn push_sync(
         .json(&json!({
             "ciphertext": encrypted,
             "updatedAt": updated_at,
+            "expectedUpdatedAt": expected_updated_at,
         }))
         .send()
         .map_err(|error| format!("上传同步数据失败: {error}"))?;
-    if response.status().is_success() {
+    if response.status().as_u16() == 409 {
+        emit_progress(
+            &app,
+            &operation_id,
+            "push",
+            "running",
+            "conflict",
+            82,
+            "检测到其他设备的新版本，正在重新合并",
+        );
+        Ok(false)
+    } else if response.status().is_success() {
         update_data_sync_state(SyncRecord {
             direction: "upload".to_string(),
             completed_at: unix_timestamp(),
@@ -1275,13 +1473,18 @@ fn push_sync(
             100,
             "应用数据已同步",
         );
-        Ok(())
+        Ok(true)
     } else {
         Err(response_error(response))
     }
 }
 
-fn pull_sync(app: AppHandle, operation_id: String, endpoint: String) -> Result<Value, String> {
+fn pull_sync(
+    app: AppHandle,
+    operation_id: String,
+    endpoint: String,
+    local_snapshot: Value,
+) -> Result<SyncPullResult, String> {
     emit_progress(
         &app,
         &operation_id,
@@ -1317,7 +1520,10 @@ fn pull_sync(app: AppHandle, operation_id: String, endpoint: String) -> Result<V
             100,
             "云端暂无应用快照，保留当前设备数据",
         );
-        return Ok(Value::Null);
+        return Ok(SyncPullResult {
+            snapshot: None,
+            updated_at: None,
+        });
     }
     if !response.status().is_success() {
         return Err(response_error(response));
@@ -1340,7 +1546,8 @@ fn pull_sync(app: AppHandle, operation_id: String, endpoint: String) -> Result<V
         66,
         "正在解密并校验快照",
     );
-    let snapshot = resolve_snapshot_key_paths(decrypt_json(ciphertext)?, &portico_directory()?)?;
+    let snapshot =
+        resolve_snapshot_key_paths(decrypt_cloud_json(ciphertext)?, &portico_directory()?)?;
     let content = summarize_snapshot(&snapshot, ciphertext.len());
     emit_progress(
         &app,
@@ -1351,7 +1558,7 @@ fn pull_sync(app: AppHandle, operation_id: String, endpoint: String) -> Result<V
         86,
         "正在应用已同步内容",
     );
-    store_snapshot_secrets(&snapshot)?;
+    store_snapshot_secrets(&snapshot, &local_snapshot)?;
     update_data_sync_state(SyncRecord {
         direction: "download".to_string(),
         completed_at: unix_timestamp(),
@@ -1367,7 +1574,10 @@ fn pull_sync(app: AppHandle, operation_id: String, endpoint: String) -> Result<V
         100,
         "应用数据已同步",
     );
-    Ok(strip_snapshot_secrets(snapshot))
+    Ok(SyncPullResult {
+        snapshot: Some(strip_snapshot_secrets(snapshot)),
+        updated_at: remote_updated_at,
+    })
 }
 
 #[tauri::command]
@@ -1376,12 +1586,19 @@ pub async fn sync_push(
     endpoint: String,
     snapshot: Value,
     operation_id: String,
-) -> Result<(), String> {
+    expected_updated_at: Option<u64>,
+) -> Result<bool, String> {
     let endpoint = normalize_endpoint(&endpoint)?;
     let operation_id_for_task = operation_id.clone();
     let app_for_task = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        push_sync(app_for_task, operation_id_for_task, endpoint, snapshot)
+        push_sync(
+            app_for_task,
+            operation_id_for_task,
+            endpoint,
+            snapshot,
+            expected_updated_at,
+        )
     })
     .await
     .map_err(|error| format!("上传同步任务失败: {error}"))?;
@@ -1396,25 +1613,25 @@ pub async fn sync_pull(
     app: AppHandle,
     endpoint: String,
     operation_id: String,
-) -> Result<Option<Value>, String> {
+    local_snapshot: Value,
+) -> Result<SyncPullResult, String> {
     let endpoint = normalize_endpoint(&endpoint)?;
     let operation_id_for_task = operation_id.clone();
     let app_for_task = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        pull_sync(app_for_task, operation_id_for_task, endpoint)
+        pull_sync(
+            app_for_task,
+            operation_id_for_task,
+            endpoint,
+            local_snapshot,
+        )
     })
     .await
     .map_err(|error| format!("下载同步任务失败: {error}"))?;
     if let Err(error) = &result {
         emit_progress(&app, &operation_id, "pull", "error", "failed", 0, error);
     }
-    result.map(|snapshot| {
-        if snapshot.is_null() {
-            None
-        } else {
-            Some(snapshot)
-        }
-    })
+    result
 }
 
 #[tauri::command]
@@ -1441,43 +1658,89 @@ fn upload_keys(
     let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
     let prepared = build_key_bundle(&servers)?;
     persist_managed_key_copies(&prepared.managed_copies)?;
-    emit_progress(
-        &app,
-        &operation_id,
-        "keys-upload",
-        "running",
-        "encrypting",
-        42,
-        "正在加密密钥备份",
-    );
-    let plaintext = serde_json::to_vec(&prepared.bundle)
-        .map_err(|error| format!("序列化密钥备份失败: {error}"))?;
-    let ciphertext = encrypt_with_passphrase(&plaintext, &passphrase)?;
     let client = request_client()?;
-    emit_progress(
-        &app,
-        &operation_id,
-        "keys-upload",
-        "running",
-        "uploading",
-        72,
-        "正在上传密钥备份",
-    );
-    let response = client
-        .put(format!("{endpoint}/sync/keys"))
-        .bearer_auth(token)
-        .json(&json!({
-            "ciphertext": ciphertext,
-            "updatedAt": prepared.bundle.created_at,
-        }))
-        .send()
-        .map_err(|error| format!("上传密钥备份失败: {error}"))?;
-    if !response.status().is_success() {
-        return Err(response_error(response));
+    let mut merged_bundle = None;
+    for attempt in 0..4 {
+        emit_progress(
+            &app,
+            &operation_id,
+            "keys-upload",
+            "running",
+            "merging",
+            28,
+            "正在合并其他设备的密钥备份",
+        );
+        let remote_response = client
+            .get(format!("{endpoint}/sync/keys"))
+            .bearer_auth(&token)
+            .send()
+            .map_err(|error| format!("读取云端密钥备份失败: {error}"))?;
+        let (remote_bundle, expected_updated_at) = if remote_response.status().as_u16() == 404 {
+            (None, None)
+        } else if remote_response.status().is_success() {
+            let payload = remote_response
+                .json::<Value>()
+                .map_err(|error| format!("解析云端密钥备份失败: {error}"))?;
+            let ciphertext = payload
+                .get("ciphertext")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "同步服务没有返回密钥备份密文".to_string())?;
+            let plaintext = decrypt_with_passphrase(ciphertext, &passphrase)?;
+            let (bundle, _) = decode_key_bundle(&plaintext)?;
+            (
+                Some(bundle),
+                payload.get("updatedAt").and_then(Value::as_u64),
+            )
+        } else {
+            return Err(response_error(remote_response));
+        };
+        let bundle = merge_key_bundles(&prepared.bundle, remote_bundle)?;
+        key_bundle_file_infos(&bundle)?;
+        emit_progress(
+            &app,
+            &operation_id,
+            "keys-upload",
+            "running",
+            "encrypting",
+            48,
+            "正在加密密钥备份",
+        );
+        let plaintext =
+            serde_json::to_vec(&bundle).map_err(|error| format!("序列化密钥备份失败: {error}"))?;
+        let ciphertext = encrypt_with_passphrase(&plaintext, &passphrase)?;
+        emit_progress(
+            &app,
+            &operation_id,
+            "keys-upload",
+            "running",
+            "uploading",
+            72,
+            "正在上传密钥备份",
+        );
+        let response = client
+            .put(format!("{endpoint}/sync/keys"))
+            .bearer_auth(&token)
+            .json(&json!({
+                "ciphertext": ciphertext,
+                "updatedAt": bundle.created_at,
+                "expectedUpdatedAt": expected_updated_at,
+            }))
+            .send()
+            .map_err(|error| format!("上传密钥备份失败: {error}"))?;
+        if response.status().as_u16() == 409 && attempt < 3 {
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(response_error(response));
+        }
+        merged_bundle = Some(bundle);
+        break;
     }
+    let merged_bundle =
+        merged_bundle.ok_or_else(|| "云端密钥备份持续被其他设备更新，请稍后重试".to_string())?;
     let result = KeySyncResult {
-        files: prepared.files,
-        updated_at: prepared.bundle.created_at,
+        files: key_bundle_file_infos(&merged_bundle)?,
+        updated_at: merged_bundle.created_at,
         path_updates: prepared.path_updates,
     };
     update_key_sync_state(KeySyncRecord {
@@ -1700,6 +1963,67 @@ mod tests {
             Ok("https://sync.example.com/api".to_string())
         );
         assert!(super::normalize_endpoint("ftp://sync.example.com").is_err());
+    }
+
+    #[test]
+    fn newer_remote_server_revision_controls_secret_application() {
+        let local = json!({
+            "servers": [{ "id": "server-1" }],
+            "syncMeta": { "serverRevisions": { "server-1": { "clock": 4, "deviceId": "local" } } }
+        });
+        let older_remote = json!({
+            "servers": [{ "id": "server-1" }],
+            "syncMeta": { "serverRevisions": { "server-1": { "clock": 3, "deviceId": "remote" } } }
+        });
+        let newer_remote = json!({
+            "servers": [{ "id": "server-1" }],
+            "syncMeta": { "serverRevisions": { "server-1": { "clock": 5, "deviceId": "remote" } } }
+        });
+        assert!(!super::remote_server_state_wins(
+            &older_remote,
+            &local,
+            "server-1"
+        ));
+        assert!(super::remote_server_state_wins(
+            &newer_remote,
+            &local,
+            "server-1"
+        ));
+    }
+
+    #[test]
+    fn legacy_backup_sync_key_migrates_to_cloud_key() {
+        let raw = serde_json::to_vec(&json!({
+            "version": 1,
+            "createdAt": 42,
+            "files": [{ "name": "sync.key", "content": "bGVnYWN5" }]
+        }))
+        .expect("serialize legacy bundle");
+        let (bundle, files) = super::decode_key_bundle(&raw).expect("decode legacy bundle");
+        assert_eq!(bundle.files[0].name, "cloud.key");
+        assert_eq!(files[0].0, "cloud.key");
+        assert_eq!(files[0].1, b"legacy");
+    }
+
+    #[test]
+    fn key_upload_rejects_a_different_account_cloud_key() {
+        let local = super::KeyBundle {
+            version: 1,
+            created_at: 2,
+            files: vec![super::KeyBundleFile {
+                name: "cloud.key".to_string(),
+                content: "bG9jYWw=".to_string(),
+            }],
+        };
+        let remote = super::KeyBundle {
+            version: 1,
+            created_at: 1,
+            files: vec![super::KeyBundleFile {
+                name: "cloud.key".to_string(),
+                content: "cmVtb3Rl".to_string(),
+            }],
+        };
+        assert!(super::merge_key_bundles(&local, Some(remote)).is_err());
     }
 
     #[test]

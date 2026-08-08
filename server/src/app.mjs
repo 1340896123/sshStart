@@ -197,6 +197,30 @@ function sendEmpty(response, status) {
   response.end();
 }
 
+function validateExpectedUpdatedAt(body) {
+  if (!Object.hasOwn(body, "expectedUpdatedAt")) return { supplied: false, value: undefined };
+  if (body.expectedUpdatedAt !== null
+    && (!Number.isSafeInteger(body.expectedUpdatedAt) || body.expectedUpdatedAt < 0)) {
+    throw new HttpError(400, "expectedUpdatedAt 必须是 null 或非负整数版本");
+  }
+  return { supplied: true, value: body.expectedUpdatedAt ?? undefined };
+}
+
+function assertSnapshotVersion(expected, snapshot) {
+  if (!expected.supplied) return;
+  const currentUpdatedAt = snapshot?.updated_at;
+  if (currentUpdatedAt !== expected.value) {
+    throw new HttpError(409, "云端数据已被其他设备更新，请重新拉取后合并", {
+      "x-portico-current-version": String(currentUpdatedAt ?? "none"),
+    });
+  }
+}
+
+const nextSnapshotVersion = (requested, snapshot) => Math.max(
+  requested,
+  (snapshot?.updated_at ?? -1) + 1,
+);
+
 function createRateLimiter(maxAttempts, windowMs) {
   const buckets = new Map();
   return (key, nowMs) => {
@@ -381,7 +405,10 @@ export function createSyncServer({
       if (!Number.isSafeInteger(body.updatedAt) || body.updatedAt < 0) {
         throw new HttpError(400, "updatedAt 必须是非负整数时间戳");
       }
-      saveSnapshot.run(user.id, body.ciphertext, body.updatedAt, Math.floor(now() / 1000));
+      const currentSnapshot = findSnapshot.get(user.id);
+      assertSnapshotVersion(validateExpectedUpdatedAt(body), currentSnapshot);
+      const updatedAt = nextSnapshotVersion(body.updatedAt, currentSnapshot);
+      saveSnapshot.run(user.id, body.ciphertext, updatedAt, Math.floor(now() / 1000));
       sendEmpty(response, 204);
       return;
     }
@@ -410,7 +437,10 @@ export function createSyncServer({
       if (!Number.isSafeInteger(body.updatedAt) || body.updatedAt < 0) {
         throw new HttpError(400, "updatedAt 必须是非负整数时间戳");
       }
-      saveKeySnapshot.run(user.id, body.ciphertext, body.updatedAt, Math.floor(now() / 1000));
+      const currentSnapshot = findKeySnapshot.get(user.id);
+      assertSnapshotVersion(validateExpectedUpdatedAt(body), currentSnapshot);
+      const updatedAt = nextSnapshotVersion(body.updatedAt, currentSnapshot);
+      saveKeySnapshot.run(user.id, body.ciphertext, updatedAt, Math.floor(now() / 1000));
       sendEmpty(response, 204);
       return;
     }

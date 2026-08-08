@@ -151,6 +151,41 @@ test("encrypted key backups are opaque and isolated by account", async (context)
   assert.equal(otherAccount.response.status, 404);
 });
 
+test("conditional writes reject stale application and key snapshots", async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.close());
+  const registered = await register(fixture.baseUrl, "conflict@example.com");
+  const headers = { authorization: `Bearer ${registered.body.token}` };
+
+  for (const path of ["/sync/data", "/sync/keys"]) {
+    const first = await requestJson(fixture.baseUrl, path, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ ciphertext: `first-${path}`, updatedAt: 100, expectedUpdatedAt: null }),
+    });
+    assert.equal(first.response.status, 204);
+
+    const stale = await requestJson(fixture.baseUrl, path, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ ciphertext: `stale-${path}`, updatedAt: 101, expectedUpdatedAt: null }),
+    });
+    assert.equal(stale.response.status, 409);
+
+    const current = await requestJson(fixture.baseUrl, path, { headers });
+    const updated = await requestJson(fixture.baseUrl, path, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        ciphertext: `updated-${path}`,
+        updatedAt: current.body.updatedAt,
+        expectedUpdatedAt: current.body.updatedAt,
+      }),
+    });
+    assert.equal(updated.response.status, 204);
+  }
+});
+
 test("cloud data can be cleared by snapshot type or all at once", async (context) => {
   const fixture = await startFixture();
   context.after(() => fixture.close());

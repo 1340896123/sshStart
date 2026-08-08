@@ -60,7 +60,7 @@ interface Props {
   servers: ServerProfile[];
   localSyncSummary: Omit<CloudSyncContentSummary, "encryptedBytes">;
   cloudSyncActivity?: CloudSyncProgress;
-  onSyncNow: () => void | Promise<void>;
+  onSyncNow: (endpointOverride?: string) => void | Promise<void>;
   onSave: (config: AiConfig) => void | Promise<void>;
   onRemoveSavedKey: () => void | Promise<void>;
   onManageServerKeyPaths: (updates: ServerKeyPathUpdate[]) => void | Promise<void>;
@@ -387,7 +387,8 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     try {
       const result = await downloadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, overwrite, `keys-download-${crypto.randomUUID()}`);
       setKeyFiles(result.files);
-      setKeySyncNotice(`已解密恢复 ${result.files.length} 个密钥文件到 ~/.porticossh。`);
+      await onSyncNow(value.cloudSync.endpoint);
+      setKeySyncNotice(`已解密恢复 ${result.files.length} 个密钥文件，并重新拉取应用数据。`);
       setKeyPassphrase("");
       setKeyPassphraseConfirmation("");
     } catch (reason) {

@@ -12,6 +12,7 @@ const SERVER_GROUPS_KEY: &str = "server_groups";
 const AI_CONFIG_KEY: &str = "ai_config";
 const AI_CONVERSATIONS_KEY: &str = "ai_conversations";
 const COLLAPSED_GROUPS_KEY: &str = "collapsed_groups";
+const SYNC_METADATA_KEY: &str = "sync_metadata";
 
 pub struct AppDatabase {
     connection: Mutex<Connection>,
@@ -117,6 +118,7 @@ pub struct AppStorageState {
     ai_config: Option<Value>,
     ai_conversations: Vec<Value>,
     collapsed_groups: Vec<String>,
+    sync_meta: Option<Value>,
 }
 
 fn read_array(database: &AppDatabase, key: &str) -> Result<Vec<Value>, String> {
@@ -166,6 +168,7 @@ pub fn load_app_state(database: State<'_, AppDatabase>) -> Result<AppStorageStat
         ai_config: database.read_value(AI_CONFIG_KEY)?,
         ai_conversations: read_array(&database, AI_CONVERSATIONS_KEY)?,
         collapsed_groups: read_string_array(&database, COLLAPSED_GROUPS_KEY)?,
+        sync_meta: database.read_value(SYNC_METADATA_KEY)?,
     })
 }
 
@@ -223,4 +226,12 @@ pub fn save_collapsed_groups(
         COLLAPSED_GROUPS_KEY,
         &Value::Array(groups.into_iter().map(Value::String).collect()),
     )
+}
+
+#[tauri::command]
+pub fn save_sync_metadata(
+    database: State<'_, AppDatabase>,
+    sync_meta: Value,
+) -> Result<(), String> {
+    database.write_value(SYNC_METADATA_KEY, &sync_meta)
 }
