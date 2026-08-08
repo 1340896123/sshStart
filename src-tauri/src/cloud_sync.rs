@@ -282,6 +282,9 @@ fn update_data_sync_state(record: SyncRecord) -> Result<(), String> {
         .lock()
         .map_err(|_| "同步状态锁已损坏".to_string())?;
     let mut state = load_sync_state()?;
+    if state.email != email() {
+        state = PersistedSyncState::default();
+    }
     state.last_data_sync = Some(record);
     save_sync_state_unlocked(state)
 }
@@ -291,7 +294,27 @@ fn update_key_sync_state(record: KeySyncRecord) -> Result<(), String> {
         .lock()
         .map_err(|_| "同步状态锁已损坏".to_string())?;
     let mut state = load_sync_state()?;
+    if state.email != email() {
+        state = PersistedSyncState::default();
+    }
     state.last_key_sync = Some(record);
+    save_sync_state_unlocked(state)
+}
+
+fn clear_sync_state(clear_data: bool, clear_keys: bool) -> Result<(), String> {
+    let _guard = sync_state_lock()
+        .lock()
+        .map_err(|_| "同步状态锁已损坏".to_string())?;
+    let mut state = load_sync_state()?;
+    if state.email != email() {
+        state = PersistedSyncState::default();
+    }
+    if clear_data {
+        state.last_data_sync = None;
+    }
+    if clear_keys {
+        state.last_key_sync = None;
+    }
     save_sync_state_unlocked(state)
 }
 
@@ -1076,6 +1099,113 @@ fn strip_snapshot_secrets(mut snapshot: Value) -> Value {
     snapshot
 }
 
+fn clear_snapshot_category(snapshot: &mut Value, scope: &str) -> Result<(), String> {
+    let object = snapshot
+        .as_object_mut()
+        .ok_or_else(|| "云端应用快照格式无效".to_string())?;
+    match scope {
+        "servers" => {
+            object.insert("servers".to_string(), Value::Array(Vec::new()));
+            object.insert("deletedServerIds".to_string(), Value::Array(Vec::new()));
+        }
+        "groups" => {
+            object.insert("savedGroups".to_string(), Value::Array(Vec::new()));
+            object.insert("collapsedGroups".to_string(), Value::Array(Vec::new()));
+        }
+        "ai-config" => {
+            object.insert("aiConfig".to_string(), Value::Null);
+        }
+        "conversations" => {
+            object.insert("aiConversations".to_string(), Value::Array(Vec::new()));
+        }
+        _ => return Err("不支持的云端数据清除范围".to_string()),
+    }
+    Ok(())
+}
+
+fn rewrite_cloud_snapshot_without(endpoint: &str, token: &str, scope: &str) -> Result<(), String> {
+    let client = request_client()?;
+    let response = client
+        .get(format!("{endpoint}/sync/data"))
+        .bearer_auth(token)
+        .send()
+        .map_err(|error| format!("读取云端应用快照失败: {error}"))?;
+    if response.status().as_u16() == 404 {
+        return clear_sync_state(true, false);
+    }
+    if !response.status().is_success() {
+        return Err(response_error(response));
+    }
+    let payload = response
+        .json::<Value>()
+        .map_err(|error| format!("解析云端应用快照失败: {error}"))?;
+    let ciphertext = payload
+        .get("ciphertext")
+        .or_else(|| payload.get("data"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "同步服务没有返回密文".to_string())?;
+    let mut snapshot = decrypt_json(ciphertext)?;
+    clear_snapshot_category(&mut snapshot, scope)?;
+    let summary_without_size = summarize_snapshot(&snapshot, 0);
+    let encrypted = encrypt_json(&snapshot)?;
+    let content = SyncContentSummary {
+        encrypted_bytes: encrypted.len(),
+        ..summary_without_size
+    };
+    let updated_at = unix_timestamp();
+    let response = client
+        .put(format!("{endpoint}/sync/data"))
+        .bearer_auth(token)
+        .json(&json!({
+            "ciphertext": encrypted,
+            "updatedAt": updated_at,
+        }))
+        .send()
+        .map_err(|error| format!("更新云端应用快照失败: {error}"))?;
+    if !response.status().is_success() {
+        return Err(response_error(response));
+    }
+    update_data_sync_state(SyncRecord {
+        direction: "upload".to_string(),
+        completed_at: unix_timestamp(),
+        remote_updated_at: Some(updated_at),
+        content,
+    })
+}
+
+fn clear_cloud_data(endpoint: String, scope: String) -> Result<(), String> {
+    let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
+    if matches!(
+        scope.as_str(),
+        "servers" | "groups" | "ai-config" | "conversations"
+    ) {
+        return rewrite_cloud_snapshot_without(&endpoint, &token, &scope);
+    }
+    let (path, clear_data, clear_keys) = match scope.as_str() {
+        "keys" => ("/sync/keys", false, true),
+        "all" => ("/sync", true, true),
+        _ => return Err("不支持的云端数据清除范围".to_string()),
+    };
+    let response = request_client()?
+        .delete(format!("{endpoint}{path}"))
+        .bearer_auth(token)
+        .send()
+        .map_err(|error| format!("清除云端数据失败: {error}"))?;
+    if !response.status().is_success() {
+        return Err(response_error(response));
+    }
+    clear_sync_state(clear_data, clear_keys)
+}
+
+#[tauri::command]
+pub async fn sync_clear_cloud_data(endpoint: String, scope: String) -> Result<SyncStatus, String> {
+    let endpoint = normalize_endpoint(&endpoint)?;
+    tauri::async_runtime::spawn_blocking(move || clear_cloud_data(endpoint, scope))
+        .await
+        .map_err(|error| format!("清除云端数据任务失败: {error}"))??;
+    sync_status()
+}
+
 fn push_sync(
     app: AppHandle,
     operation_id: String,
@@ -1570,6 +1700,38 @@ mod tests {
             Ok("https://sync.example.com/api".to_string())
         );
         assert!(super::normalize_endpoint("ftp://sync.example.com").is_err());
+    }
+
+    #[test]
+    fn cloud_snapshot_categories_can_be_cleared_independently() {
+        let original = json!({
+            "servers": [{ "id": "server-1" }],
+            "deletedServerIds": ["server-2"],
+            "savedGroups": ["生产"],
+            "collapsedGroups": ["生产"],
+            "aiConfig": { "model": "example" },
+            "aiConversations": [{ "id": "conversation-1" }],
+        });
+
+        let mut servers = original.clone();
+        super::clear_snapshot_category(&mut servers, "servers").expect("clear servers");
+        assert_eq!(servers["servers"], json!([]));
+        assert_eq!(servers["deletedServerIds"], json!([]));
+        assert_eq!(servers["savedGroups"], original["savedGroups"]);
+
+        let mut groups = original.clone();
+        super::clear_snapshot_category(&mut groups, "groups").expect("clear groups");
+        assert_eq!(groups["savedGroups"], json!([]));
+        assert_eq!(groups["collapsedGroups"], json!([]));
+
+        let mut ai_config = original.clone();
+        super::clear_snapshot_category(&mut ai_config, "ai-config").expect("clear ai config");
+        assert!(ai_config["aiConfig"].is_null());
+
+        let mut conversations = original;
+        super::clear_snapshot_category(&mut conversations, "conversations")
+            .expect("clear conversations");
+        assert_eq!(conversations["aiConversations"], json!([]));
     }
 
     #[test]

@@ -2807,6 +2807,7 @@ pub fn run() {
             cloud_sync::sync_logout,
             cloud_sync::sync_push,
             cloud_sync::sync_pull,
+            cloud_sync::sync_clear_cloud_data,
             cloud_sync::sync_list_key_files,
             cloud_sync::sync_upload_keys,
             cloud_sync::sync_download_keys,

@@ -46,6 +46,7 @@ export interface CloudKeySyncRecord {
 
 export type CloudSyncOperation = "push" | "pull" | "keys-upload" | "keys-download";
 export type CloudSyncProgressStatus = "running" | "success" | "error";
+export type CloudDataScope = "servers" | "groups" | "ai-config" | "conversations" | "keys" | "all";
 
 export interface CloudSyncProgress {
   operationId: string;
@@ -146,6 +147,11 @@ export const pushCloudSync = (endpoint: string, snapshot: AppStorageSnapshot, op
 
 export const pullCloudSync = (endpoint: string, operationId: string) =>
   isTauri() ? invoke<AppStorageSnapshot | null>("sync_pull", { endpoint, operationId }) : Promise.resolve(null);
+
+export const clearCloudSyncData = (endpoint: string, scope: CloudDataScope) =>
+  isTauri()
+    ? invoke<CloudSyncStatus>("sync_clear_cloud_data", { endpoint, scope })
+    : Promise.reject(new Error("云端同步仅可在桌面应用中使用"));
 
 export const listCloudSyncKeyFiles = (servers: ServerProfile[]) =>
   isTauri() ? invoke<KeyFileInfo[]>("sync_list_key_files", { servers: cloudKeyServers(servers) }) : Promise.resolve([]);

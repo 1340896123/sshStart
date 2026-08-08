@@ -151,6 +151,46 @@ test("encrypted key backups are opaque and isolated by account", async (context)
   assert.equal(otherAccount.response.status, 404);
 });
 
+test("cloud data can be cleared by snapshot type or all at once", async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.close());
+  const registered = await register(fixture.baseUrl, "clear@example.com");
+  const headers = { authorization: `Bearer ${registered.body.token}` };
+
+  for (const path of ["/sync/data", "/sync/keys"]) {
+    const uploaded = await requestJson(fixture.baseUrl, path, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ ciphertext: `opaque-${path}`, updatedAt: 1786118400 }),
+    });
+    assert.equal(uploaded.response.status, 204);
+  }
+
+  const clearedData = await requestJson(fixture.baseUrl, "/sync/data", { method: "DELETE", headers });
+  assert.equal(clearedData.response.status, 204);
+  assert.equal((await requestJson(fixture.baseUrl, "/sync/data", { headers })).response.status, 404);
+  assert.equal((await requestJson(fixture.baseUrl, "/sync/keys", { headers })).response.status, 200);
+
+  const clearedKeys = await requestJson(fixture.baseUrl, "/sync/keys", { method: "DELETE", headers });
+  assert.equal(clearedKeys.response.status, 204);
+  assert.equal((await requestJson(fixture.baseUrl, "/sync/keys", { headers })).response.status, 404);
+
+  for (const path of ["/sync/data", "/sync/keys"]) {
+    await requestJson(fixture.baseUrl, path, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ ciphertext: `opaque-restored-${path}`, updatedAt: 1786118401 }),
+    });
+  }
+  const clearedAll = await requestJson(fixture.baseUrl, "/sync", { method: "DELETE", headers });
+  assert.equal(clearedAll.response.status, 204);
+  assert.equal((await requestJson(fixture.baseUrl, "/sync/data", { headers })).response.status, 404);
+  assert.equal((await requestJson(fixture.baseUrl, "/sync/keys", { headers })).response.status, 404);
+
+  const repeated = await requestJson(fixture.baseUrl, "/sync", { method: "DELETE", headers });
+  assert.equal(repeated.response.status, 204);
+});
+
 test("sync routes reject missing authentication and invalid payloads", async (context) => {
   const fixture = await startFixture();
   context.after(() => fixture.close());
@@ -159,6 +199,8 @@ test("sync routes reject missing authentication and invalid payloads", async (co
   assert.equal(unauthorized.response.status, 401);
   const unauthorizedKeys = await requestJson(fixture.baseUrl, "/sync/keys");
   assert.equal(unauthorizedKeys.response.status, 401);
+  const unauthorizedDelete = await requestJson(fixture.baseUrl, "/sync", { method: "DELETE" });
+  assert.equal(unauthorizedDelete.response.status, 401);
 
   const registered = await register(fixture.baseUrl, "payload@example.com");
   const invalidPayload = await requestJson(fixture.baseUrl, "/sync/data", {

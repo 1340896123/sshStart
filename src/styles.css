@@ -4665,6 +4665,7 @@ body.is-resizing-rows .system-dock {
   max-width: 1028px;
   min-height: 0;
   display: grid;
+  grid-auto-rows: max-content;
   align-content: start;
   gap: 18px;
   padding: 0 clamp(24px, 5vw, 64px) 36px;
@@ -4715,6 +4716,14 @@ body.is-resizing-rows .system-dock {
 
 .settings-panel-header-with-action > button {
   flex: 0 0 auto;
+}
+
+.sync-overview-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
 }
 
 .sync-overview-status {
@@ -4866,6 +4875,37 @@ body.is-resizing-rows .system-dock {
   font-style: normal;
   text-align: right;
   white-space: nowrap;
+}
+
+.sync-content-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.sync-clear-button {
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background 150ms cubic-bezier(0.2, 0, 0, 1), border-color 150ms cubic-bezier(0.2, 0, 0, 1), color 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.sync-clear-button:hover:not(:disabled),
+.sync-clear-button:focus-visible {
+  border-color: var(--danger-soft);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .sync-content-row-muted em,
@@ -5733,6 +5773,10 @@ body.is-resizing-rows .system-dock {
     padding-left: 18px;
   }
 
+  .sync-content-actions {
+    gap: 7px;
+  }
+
   .sync-progress-block {
     padding-right: 18px;
     padding-left: 18px;
@@ -5873,6 +5917,10 @@ body.is-resizing-rows .system-dock {
   .settings-panel-header-with-action > button svg {
     flex: 0 0 auto;
     color: var(--fg);
+  }
+
+  .sync-overview-actions {
+    flex-wrap: wrap;
   }
 
   .sync-overview-status,

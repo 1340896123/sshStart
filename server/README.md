@@ -34,8 +34,11 @@ For an internet-facing deployment, terminate TLS at a reverse proxy, keep the se
 - `POST /auth/login` verifies an account and returns `{ "token", "email" }`.
 - `GET /sync/data` returns `{ "ciphertext", "updatedAt" }`, or `404` before the first upload.
 - `PUT /sync/data` stores `{ "ciphertext", "updatedAt" }` for the authenticated account.
+- `DELETE /sync/data` removes the authenticated account's application snapshot.
 - `GET /sync/keys` returns the opaque passphrase-encrypted `*.key` backup, or `404` before the first upload.
 - `PUT /sync/keys` stores `{ "ciphertext", "updatedAt" }` for the authenticated account.
+- `DELETE /sync/keys` removes the authenticated account's encrypted key backup.
+- `DELETE /sync` removes both cloud snapshots for the authenticated account.
 - `GET /healthz` returns service readiness.
 
 Passwords are hashed with scrypt and a per-account random salt. Tokens use HMAC-SHA256 and expire after seven days. Authentication endpoints are rate-limited per client address. Application snapshots and key backups are never decrypted or parsed by the service.

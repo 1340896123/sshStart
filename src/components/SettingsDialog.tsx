@@ -38,6 +38,7 @@ import {
 } from "lucide-react";
 import { isTauri } from "../lib";
 import {
+  clearCloudSyncData,
   downloadCloudSyncKeys,
   getCloudSyncStatus,
   listCloudSyncKeyFiles,
@@ -46,6 +47,7 @@ import {
   registerCloudSync,
   uploadCloudSyncKeys,
   type CloudSyncStatus,
+  type CloudDataScope,
   type CloudSyncProgress,
   type KeyFileInfo,
   type ServerKeyPathUpdate,
@@ -158,6 +160,8 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
   const [syncEmail, setSyncEmail] = useState("");
   const [syncPassword, setSyncPassword] = useState("");
   const [syncBusy, setSyncBusy] = useState(false);
+  const [cloudClearTarget, setCloudClearTarget] = useState<CloudDataScope>();
+  const [cloudClearNotice, setCloudClearNotice] = useState("");
   const [keyFiles, setKeyFiles] = useState<KeyFileInfo[]>([]);
   const [keyPassphrase, setKeyPassphrase] = useState("");
   const [keyPassphraseConfirmation, setKeyPassphraseConfirmation] = useState("");
@@ -334,6 +338,7 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
     }
     setKeySyncAction("upload");
     setError("");
+    setCloudClearNotice("");
     setKeySyncNotice("");
     try {
       const result = await uploadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, servers, `keys-upload-${crypto.randomUUID()}`);
@@ -418,6 +423,7 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
 
   const triggerSyncNow = async () => {
     setError("");
+    setCloudClearNotice("");
     try {
       await onSyncNow();
     } catch (reason) {
@@ -425,7 +431,43 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
     }
   };
 
-  const busy = saving || removingKey || syncBusy || keySyncBusy;
+  const clearCloudData = async (scope: CloudDataScope) => {
+    if (!syncStatus?.authenticated) {
+      setError("请先登录同步账号");
+      return;
+    }
+    if (!value.cloudSync.endpoint.trim()) {
+      setError("请先配置云端同步服务地址");
+      return;
+    }
+    const labels: Record<CloudDataScope, string> = {
+      servers: "服务器配置",
+      groups: "服务器分组",
+      "ai-config": "AI 配置",
+      conversations: "AI 会话",
+      keys: "SSH 私钥备份",
+      all: "全部云端数据",
+    };
+    const confirmation = scope === "all"
+      ? "将清空当前账号的应用快照和 SSH 私钥备份。此操作不会删除本机数据，但以后自动或手动同步可能再次上传本地内容。确定继续吗？"
+      : `将从当前账号的云端快照中清除“${labels[scope]}”。此操作不会删除本机数据，但以后自动或手动同步可能再次上传本地内容。确定继续吗？`;
+    if (!window.confirm(confirmation)) return;
+
+    setCloudClearTarget(scope);
+    setCloudClearNotice("");
+    setError("");
+    try {
+      setSyncStatus(await clearCloudSyncData(value.cloudSync.endpoint, scope));
+      setCloudClearNotice(scope === "all" ? "已清空当前账号的全部云端数据，本机数据保持不变。" : `已清除云端${labels[scope]}，本机数据保持不变。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setCloudClearTarget(undefined);
+    }
+  };
+
+  const cloudClearBusy = Boolean(cloudClearTarget);
+  const busy = saving || removingKey || syncBusy || keySyncBusy || cloudClearBusy;
   const visibleSections = SETTINGS_SECTIONS.filter((section) => {
     const query = navSearch.trim().toLocaleLowerCase();
     return !query || `${section.label} ${section.description}`.toLocaleLowerCase().includes(query);
@@ -434,6 +476,19 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
     ? activeSection
     : visibleSections[0]?.id;
   const activeSectionMeta = SETTINGS_SECTIONS.find((section) => section.id === visibleActiveSection);
+  const renderCloudClearButton = (scope: Exclude<CloudDataScope, "all">, label: string) => (
+    <button
+      className="sync-clear-button"
+      type="button"
+      disabled={!syncStatus?.authenticated || syncOperationRunning || cloudClearBusy || isDirty}
+      onClick={() => void clearCloudData(scope)}
+      title={isDirty ? "请先保存当前设置" : `清除云端${label}，不会删除本机数据`}
+      aria-label={`清除云端${label}`}
+    >
+      {cloudClearTarget === scope ? <RefreshCw className="spinning" size={12} /> : <Trash2 size={12} />}
+      清除
+    </button>
+  );
 
   useEffect(() => {
     if (!visibleSections.some((section) => section.id === activeSection) && visibleSections[0]) {
@@ -697,10 +752,16 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
                 <section className="settings-panel sync-overview-panel">
                   <header className="settings-panel-header-with-action">
                     <div><strong>同步概览</strong><small>这里显示最近一次成功同步的范围，不会显示密码、API 密钥或私钥内容</small></div>
-                    <button className="secondary-button" type="button" disabled={!syncStatus?.authenticated || syncOperationRunning || isDirty} onClick={() => void triggerSyncNow()} title={isDirty ? "请先保存当前设置" : "立即上传当前应用数据"}>
-                      {syncOperationRunning && cloudSyncActivity?.operation === "push" ? <RefreshCw className="spinning" size={14} /> : <Cloud size={14} />}
-                      立即同步
-                    </button>
+                    <span className="sync-overview-actions">
+                      <button className="secondary-button" type="button" disabled={!syncStatus?.authenticated || syncOperationRunning || cloudClearBusy || isDirty} onClick={() => void triggerSyncNow()} title={isDirty ? "请先保存当前设置" : "立即上传当前应用数据"}>
+                        {syncOperationRunning && cloudSyncActivity?.operation === "push" ? <RefreshCw className="spinning" size={14} /> : <Cloud size={14} />}
+                        立即同步
+                      </button>
+                      <button className="danger-button" type="button" disabled={!syncStatus?.authenticated || syncOperationRunning || cloudClearBusy || isDirty} onClick={() => void clearCloudData("all")} title={isDirty ? "请先保存当前设置" : "清空当前账号的全部云端数据，不会删除本机数据"}>
+                        {cloudClearTarget === "all" ? <RefreshCw className="spinning" size={14} /> : <Trash2 size={14} />}
+                        清空所有云端数据
+                      </button>
+                    </span>
                   </header>
                   <div className={`sync-overview-status ${cloudSyncActivity?.status ?? (lastDataSync ? "success" : "idle")}`}>
                     <span className="sync-overview-status-icon">
@@ -716,13 +777,14 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
                     </div>
                   )}
                   <div className="sync-content-list">
-                    <div className="sync-content-row"><span className="sync-content-icon"><ServerCog size={14} /></span><span><strong>服务器配置</strong><small>连接信息与本地加密凭据</small></span><em>{lastDataSync ? `${lastDataSync.content.serverCount} 个` : "待同步"}</em></div>
-                    <div className="sync-content-row"><span className="sync-content-icon"><FolderTree size={14} /></span><span><strong>服务器分组</strong><small>分组名称与展开状态</small></span><em>{lastDataSync ? `${lastDataSync.content.groupCount} 个 · ${lastDataSync.content.collapsedGroupCount} 个状态` : "待同步"}</em></div>
-                    <div className="sync-content-row"><span className="sync-content-icon"><Bot size={14} /></span><span><strong>AI 配置</strong><small>模型、Agent、工具与加密 API 密钥</small></span><em>{lastDataSync?.content.hasAiConfig ? "已包含" : "待同步"}</em></div>
-                    <div className="sync-content-row"><span className="sync-content-icon"><MessageSquare size={14} /></span><span><strong>AI 会话</strong><small>历史对话与当前工作区上下文</small></span><em>{lastDataSync ? `${lastDataSync.content.conversationCount} 条` : "待同步"}</em></div>
-                    <div className="sync-content-row sync-content-row-muted"><span className="sync-content-icon"><KeyRound size={14} /></span><span><strong>SSH 私钥文件</strong><small>不随应用快照上传，需在下方单独加密备份</small></span><em>{lastKeySync ? `${lastKeySync.fileCount} 个 · ${formatSyncTimestamp(lastKeySync.completedAt)}` : "单独备份"}</em></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><ServerCog size={14} /></span><span><strong>服务器配置</strong><small>连接信息与本地加密凭据</small></span><span className="sync-content-actions"><em>{lastDataSync ? lastDataSync.content.serverCount > 0 ? `${lastDataSync.content.serverCount} 个` : "已清空" : "待同步"}</em>{renderCloudClearButton("servers", "服务器配置")}</span></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><FolderTree size={14} /></span><span><strong>服务器分组</strong><small>分组名称与展开状态</small></span><span className="sync-content-actions"><em>{lastDataSync ? lastDataSync.content.groupCount > 0 || lastDataSync.content.collapsedGroupCount > 0 ? `${lastDataSync.content.groupCount} 个 · ${lastDataSync.content.collapsedGroupCount} 个状态` : "已清空" : "待同步"}</em>{renderCloudClearButton("groups", "服务器分组")}</span></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><Bot size={14} /></span><span><strong>AI 配置</strong><small>模型、Agent、工具与加密 API 密钥</small></span><span className="sync-content-actions"><em>{lastDataSync ? lastDataSync.content.hasAiConfig ? "已包含" : "已清空" : "待同步"}</em>{renderCloudClearButton("ai-config", "AI 配置")}</span></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><MessageSquare size={14} /></span><span><strong>AI 会话</strong><small>历史对话与当前工作区上下文</small></span><span className="sync-content-actions"><em>{lastDataSync ? lastDataSync.content.conversationCount > 0 ? `${lastDataSync.content.conversationCount} 条` : "已清空" : "待同步"}</em>{renderCloudClearButton("conversations", "AI 会话")}</span></div>
+                    <div className="sync-content-row sync-content-row-muted"><span className="sync-content-icon"><KeyRound size={14} /></span><span><strong>SSH 私钥文件</strong><small>不随应用快照上传，需在下方单独加密备份</small></span><span className="sync-content-actions"><em>{lastKeySync ? `${lastKeySync.fileCount} 个 · ${formatSyncTimestamp(lastKeySync.completedAt)}` : "单独备份"}</em>{renderCloudClearButton("keys", "SSH 私钥备份")}</span></div>
                   </div>
                 </section>
+                {cloudClearNotice && <div className="settings-note"><Check size={15} /><span>{cloudClearNotice}</span></div>}
                 <section className="settings-panel">
                   <header><strong>同步账号</strong><small>{syncStatus?.authenticated ? `已登录：${syncStatus.email ?? "当前账号"}` : "必须登录后才能开启同步"}</small></header>
                   {!syncStatus?.authenticated ? (

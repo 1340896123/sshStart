@@ -273,6 +273,7 @@ export function createSyncServer({
   const findUserById = database.prepare("SELECT id, email FROM users WHERE id = ?");
   const insertUser = database.prepare("INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)");
   const findSnapshot = database.prepare("SELECT ciphertext, updated_at FROM sync_snapshots WHERE user_id = ?");
+  const deleteSnapshot = database.prepare("DELETE FROM sync_snapshots WHERE user_id = ?");
   const saveSnapshot = database.prepare(`
     INSERT INTO sync_snapshots (user_id, ciphertext, updated_at, stored_at)
     VALUES (?, ?, ?, ?)
@@ -282,6 +283,7 @@ export function createSyncServer({
       stored_at = excluded.stored_at
   `);
   const findKeySnapshot = database.prepare("SELECT ciphertext, updated_at FROM key_snapshots WHERE user_id = ?");
+  const deleteKeySnapshot = database.prepare("DELETE FROM key_snapshots WHERE user_id = ?");
   const saveKeySnapshot = database.prepare(`
     INSERT INTO key_snapshots (user_id, ciphertext, updated_at, stored_at)
     VALUES (?, ?, ?, ?)
@@ -383,6 +385,12 @@ export function createSyncServer({
       sendEmpty(response, 204);
       return;
     }
+    if (path === "/sync/data" && request.method === "DELETE") {
+      const user = authenticate(request);
+      deleteSnapshot.run(user.id);
+      sendEmpty(response, 204);
+      return;
+    }
     if (path === "/sync/keys" && request.method === "GET") {
       const user = authenticate(request);
       const snapshot = findKeySnapshot.get(user.id);
@@ -406,8 +414,21 @@ export function createSyncServer({
       sendEmpty(response, 204);
       return;
     }
+    if (path === "/sync/keys" && request.method === "DELETE") {
+      const user = authenticate(request);
+      deleteKeySnapshot.run(user.id);
+      sendEmpty(response, 204);
+      return;
+    }
+    if (path === "/sync" && request.method === "DELETE") {
+      const user = authenticate(request);
+      deleteSnapshot.run(user.id);
+      deleteKeySnapshot.run(user.id);
+      sendEmpty(response, 204);
+      return;
+    }
 
-    if (path === "/auth/register" || path === "/auth/login" || path === "/sync/data" || path === "/sync/keys") {
+    if (path === "/auth/register" || path === "/auth/login" || path === "/sync" || path === "/sync/data" || path === "/sync/keys") {
       throw new HttpError(405, "请求方法不受支持");
     }
     throw new HttpError(404, "接口不存在");
