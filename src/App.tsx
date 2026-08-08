@@ -1250,7 +1250,25 @@ export default function App() {
           onImport={importAiServerList}
         />
       )}
-      {settingsOpen && <SettingsDialog config={aiConfig} servers={servers} cloudSyncActivity={cloudSyncActivity} onSyncNow={syncNow} onSave={saveAiConfig} onRemoveSavedKey={removeSavedAiKey} onManageServerKeyPaths={manageServerKeyPaths} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsDialog
+          config={aiConfig}
+          servers={servers}
+          localSyncSummary={{
+            serverCount: servers.length,
+            groupCount: savedGroups.length,
+            conversationCount: readAiConversations().length,
+            collapsedGroupCount: collapsedGroups.length,
+            hasAiConfig: true,
+          }}
+          cloudSyncActivity={cloudSyncActivity}
+          onSyncNow={syncNow}
+          onSave={saveAiConfig}
+          onRemoveSavedKey={removeSavedAiKey}
+          onManageServerKeyPaths={manageServerKeyPaths}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
     </div>
   );
 }

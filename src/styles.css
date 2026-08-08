@@ -4884,6 +4884,29 @@ body.is-resizing-rows .system-dock {
   gap: 10px;
 }
 
+.sync-counts {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.sync-counts > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.sync-counts small {
+  color: var(--muted-2);
+  font-size: 8px;
+  letter-spacing: 0.02em;
+}
+
+.sync-counts em {
+  color: var(--fg);
+}
+
 .sync-clear-button {
   min-height: 26px;
   display: inline-flex;
@@ -5774,6 +5797,10 @@ body.is-resizing-rows .system-dock {
   }
 
   .sync-content-actions {
+    gap: 8px;
+  }
+
+  .sync-counts {
     gap: 7px;
   }
 

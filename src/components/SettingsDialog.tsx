@@ -48,6 +48,7 @@ import {
   uploadCloudSyncKeys,
   type CloudSyncStatus,
   type CloudDataScope,
+  type CloudSyncContentSummary,
   type CloudSyncProgress,
   type KeyFileInfo,
   type ServerKeyPathUpdate,
@@ -57,6 +58,7 @@ import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOI
 interface Props {
   config: AiConfig;
   servers: ServerProfile[];
+  localSyncSummary: Omit<CloudSyncContentSummary, "encryptedBytes">;
   cloudSyncActivity?: CloudSyncProgress;
   onSyncNow: () => void | Promise<void>;
   onSave: (config: AiConfig) => void | Promise<void>;
@@ -145,7 +147,7 @@ const formatSyncTimestamp = (seconds?: number) => seconds
 
 const syncDirectionLabel = (direction?: "upload" | "download") => direction === "download" ? "从云端下载" : "上传到云端";
 
-export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, onSave, onRemoveSavedKey, onManageServerKeyPaths, onClose }: Props) {
+export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncActivity, onSyncNow, onSave, onRemoveSavedKey, onManageServerKeyPaths, onClose }: Props) {
   const [value, setValue] = useState(() => normalizeAiConfig(config));
   const [savedValue, setSavedValue] = useState(() => normalizeAiConfig(config));
   const [models, setModels] = useState<string[]>([]);
@@ -489,6 +491,12 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
       清除
     </button>
   );
+  const renderSyncCounts = (cloud: string, local: string) => (
+    <span className="sync-counts" aria-label={`云端 ${cloud}，本地 ${local}`}>
+      <span><small>云端</small><em>{cloud}</em></span>
+      <span><small>本地</small><em>{local}</em></span>
+    </span>
+  );
 
   useEffect(() => {
     if (!visibleSections.some((section) => section.id === activeSection) && visibleSections[0]) {
@@ -777,11 +785,11 @@ export function SettingsDialog({ config, servers, cloudSyncActivity, onSyncNow, 
                     </div>
                   )}
                   <div className="sync-content-list">
-                    <div className="sync-content-row"><span className="sync-content-icon"><ServerCog size={14} /></span><span><strong>服务器配置</strong><small>连接信息与本地加密凭据</small></span><span className="sync-content-actions"><em>{lastDataSync ? lastDataSync.content.serverCount > 0 ? `${lastDataSync.content.serverCount} 个` : "已清空" : "待同步"}</em>{renderCloudClearButton("servers", "服务器配置")}</span></div>
-                    <div className="sync-content-row"><span className="sync-content-icon"><FolderTree size={14} /></span><span><strong>服务器分组</strong><small>分组名称与展开状态</small></span><span className="sync-content-actions"><em>{lastDataSync ? lastDataSync.content.groupCount > 0 || lastDataSync.content.collapsedGroupCount > 0 ? `${lastDataSync.content.groupCount} 个 · ${lastDataSync.content.collapsedGroupCount} 个状态` : "已清空" : "待同步"}</em>{renderCloudClearButton("groups", "服务器分组")}</span></div>
-                    <div className="sync-content-row"><span className="sync-content-icon"><Bot size={14} /></span><span><strong>AI 配置</strong><small>模型、Agent、工具与加密 API 密钥</small></span><span className="sync-content-actions"><em>{lastDataSync ? lastDataSync.content.hasAiConfig ? "已包含" : "已清空" : "待同步"}</em>{renderCloudClearButton("ai-config", "AI 配置")}</span></div>
-                    <div className="sync-content-row"><span className="sync-content-icon"><MessageSquare size={14} /></span><span><strong>AI 会话</strong><small>历史对话与当前工作区上下文</small></span><span className="sync-content-actions"><em>{lastDataSync ? lastDataSync.content.conversationCount > 0 ? `${lastDataSync.content.conversationCount} 条` : "已清空" : "待同步"}</em>{renderCloudClearButton("conversations", "AI 会话")}</span></div>
-                    <div className="sync-content-row sync-content-row-muted"><span className="sync-content-icon"><KeyRound size={14} /></span><span><strong>SSH 私钥文件</strong><small>不随应用快照上传，需在下方单独加密备份</small></span><span className="sync-content-actions"><em>{lastKeySync ? `${lastKeySync.fileCount} 个 · ${formatSyncTimestamp(lastKeySync.completedAt)}` : "单独备份"}</em>{renderCloudClearButton("keys", "SSH 私钥备份")}</span></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><ServerCog size={14} /></span><span><strong>服务器配置</strong><small>连接信息与本地加密凭据</small></span><span className="sync-content-actions">{renderSyncCounts(lastDataSync ? `${lastDataSync.content.serverCount} 个` : "—", `${localSyncSummary.serverCount} 个`)}{renderCloudClearButton("servers", "服务器配置")}</span></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><FolderTree size={14} /></span><span><strong>服务器分组</strong><small>分组名称与展开状态</small></span><span className="sync-content-actions">{renderSyncCounts(lastDataSync ? `${lastDataSync.content.groupCount} 组` : "—", `${localSyncSummary.groupCount} 组`)}{renderCloudClearButton("groups", "服务器分组")}</span></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><Bot size={14} /></span><span><strong>AI 配置</strong><small>模型、Agent、工具与加密 API 密钥</small></span><span className="sync-content-actions">{renderSyncCounts(lastDataSync ? `${Number(lastDataSync.content.hasAiConfig)} 项` : "—", `${Number(localSyncSummary.hasAiConfig)} 项`)}{renderCloudClearButton("ai-config", "AI 配置")}</span></div>
+                    <div className="sync-content-row"><span className="sync-content-icon"><MessageSquare size={14} /></span><span><strong>AI 会话</strong><small>历史对话与当前工作区上下文</small></span><span className="sync-content-actions">{renderSyncCounts(lastDataSync ? `${lastDataSync.content.conversationCount} 条` : "—", `${localSyncSummary.conversationCount} 条`)}{renderCloudClearButton("conversations", "AI 会话")}</span></div>
+                    <div className="sync-content-row sync-content-row-muted"><span className="sync-content-icon"><KeyRound size={14} /></span><span><strong>SSH 私钥文件</strong><small>不随应用快照上传，需在下方单独加密备份</small></span><span className="sync-content-actions">{renderSyncCounts(lastKeySync ? `${lastKeySync.fileCount} 个` : "—", `${keyFiles.length} 个`)}{renderCloudClearButton("keys", "SSH 私钥备份")}</span></div>
                   </div>
                 </section>
                 {cloudClearNotice && <div className="settings-note"><Check size={15} /><span>{cloudClearNotice}</span></div>}
