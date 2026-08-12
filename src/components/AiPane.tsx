@@ -912,7 +912,6 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
               <ShieldCheck size={11} aria-hidden="true" />
               <select
                 aria-label="工具审批策略"
-                disabled={agent.running}
                 value={approvalPolicy}
                 onChange={(event) => onUpdate({ approvalPolicy: event.target.value as AiApprovalPolicy })}
               >

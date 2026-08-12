@@ -211,7 +211,7 @@ export default function App() {
     replaceStorageSnapshot(merged);
     if (isTauri()) {
       const apiKey = await invoke<string | null>("load_ai_key").catch(() => null);
-      setAiConfig((current) => ({ ...current, apiKey: apiKey ?? "" }));
+      setAiConfig((current) => keepCurrentWhenEqual(current, { ...current, apiKey: apiKey ?? "" }));
     }
     return merged;
   }, [replaceStorageSnapshot]);

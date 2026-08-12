@@ -79,6 +79,51 @@ export interface NetworkInterface {
   mtu: number;
 }
 
+export interface DiskUsage {
+  filesystem: string;
+  mountPoint: string;
+  totalBytes: number;
+  usedBytes: number;
+  availableBytes: number;
+  usedPercent: number;
+}
+
+export interface SystemInformation {
+  hostname: string;
+  operatingSystem: string;
+  kernel: string;
+  architecture: string;
+  cpuModel: string;
+  cpuCores: number;
+  cpuUsagePercent: number;
+  loadAverage: number[];
+  uptimeSeconds: number;
+  memoryTotalBytes: number;
+  memoryUsedBytes: number;
+  memoryAvailableBytes: number;
+  swapTotalBytes: number;
+  swapUsedBytes: number;
+  disks: DiskUsage[];
+}
+
+export type ContainerAction = "start" | "stop" | "restart" | "remove";
+
+export interface ContainerInfo {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+  ports: string;
+  createdAt: string;
+  cpuPercent: number;
+  memoryUsageBytes: number;
+  memoryLimitBytes: number;
+  memoryPercent: number;
+  networkInputBytes: number;
+  networkOutputBytes: number;
+}
+
 export type TransferDirection = "upload" | "download";
 export type TransferStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
 

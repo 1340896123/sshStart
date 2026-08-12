@@ -110,6 +110,7 @@ export function useAiAgent({
   const pendingLocalMessagesRef = useRef<AiMessage[]>();
   const onMessagesChangeRef = useRef(onMessagesChange);
   const activeRunRef = useRef<ActiveRun>();
+  const approvalPolicyRef = useRef(approvalPolicy);
 
   if (messages !== lastPropMessagesRef.current) {
     lastPropMessagesRef.current = messages;
@@ -117,6 +118,7 @@ export function useAiAgent({
     pendingLocalMessagesRef.current = undefined;
   }
   onMessagesChangeRef.current = onMessagesChange;
+  approvalPolicyRef.current = approvalPolicy;
 
   const commit = (
     updater: (messages: AiMessage[]) => AiMessage[],
@@ -305,9 +307,9 @@ export function useAiAgent({
           status: "running",
           updatedAt: event.timestamp,
         }), true);
-        if (approvalPolicy === "full-access") {
+        if (approvalPolicyRef.current === "full-access") {
           void submitApproval(messageId, approval, "approve", "完全访问已自动批准，Agent 正在继续");
-        } else if (approvalPolicy === "reviewer") {
+        } else if (approvalPolicyRef.current === "reviewer") {
           void reviewApproval(messageId, approval);
         }
         break;
@@ -521,6 +523,20 @@ export function useAiAgent({
       "用户拒绝了该工具调用",
     );
   };
+
+  useEffect(() => {
+    if (approvalPolicy === "request" || resolvingApprovalId) return;
+    const activeRun = activeRunRef.current;
+    if (!activeRun) return;
+    const message = messagesRef.current.find((candidate) => candidate.id === activeRun.messageId);
+    const approval = message?.approval;
+    if (!approval || message.approvalState !== "pending") return;
+    if (approvalPolicy === "full-access") {
+      void submitApproval(activeRun.messageId, approval, "approve", "完全访问已自动批准，Agent 正在继续");
+    } else {
+      void reviewApproval(activeRun.messageId, approval);
+    }
+  }, [approvalPolicy]);
 
   useEffect(() => () => {
     const activeRun = activeRunRef.current;

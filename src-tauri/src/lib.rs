@@ -129,6 +129,55 @@ struct NetworkInterface {
     mtu: u32,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskUsage {
+    filesystem: String,
+    mount_point: String,
+    total_bytes: u64,
+    used_bytes: u64,
+    available_bytes: u64,
+    used_percent: f32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemInformation {
+    hostname: String,
+    operating_system: String,
+    kernel: String,
+    architecture: String,
+    cpu_model: String,
+    cpu_cores: u32,
+    cpu_usage_percent: f32,
+    load_average: Vec<f32>,
+    uptime_seconds: u64,
+    memory_total_bytes: u64,
+    memory_used_bytes: u64,
+    memory_available_bytes: u64,
+    swap_total_bytes: u64,
+    swap_used_bytes: u64,
+    disks: Vec<DiskUsage>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContainerInfo {
+    id: String,
+    name: String,
+    image: String,
+    state: String,
+    status: String,
+    ports: String,
+    created_at: String,
+    cpu_percent: f32,
+    memory_usage_bytes: u64,
+    memory_limit_bytes: u64,
+    memory_percent: f32,
+    network_input_bytes: u64,
+    network_output_bytes: u64,
+}
+
 enum TerminalRequest {
     Input(Vec<u8>),
     Resize(u32, u32),
@@ -980,6 +1029,215 @@ fn parse_network_interfaces(output: &str) -> Vec<NetworkInterface> {
         }
     }
     result
+}
+
+fn section<'a>(output: &'a str, name: &str) -> &'a str {
+    let marker = format!("--{name}--");
+    let Some((_, remainder)) = output.split_once(&marker) else {
+        return "";
+    };
+    remainder.split("\n--").next().unwrap_or(remainder).trim()
+}
+
+fn parse_key_value_lines(output: &str) -> HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.trim_matches('"').to_string()))
+        .collect()
+}
+
+fn parse_system_information(output: &str) -> Result<SystemInformation, String> {
+    let identity = parse_key_value_lines(section(output, "IDENTITY"));
+    let cpu = parse_key_value_lines(section(output, "CPU"));
+    let memory = parse_key_value_lines(section(output, "MEMORY"));
+    let load_average = section(output, "LOAD")
+        .split_whitespace()
+        .take(3)
+        .filter_map(|value| value.parse().ok())
+        .collect::<Vec<_>>();
+    let disks = section(output, "DISKS")
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() < 6 {
+                return None;
+            }
+            Some(DiskUsage {
+                filesystem: fields[0].to_string(),
+                total_bytes: fields[1].parse().ok()?,
+                used_bytes: fields[2].parse().ok()?,
+                available_bytes: fields[3].parse().ok()?,
+                used_percent: fields[4].trim_end_matches('%').parse().unwrap_or(0.0),
+                mount_point: fields[5..].join(" "),
+            })
+        })
+        .collect();
+    let memory_total_bytes = memory
+        .get("MemTotal")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let memory_available_bytes = memory
+        .get("MemAvailable")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let swap_total_bytes = memory
+        .get("SwapTotal")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let swap_free_bytes = memory
+        .get("SwapFree")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let operating_system = identity
+        .get("PRETTY_NAME")
+        .cloned()
+        .or_else(|| identity.get("NAME").cloned())
+        .unwrap_or_else(|| "Linux".to_string());
+    let hostname = identity
+        .get("HOSTNAME")
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "系统信息缺少主机名".to_string())?;
+
+    Ok(SystemInformation {
+        hostname,
+        operating_system,
+        kernel: identity.get("KERNEL").cloned().unwrap_or_default(),
+        architecture: identity.get("ARCH").cloned().unwrap_or_default(),
+        cpu_model: cpu.get("MODEL").cloned().unwrap_or_else(|| "Unknown CPU".to_string()),
+        cpu_cores: cpu.get("CORES").and_then(|value| value.parse().ok()).unwrap_or(0),
+        cpu_usage_percent: cpu.get("USAGE").and_then(|value| value.parse().ok()).unwrap_or(0.0),
+        load_average,
+        uptime_seconds: section(output, "UPTIME")
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.split('.').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        memory_total_bytes,
+        memory_used_bytes: memory_total_bytes.saturating_sub(memory_available_bytes),
+        memory_available_bytes,
+        swap_total_bytes,
+        swap_used_bytes: swap_total_bytes.saturating_sub(swap_free_bytes),
+        disks,
+    })
+}
+
+fn parse_size_bytes(value: &str) -> u64 {
+    let value = value.trim();
+    let split_at = value
+        .find(|character: char| !character.is_ascii_digit() && character != '.')
+        .unwrap_or(value.len());
+    let amount = value[..split_at].parse::<f64>().unwrap_or(0.0);
+    let unit = value[split_at..].trim().to_ascii_lowercase();
+    let multiplier = match unit.as_str() {
+        "b" | "" => 1.0,
+        "kb" => 1000.0,
+        "mb" => 1000.0_f64.powi(2),
+        "gb" => 1000.0_f64.powi(3),
+        "tb" => 1000.0_f64.powi(4),
+        "kib" => 1024.0,
+        "mib" => 1024.0_f64.powi(2),
+        "gib" => 1024.0_f64.powi(3),
+        "tib" => 1024.0_f64.powi(4),
+        _ => 1.0,
+    };
+    (amount * multiplier).round() as u64
+}
+
+fn parse_io_pair(value: &str) -> (u64, u64) {
+    value
+        .split_once('/')
+        .map(|(input, output)| (parse_size_bytes(input), parse_size_bytes(output)))
+        .unwrap_or((0, 0))
+}
+
+fn parse_containers(output: &str) -> Vec<ContainerInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() < 11 {
+                return None;
+            }
+            let (memory_usage_bytes, memory_limit_bytes) = parse_io_pair(fields[7]);
+            let (network_input_bytes, network_output_bytes) = parse_io_pair(fields[9]);
+            Some(ContainerInfo {
+                id: fields[0].to_string(),
+                name: fields[1].to_string(),
+                image: fields[2].to_string(),
+                state: fields[3].to_string(),
+                status: fields[4].to_string(),
+                ports: fields[5].to_string(),
+                created_at: fields[6].to_string(),
+                cpu_percent: fields[8].trim_end_matches('%').parse().unwrap_or(0.0),
+                memory_usage_bytes,
+                memory_limit_bytes,
+                memory_percent: fields[10].trim_end_matches('%').parse().unwrap_or(0.0),
+                network_input_bytes,
+                network_output_bytes,
+            })
+        })
+        .collect()
+}
+
+fn validate_container_id(container_id: &str) -> Result<&str, String> {
+    if (12..=64).contains(&container_id.len())
+        && container_id.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        Ok(container_id)
+    } else {
+        Err("容器 ID 格式无效".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_system_information(server: ServerProfile) -> Result<SystemInformation, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let command = "LC_ALL=C sh -lc 'printf \"--IDENTITY--\\nHOSTNAME=%s\\nKERNEL=%s\\nARCH=%s\\n\" \"$(hostname 2>/dev/null)\" \"$(uname -r 2>/dev/null)\" \"$(uname -m 2>/dev/null)\"; if [ -r /etc/os-release ]; then cat /etc/os-release; fi; printf \"--CPU--\\nMODEL=%s\\nCORES=%s\\n\" \"$(awk -F: '\''/model name|Hardware/ {gsub(/^[ \\t]+/, \"\", $2); print $2; exit}'\'' /proc/cpuinfo)\" \"$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf 0)\"; read _ u n s i w irq sirq st _ < /proc/stat; total1=$((u+n+s+i+w+irq+sirq+st)); idle1=$((i+w)); sleep 0.2; read _ u n s i w irq sirq st _ < /proc/stat; total2=$((u+n+s+i+w+irq+sirq+st)); idle2=$((i+w)); delta=$((total2-total1)); idle=$((idle2-idle1)); if [ \"$delta\" -gt 0 ]; then awk -v d=\"$delta\" -v i=\"$idle\" '\''BEGIN { printf \"USAGE=%.1f\\n\", (d-i)*100/d }'\''; else printf \"USAGE=0\\n\"; fi; printf \"--LOAD--\\n\"; cat /proc/loadavg 2>/dev/null; printf \"--UPTIME--\\n\"; cat /proc/uptime 2>/dev/null; printf \"--MEMORY--\\n\"; awk '\''/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ {gsub(/:/, \"\", $1); print $1 \"=\" $2}'\'' /proc/meminfo; printf \"--DISKS--\\n\"; df -P -B1 -x tmpfs -x devtmpfs 2>/dev/null | awk '\''NR > 1 {printf \"%s\\t%s\\t%s\\t%s\\t%s\\t\", $1, $2, $3, $4, $5; for (i=6; i<=NF; i++) printf \"%s%s\", $i, (i<NF ? \" \" : \"\\n\")}'\'''";
+        let result = run_command_sync(&server, command)?;
+        parse_system_information(&successful_output(result, "读取系统信息")?)
+    })
+    .await
+    .map_err(|error| format!("系统信息查询任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn list_containers(server: ServerProfile) -> Result<Vec<ContainerInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let command = "LC_ALL=C sh -lc 'command -v docker >/dev/null 2>&1 || { printf \"未安装 Docker 或 docker 不在 PATH 中\\n\" >&2; exit 127; }; rows=$(docker ps -a --no-trunc --format \"{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.State}}\\t{{.Status}}\\t{{.Ports}}\\t{{.CreatedAt}}\") || exit $?; stats=$(docker stats --no-stream --no-trunc --format \"{{.ID}}\\t{{.MemUsage}}\\t{{.CPUPerc}}\\t{{.NetIO}}\\t{{.MemPerc}}\" 2>/dev/null || true); printf \"%s\\n\" \"$rows\" | awk -F '\''\\t'\'' -v stats=\"$stats\" '\''BEGIN { n=split(stats, lines, \"\\n\"); for (i=1; i<=n; i++) { split(lines[i], fields, \"\\t\"); if (fields[1] != \"\") metrics[fields[1]]=fields[2] \"\\t\" fields[3] \"\\t\" fields[4] \"\\t\" fields[5]; } } $1 != \"\" { extra=metrics[$1]; if (extra == \"\") extra=\"0B / 0B\\t0%\\t0B / 0B\\t0%\"; print $0 \"\\t\" extra }'\'''";
+        let result = run_command_sync(&server, command)?;
+        Ok(parse_containers(&successful_output(result, "读取容器列表")?))
+    })
+    .await
+    .map_err(|error| format!("容器查询任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn control_container(
+    server: ServerProfile,
+    container_id: String,
+    action: String,
+) -> Result<(), String> {
+    validate_container_id(&container_id)?;
+    let docker_action = match action.as_str() {
+        "start" => "start",
+        "stop" => "stop",
+        "restart" => "restart",
+        "remove" => "rm",
+        _ => return Err("不支持的容器动作".to_string()),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_command_sync(&server, &format!("docker {docker_action} {container_id}"))?;
+        successful_output(result, "执行容器动作").map(|_| ())
+    })
+    .await
+    .map_err(|error| format!("容器动作任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -2831,6 +3089,9 @@ pub fn run() {
             signal_process,
             list_network_connections,
             list_network_interfaces,
+            get_system_information,
+            list_containers,
+            control_container,
             list_directory,
             upload_file,
             upload_ai_attachment,
@@ -2862,7 +3123,8 @@ pub fn run() {
 mod tests {
     use super::{
         copy_transfer_bytes, ensure_remote_revision, local_transfer_temp_path, mode_string,
-        parse_network_connections, parse_network_interfaces, parse_processes,
+        parse_containers, parse_network_connections, parse_network_interfaces, parse_processes,
+        parse_size_bytes, parse_system_information,
         remote_parent_and_name, remote_transfer_temp_path, replace_local_file, shell_quote,
         RemoteFileRevision, TransferControl,
     };
@@ -3059,6 +3321,35 @@ mod tests {
         assert_eq!(rows[0].name, "eth0");
         assert_eq!(rows[0].address, "172.17.0.2");
         assert_eq!(rows[0].prefix_length, Some(16));
+    }
+
+    #[test]
+    fn parses_system_information_sections() {
+        let info = parse_system_information(
+            "--IDENTITY--\nHOSTNAME=portico\nKERNEL=6.8.0\nARCH=x86_64\nPRETTY_NAME=Ubuntu 24.04 LTS\n\
+             --CPU--\nMODEL=AMD EPYC\nCORES=8\nUSAGE=12.5\n\
+             --LOAD--\n0.25 0.50 0.75 1/100 1\n\
+             --UPTIME--\n90061.42 100.0\n\
+             --MEMORY--\nMemTotal=16000000\nMemAvailable=6000000\nSwapTotal=2000000\nSwapFree=1500000\n\
+             --DISKS--\n/dev/sda1\t100000000\t40000000\t60000000\t40%\t/\n",
+        )
+        .unwrap();
+        assert_eq!(info.hostname, "portico");
+        assert_eq!(info.cpu_cores, 8);
+        assert_eq!(info.memory_used_bytes, 10_000_000 * 1024);
+        assert_eq!(info.disks[0].mount_point, "/");
+    }
+
+    #[test]
+    fn parses_container_rows_and_binary_sizes() {
+        assert_eq!(parse_size_bytes("1.5GiB"), 1_610_612_736);
+        let rows = parse_containers(
+            "0123456789abcdef\tapi\tportico/api:latest\trunning\tUp 2 hours\t0.0.0.0:8080->80/tcp\t2026-08-12 10:00:00 +0800 CST\t512MiB / 2GiB\t3.5%\t1.2MB / 800kB\t25%\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "api");
+        assert_eq!(rows[0].memory_limit_bytes, 2_147_483_648);
+        assert_eq!(rows[0].network_input_bytes, 1_200_000);
     }
 
     #[test]
