@@ -2568,6 +2568,19 @@ fn editor_file_revision(path: &Path) -> Result<(u64, SystemTime), String> {
     Ok((metadata.len(), modified))
 }
 
+fn editor_file_revision_if_present(path: &Path) -> Result<Option<(u64, SystemTime)>, String> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let modified = metadata
+                .modified()
+                .map_err(|error| format!("读取本地修改时间失败: {error}"))?;
+            Ok(Some((metadata.len(), modified)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("读取本地编辑副本失败: {error}")),
+    }
+}
+
 fn remote_file_revision(
     sftp: &ssh2::Sftp,
     remote_path: &str,
@@ -2682,22 +2695,30 @@ fn vscode_candidates() -> Vec<PathBuf> {
     };
     if cfg!(windows) {
         if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-            add(PathBuf::from(local_app_data).join("Programs/Microsoft VS Code/Code.exe"));
+            let root = PathBuf::from(local_app_data).join("Programs/Microsoft VS Code");
+            add(root.join("bin/code.cmd"));
+            add(root.join("Code.exe"));
         }
         if let Some(program_files) = env::var_os("PROGRAMFILES") {
-            add(PathBuf::from(program_files).join("Microsoft VS Code/Code.exe"));
+            let root = PathBuf::from(program_files).join("Microsoft VS Code");
+            add(root.join("bin/code.cmd"));
+            add(root.join("Code.exe"));
         }
         if let Some(program_files_x86) = env::var_os("PROGRAMFILES(X86)") {
-            add(PathBuf::from(program_files_x86).join("Microsoft VS Code/Code.exe"));
+            let root = PathBuf::from(program_files_x86).join("Microsoft VS Code");
+            add(root.join("bin/code.cmd"));
+            add(root.join("Code.exe"));
         }
         if let Ok(output) = Command::new("where.exe").arg("code.cmd").output() {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
                 let cli_path = PathBuf::from(line.trim());
+                add(cli_path.clone());
                 if let Some(root) = cli_path.parent().and_then(Path::parent) {
                     add(root.join("Code.exe"));
                 }
             }
         }
+        add(PathBuf::from("code.cmd"));
     } else {
         add(PathBuf::from(
             "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
@@ -2815,8 +2836,21 @@ fn watch_editor_file(
                 true
             }
         };
-        let current_revision = match editor_file_revision(&local_path) {
-            Ok(revision) => revision,
+        let mut current_revision = match editor_file_revision_if_present(&local_path) {
+            Ok(Some(revision)) => revision,
+            Ok(None) if !process_exited => continue,
+            Ok(None) => {
+                emit_vscode_status_to_sessions(
+                    &app,
+                    &session_ids,
+                    &server_id,
+                    &remote_path,
+                    &local_path,
+                    "error",
+                    format!("本地编辑副本已不存在：{}", local_path.display()),
+                );
+                break;
+            }
             Err(error) => {
                 emit_vscode_status_to_sessions(
                     &app,
@@ -2832,8 +2866,9 @@ fn watch_editor_file(
         };
         if current_revision != last_synced && !sync_blocked {
             thread::sleep(Duration::from_millis(260));
-            let stable_revision = match editor_file_revision(&local_path) {
-                Ok(revision) => revision,
+            let stable_revision = match editor_file_revision_if_present(&local_path) {
+                Ok(Some(revision)) => revision,
+                Ok(None) => continue,
                 Err(error) => {
                     emit_vscode_status_to_sessions(
                         &app,
@@ -2860,6 +2895,7 @@ fn watch_editor_file(
                 Ok(remote_revision) => {
                     last_remote_revision = remote_revision;
                     last_synced = stable_revision;
+                    current_revision = stable_revision;
                     sync_ok = true;
                     emit_vscode_status_to_sessions(
                         &app,
