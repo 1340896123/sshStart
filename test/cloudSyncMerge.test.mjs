@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   advanceSyncMetadata,
   createSyncMetadata,
+  markPendingSyncChange,
   mergeAiConversations,
   mergeAppStorageSnapshots,
   snapshotsEqual,
@@ -20,19 +21,24 @@ const server = (id, name = id) => ({
   color: "#000000",
 });
 
-const snapshot = (servers, deviceId = "device") => ({
+const snapshot = (servers, deviceId = "device", aiConfig = null, syncMeta) => ({
   servers,
   deletedServerIds: [],
   savedGroups: [],
-  aiConfig: null,
+  aiConfig,
   aiConversations: [],
   collapsedGroups: [],
-  syncMeta: createSyncMetadata(deviceId),
+  syncMeta: syncMeta ?? createSyncMetadata(deviceId),
 });
 
 const withChange = (value, change) => ({
   ...value,
   syncMeta: advanceSyncMetadata(value.syncMeta, change),
+});
+
+const withPendingChange = (value, change) => ({
+  ...value,
+  syncMeta: markPendingSyncChange(value.syncMeta, change),
 });
 
 test("merges disjoint server lists without dropping either device", () => {
@@ -109,4 +115,79 @@ test("syncs group deletion, collapsed state, server order, and settings by revis
   assert.deepEqual(merged.savedGroups, []);
   assert.deepEqual(merged.collapsedGroups, []);
   assert.equal(merged.aiConfig.model, "new-model");
+});
+
+test("a local settings edit wins over the cloud even with a stale local clock", () => {
+  // Device B last synced when the cloud clock was 3; the cloud has since advanced
+  // to 10 (another device edited). B edits settings locally before syncing again,
+  // so its freshly stamped revision (4) would lose to the cloud (10) without the
+  // pending marker.
+  let baseMeta = createSyncMetadata("device-b");
+  for (let i = 0; i < 3; i += 1) baseMeta = advanceSyncMetadata(baseMeta, { aiConfig: true });
+
+  let local = snapshot([server("a")], "device-b", { model: "cloud-model" }, baseMeta);
+  local = { ...local, aiConfig: { model: "local-model" } };
+  local = withPendingChange(local, { aiConfig: true });
+
+  let cloudMeta = baseMeta;
+  for (let i = 3; i < 10; i += 1) cloudMeta = advanceSyncMetadata(cloudMeta, { aiConfig: true });
+  const cloud = snapshot([server("a")], "device-a", { model: "other-model" }, cloudMeta);
+
+  const merged = mergeAppStorageSnapshots(local, cloud);
+  assert.equal(merged.aiConfig.model, "local-model");
+  assert.equal(merged.syncMeta.aiConfigRevision.clock, 11, "revision bumps above the cloud clock");
+  assert.equal(merged.syncMeta.pending.aiConfig, true, "pending marker survives until the cloud confirms");
+});
+
+test("a local server edit wins over the cloud with a stale clock and bumps its revision", () => {
+  let baseMeta = createSyncMetadata("device-b");
+  for (let i = 0; i < 3; i += 1) baseMeta = advanceSyncMetadata(baseMeta, { serverIds: ["a"] });
+
+  let local = snapshot([server("a", "local-name")], "device-b", null, baseMeta);
+  local = withPendingChange(local, { serverIds: ["a"] });
+
+  let cloudMeta = baseMeta;
+  for (let i = 3; i < 10; i += 1) cloudMeta = advanceSyncMetadata(cloudMeta, { serverIds: ["a"] });
+  const cloud = snapshot([server("a", "cloud-name")], "device-a", null, cloudMeta);
+
+  const merged = mergeAppStorageSnapshots(local, cloud);
+  assert.equal(merged.servers[0].name, "local-name");
+  assert.equal(merged.syncMeta.serverRevisions.a.clock, 11);
+  assert.deepEqual(merged.syncMeta.pending.serverIds, ["a"]);
+});
+
+test("pending markers clear once the merged state matches the cloud", () => {
+  let baseMeta = createSyncMetadata("device-b");
+  for (let i = 0; i < 3; i += 1) baseMeta = advanceSyncMetadata(baseMeta, { aiConfig: true });
+
+  let local = snapshot([server("a")], "device-b", { model: "same-model" }, baseMeta);
+  local = withPendingChange(local, { aiConfig: true });
+
+  const cloud = snapshot([server("a")], "device-a", { model: "same-model" }, baseMeta);
+
+  const merged = mergeAppStorageSnapshots(local, cloud);
+  assert.equal(merged.aiConfig.model, "same-model");
+  assert.equal(merged.syncMeta.pending, undefined, "pending object is dropped when the cloud already matches");
+  assert.equal(
+    merged.syncMeta.aiConfigRevision.clock,
+    local.syncMeta.aiConfigRevision.clock,
+    "revision stays put when already confirmed",
+  );
+});
+
+test("an equal-clock local edit beats the cloud instead of silently losing the tie", () => {
+  // Both devices start from the same cloud state and edit settings at the same
+  // logical clock. The local editor's change must survive its own sync.
+  let baseMeta = createSyncMetadata("device-b");
+  baseMeta = advanceSyncMetadata(baseMeta, { aiConfig: true });
+
+  let local = snapshot([server("a")], "device-b", { model: "local-model" }, baseMeta);
+  local = withPendingChange(local, { aiConfig: true });
+
+  const cloud = snapshot([server("a")], "device-a", { model: "cloud-model" }, baseMeta);
+
+  const merged = mergeAppStorageSnapshots(local, cloud);
+  assert.equal(merged.aiConfig.model, "local-model");
+  assert.equal(merged.syncMeta.aiConfigRevision.clock, baseMeta.clock + 1);
+  assert.equal(merged.syncMeta.pending.aiConfig, true);
 });

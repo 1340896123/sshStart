@@ -18,6 +18,15 @@ export interface SyncRevision {
   deviceId: string;
 }
 
+/** Categories edited locally but not yet confirmed on the cloud. */
+export interface SyncPendingState {
+  serverIds?: string[];
+  serverOrder?: boolean;
+  groups?: boolean;
+  aiConfig?: boolean;
+  collapsedGroups?: boolean;
+}
+
 export interface CloudSyncMetadata {
   version: 2;
   deviceId: string;
@@ -27,6 +36,7 @@ export interface CloudSyncMetadata {
   groupsRevision?: SyncRevision;
   aiConfigRevision?: SyncRevision;
   collapsedGroupsRevision?: SyncRevision;
+  pending?: SyncPendingState;
 }
 
 export interface CloudSyncStatus {

@@ -32,7 +32,9 @@ import { DEV_BOOTSTRAP } from "./devBootstrap";
 import { AI_HISTORY_UPDATED_EVENT, initializeAiConversations, readAiConversations } from "./aiHistory";
 import {
   advanceSyncMetadata,
+  clearSyncPending,
   createSyncMetadata,
+  markPendingSyncChange,
   mergeAppStorageSnapshots,
   normalizeSyncMetadata,
   snapshotsEqual,
@@ -180,7 +182,7 @@ export default function App() {
   const createCurrentSnapshot = useCallback(() => snapshotRef.current, []);
 
   const markSyncChange = useCallback((change: Parameters<typeof advanceSyncMetadata>[1]) => {
-    const next = advanceSyncMetadata(syncMetaRef.current, change);
+    const next = markPendingSyncChange(syncMetaRef.current, change);
     syncMetaRef.current = next;
     setSyncMeta(next);
   }, []);
@@ -261,8 +263,15 @@ export default function App() {
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const remote = await startCloudSyncPull(endpoint, candidate);
       const mergedSnapshot = stampUnversionedSnapshot(mergeAppStorageSnapshots(candidate, remote.snapshot));
-      if (remote.snapshot && snapshotsEqual(mergedSnapshot, remote.snapshot)) return mergedSnapshot;
-      if (await startCloudSyncPush(endpoint, mergedSnapshot, remote.updatedAt)) return mergedSnapshot;
+      if (remote.snapshot && snapshotsEqual(mergedSnapshot, remote.snapshot)) {
+        // Nothing changed locally; the cloud snapshot is already the baseline.
+        return { ...mergedSnapshot, syncMeta: clearSyncPending(mergedSnapshot.syncMeta) };
+      }
+      if (await startCloudSyncPush(endpoint, mergedSnapshot, remote.updatedAt)) {
+        // Local edits have been confirmed on the cloud; drop the pending markers
+        // so the confirmed snapshot becomes the new local baseline.
+        return { ...mergedSnapshot, syncMeta: clearSyncPending(mergedSnapshot.syncMeta) };
+      }
       candidate = mergedSnapshot;
     }
     throw new Error("云端数据持续被其他设备更新，请稍后重试");
