@@ -1196,12 +1196,195 @@ fn validate_container_id(container_id: &str) -> Result<&str, String> {
     }
 }
 
+// 远程脚本通过 base64 传输后由 Python 执行，避免在 SSH 命令字符串里嵌套引号
+// 导致的转义问题。脚本输出与原有解析器兼容的文本格式。
+const PYTHON_BOOTSTRAP: &str =
+    "import base64,sys;exec(compile(base64.b64decode(sys.argv[1]),\"portico\",\"exec\"))";
+
+const SYSTEM_INFO_SCRIPT: &str = r#"import os
+import socket
+import time
+
+
+def put(key, value):
+    print("%s=%s" % (key, value))
+
+
+def read_text(path):
+    try:
+        with open(path, "r", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def uname_field(name):
+    try:
+        return getattr(os.uname(), name)
+    except Exception:
+        return ""
+
+
+def hostname():
+    value = read_text("/proc/sys/kernel/hostname").strip()
+    if value:
+        return value
+    try:
+        return socket.gethostname()
+    except OSError:
+        return uname_field("nodename")
+
+
+def cpu_ticks():
+    content = read_text("/proc/stat")
+    line = content.splitlines()[0] if content else ""
+    fields = line.split()[1:] if line else []
+    values = [int(value) for value in fields[:8]]
+    while len(values) < 8:
+        values.append(0)
+    return values
+
+
+print("--IDENTITY--")
+put("HOSTNAME", hostname())
+put("KERNEL", read_text("/proc/sys/kernel/osrelease").strip() or uname_field("release"))
+put("ARCH", uname_field("machine"))
+os_release = {}
+for line in read_text("/etc/os-release").splitlines():
+    if "=" in line:
+        key, _, value = line.partition("=")
+        os_release[key] = value.strip().strip('"').strip("'")
+if os_release.get("PRETTY_NAME"):
+    put("PRETTY_NAME", os_release["PRETTY_NAME"])
+elif os_release.get("NAME"):
+    put("NAME", os_release["NAME"])
+
+print("--CPU--")
+model = ""
+for line in read_text("/proc/cpuinfo").splitlines():
+    stripped = line.strip()
+    if stripped.startswith("model name") or stripped.startswith("Hardware"):
+        model = stripped.split(":", 1)[1].strip()
+        break
+put("MODEL", model or "Unknown CPU")
+put("CORES", os.cpu_count() or 0)
+
+first = cpu_ticks()
+time.sleep(0.2)
+second = cpu_ticks()
+total_delta = sum(second) - sum(first)
+idle_delta = (second[3] + second[4]) - (first[3] + first[4])
+usage = (total_delta - idle_delta) * 100.0 / total_delta if total_delta > 0 else 0.0
+put("USAGE", "%.1f" % usage)
+
+print("--LOAD--")
+print(read_text("/proc/loadavg").strip() or "0.00 0.00 0.00")
+
+print("--UPTIME--")
+print(read_text("/proc/uptime").strip() or "0 0")
+
+print("--MEMORY--")
+for line in read_text("/proc/meminfo").splitlines():
+    if line.startswith(("MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:")):
+        key, _, value = line.partition(":")
+        print("%s=%s" % (key, value.strip().split()[0]))
+
+print("--DISKS--")
+skip_filesystems = {
+    "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "cgroup2", "overlay",
+    "squashfs", "iso9660", "devpts", "mqueue", "securityfs", "debugfs",
+    "tracefs", "pstore", "bpf", "hugetlbfs", "ramfs", "fusectl", "configfs",
+}
+seen_mounts = set()
+for line in read_text("/proc/mounts").splitlines():
+    fields = line.split()
+    if len(fields) < 3:
+        continue
+    device, mount_point, filesystem = fields[0], fields[1], fields[2]
+    if filesystem in skip_filesystems or mount_point in seen_mounts:
+        continue
+    try:
+        stats = os.statvfs(mount_point)
+    except OSError:
+        continue
+    total = stats.f_blocks * stats.f_frsize
+    if total <= 0:
+        continue
+    used = (stats.f_blocks - stats.f_bfree) * stats.f_frsize
+    available = stats.f_bavail * stats.f_frsize
+    percent = used * 100.0 / total
+    print("%s\t%d\t%d\t%d\t%.0f%%\t%s" % (
+        device.replace("\\040", " "),
+        total,
+        used,
+        available,
+        percent,
+        mount_point.replace("\\040", " "),
+    ))
+    seen_mounts.add(mount_point)
+"#;
+
+const DOCKER_LIST_SCRIPT: &str = r#"import subprocess
+import sys
+
+
+def run_docker(arguments):
+    try:
+        return subprocess.run(
+            ["docker"] + arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+
+
+ps_format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}\t{{.Ports}}\t{{.CreatedAt}}"
+listing = run_docker(["ps", "-a", "--no-trunc", "--format", ps_format])
+if listing is None:
+    sys.stderr.write("未安装 Docker 或 docker 不在 PATH 中\n")
+    sys.exit(127)
+if listing.returncode != 0:
+    sys.stderr.write(listing.stderr or "docker ps 执行失败\n")
+    sys.exit(listing.returncode)
+
+stats_format = "{{.ID}}\t{{.MemUsage}}\t{{.CPUPerc}}\t{{.NetIO}}\t{{.MemPerc}}"
+sampling = run_docker(["stats", "--no-stream", "--no-trunc", "--format", stats_format])
+metrics = {}
+if sampling is not None and sampling.returncode == 0:
+    for line in sampling.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 5 and fields[0]:
+            metrics[fields[0]] = fields[1:5]
+
+for line in listing.stdout.splitlines():
+    if not line:
+        continue
+    fields = line.split("\t")
+    if not fields or not fields[0]:
+        continue
+    extra = metrics.get(fields[0])
+    if extra:
+        print(line + "\t" + "\t".join(extra))
+    else:
+        print(line + "\t0B / 0B\t0%\t0B / 0B\t0%")
+"#;
+
+fn run_remote_script(server: &ServerProfile, script: &str, label: &str) -> Result<String, String> {
+    let encoded = BASE64_STANDARD.encode(script.as_bytes());
+    let command = format!(
+        "python3 -c '{PYTHON_BOOTSTRAP}' '{encoded}' || python -c '{PYTHON_BOOTSTRAP}' '{encoded}'"
+    );
+    let result = run_command_sync(server, &command)?;
+    successful_output(result, label)
+}
+
 #[tauri::command]
 async fn get_system_information(server: ServerProfile) -> Result<SystemInformation, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let command = "LC_ALL=C sh -lc 'printf \"--IDENTITY--\\nHOSTNAME=%s\\nKERNEL=%s\\nARCH=%s\\n\" \"$(hostname 2>/dev/null)\" \"$(uname -r 2>/dev/null)\" \"$(uname -m 2>/dev/null)\"; if [ -r /etc/os-release ]; then cat /etc/os-release; fi; printf \"--CPU--\\nMODEL=%s\\nCORES=%s\\n\" \"$(awk -F: '\''/model name|Hardware/ {gsub(/^[ \\t]+/, \"\", $2); print $2; exit}'\'' /proc/cpuinfo)\" \"$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf 0)\"; read _ u n s i w irq sirq st _ < /proc/stat; total1=$((u+n+s+i+w+irq+sirq+st)); idle1=$((i+w)); sleep 0.2; read _ u n s i w irq sirq st _ < /proc/stat; total2=$((u+n+s+i+w+irq+sirq+st)); idle2=$((i+w)); delta=$((total2-total1)); idle=$((idle2-idle1)); if [ \"$delta\" -gt 0 ]; then awk -v d=\"$delta\" -v i=\"$idle\" '\''BEGIN { printf \"USAGE=%.1f\\n\", (d-i)*100/d }'\''; else printf \"USAGE=0\\n\"; fi; printf \"--LOAD--\\n\"; cat /proc/loadavg 2>/dev/null; printf \"--UPTIME--\\n\"; cat /proc/uptime 2>/dev/null; printf \"--MEMORY--\\n\"; awk '\''/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ {gsub(/:/, \"\", $1); print $1 \"=\" $2}'\'' /proc/meminfo; printf \"--DISKS--\\n\"; df -P -B1 -x tmpfs -x devtmpfs 2>/dev/null | awk '\''NR > 1 {printf \"%s\\t%s\\t%s\\t%s\\t%s\\t\", $1, $2, $3, $4, $5; for (i=6; i<=NF; i++) printf \"%s%s\", $i, (i<NF ? \" \" : \"\\n\")}'\'''";
-        let result = run_command_sync(&server, command)?;
-        parse_system_information(&successful_output(result, "读取系统信息")?)
+        let output = run_remote_script(&server, SYSTEM_INFO_SCRIPT, "读取系统信息")?;
+        parse_system_information(&output)
     })
     .await
     .map_err(|error| format!("系统信息查询任务失败: {error}"))?
@@ -1210,9 +1393,8 @@ async fn get_system_information(server: ServerProfile) -> Result<SystemInformati
 #[tauri::command]
 async fn list_containers(server: ServerProfile) -> Result<Vec<ContainerInfo>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let command = "LC_ALL=C sh -lc 'command -v docker >/dev/null 2>&1 || { printf \"未安装 Docker 或 docker 不在 PATH 中\\n\" >&2; exit 127; }; rows=$(docker ps -a --no-trunc --format \"{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.State}}\\t{{.Status}}\\t{{.Ports}}\\t{{.CreatedAt}}\") || exit $?; stats=$(docker stats --no-stream --no-trunc --format \"{{.ID}}\\t{{.MemUsage}}\\t{{.CPUPerc}}\\t{{.NetIO}}\\t{{.MemPerc}}\" 2>/dev/null || true); printf \"%s\\n\" \"$rows\" | awk -F '\''\\t'\'' -v stats=\"$stats\" '\''BEGIN { n=split(stats, lines, \"\\n\"); for (i=1; i<=n; i++) { split(lines[i], fields, \"\\t\"); if (fields[1] != \"\") metrics[fields[1]]=fields[2] \"\\t\" fields[3] \"\\t\" fields[4] \"\\t\" fields[5]; } } $1 != \"\" { extra=metrics[$1]; if (extra == \"\") extra=\"0B / 0B\\t0%\\t0B / 0B\\t0%\"; print $0 \"\\t\" extra }'\'''";
-        let result = run_command_sync(&server, command)?;
-        Ok(parse_containers(&successful_output(result, "读取容器列表")?))
+        let output = run_remote_script(&server, DOCKER_LIST_SCRIPT, "读取容器列表")?;
+        Ok(parse_containers(&output))
     })
     .await
     .map_err(|error| format!("容器查询任务失败: {error}"))?
