@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine,
@@ -53,6 +54,12 @@ type FileListState = {
 type FileIconName = "archive" | "code" | "config" | "file" | "folder" | "image" | "json" | "markdown" | "shell" | "text";
 type SystemFileIconRequest = { key: string; fileName: string; isDir: boolean };
 type SystemFileIcon = { key: string; dataUrl: string };
+type LocalUploadManifest = {
+  files: Array<{ localPath: string; relativePath: string }>;
+  directories: string[];
+  skippedEntries: number;
+};
+type FileDropTarget = { path: string; rowPath?: string };
 type VscodeSyncEvent = {
   sessionId: string;
   serverId: string;
@@ -91,6 +98,7 @@ const DEMO_FILES: RemoteFile[] = [
 const minimumColumnWidths: ColumnWidths = { name: 180, size: 82, modified: 138, permissions: 112 };
 const defaultColumnWidths: ColumnWidths = { name: 340, size: 100, modified: 168, permissions: 126 };
 const systemFileIconCache = new Map<string, string>();
+const DROP_UPLOAD_CONCURRENCY = 3;
 
 function createFileListState(id: string, path: string): FileListState {
   return {
@@ -183,6 +191,7 @@ function SortGlyph({ active, direction }: { active: boolean; direction: SortDire
 }
 
 export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
+  const paneRef = useRef<HTMLDivElement>(null);
   const initialListIdRef = useRef(uid("file-list"));
   const [fileLists, setFileLists] = useState<FileListState[]>(() => [
     createFileListState(initialListIdRef.current, session.cwd),
@@ -192,9 +201,14 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   const [menu, setMenu] = useState<MenuState>();
   const [editorStatus, setEditorStatus] = useState<VscodeSyncEvent>();
   const [systemFileIcons, setSystemFileIcons] = useState<Record<string, string>>({});
+  const [dropTarget, setDropTarget] = useState<FileDropTarget>();
+  const [dropUploadStatus, setDropUploadStatus] = useState<string>();
+  const uploadDroppedPathsRef = useRef<(localPaths: string[], target: FileDropTarget) => Promise<void>>(async () => undefined);
   activeListIdRef.current = activeListId;
 
   const activeList = fileLists.find((list) => list.id === activeListId) ?? fileLists[0]!;
+  const activeListRef = useRef(activeList);
+  activeListRef.current = activeList;
   const { files, loading, error, filter, selected, pathDraft, sort, columnWidths } = activeList;
 
   const patchFileList = useCallback((
@@ -343,6 +357,128 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
     }
     await load(currentPath, listId);
   };
+
+  const uploadDroppedPaths = useCallback(async (localPaths: string[], target: FileDropTarget) => {
+    const listId = activeListRef.current.id;
+    const currentPath = activeListRef.current.path;
+    patchFileList(listId, { error: "" });
+    setDropUploadStatus(`正在读取拖入内容…`);
+    try {
+      const manifest = await invoke<LocalUploadManifest>("collect_local_upload_manifest", { paths: localPaths });
+      const remoteDirectories = manifest.directories.map((path) => joinRemotePath(target.path, path));
+      if (remoteDirectories.length > 0) {
+        setDropUploadStatus(`正在创建 ${remoteDirectories.length} 个远程文件夹…`);
+        await invoke("create_directories", { server, paths: remoteDirectories });
+      }
+
+      let nextFileIndex = 0;
+      let failedUploads = 0;
+      const uploadNext = async () => {
+        while (nextFileIndex < manifest.files.length) {
+          const file = manifest.files[nextFileIndex];
+          nextFileIndex += 1;
+          const remotePath = joinRemotePath(target.path, file.relativePath);
+          try {
+            await onTransfer(
+              {
+                direction: "upload",
+                fileName: file.relativePath,
+                sourcePath: file.localPath,
+                destinationPath: remotePath,
+              },
+              (transferId) => invoke("start_upload_file", {
+                server,
+                localPath: file.localPath,
+                remotePath,
+                transferId,
+              }),
+            );
+          } catch {
+            failedUploads += 1;
+          }
+        }
+      };
+      const workers = Array.from(
+        { length: Math.min(DROP_UPLOAD_CONCURRENCY, manifest.files.length) },
+        () => uploadNext(),
+      );
+      await Promise.all(workers);
+      await load(currentPath, listId);
+
+      if (failedUploads > 0) {
+        patchFileList(listId, { error: `${failedUploads} 个文件上传失败，请在传输列表中查看详情。` });
+        setDropUploadStatus(undefined);
+        return;
+      }
+      const skippedCopy = manifest.skippedEntries > 0 ? `，已跳过 ${manifest.skippedEntries} 个链接或重复项` : "";
+      setDropUploadStatus(`已上传 ${manifest.files.length} 个文件到 ${target.path}${skippedCopy}`);
+      window.setTimeout(() => setDropUploadStatus(undefined), 2600);
+    } catch (reason) {
+      setDropUploadStatus(undefined);
+      patchFileList(listId, { error: String(reason) });
+    }
+  }, [load, onTransfer, patchFileList, server]);
+  uploadDroppedPathsRef.current = uploadDroppedPaths;
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlistenDrop: (() => void) | undefined;
+    let unlistenScale: (() => void) | undefined;
+    let scaleFactor = window.devicePixelRatio || 1;
+    const webview = getCurrentWebview();
+
+    const targetAtPosition = (physicalX: number, physicalY: number): FileDropTarget | undefined => {
+      const root = paneRef.current;
+      if (!root) return undefined;
+      const x = physicalX / scaleFactor;
+      const y = physicalY / scaleFactor;
+      const bounds = root.getBoundingClientRect();
+      if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) return undefined;
+      const element = document.elementFromPoint(x, y);
+      if (!element || !root.contains(element)) return undefined;
+      const directoryRow = element.closest<HTMLTableRowElement>("tr[data-drop-path]");
+      if (directoryRow && root.contains(directoryRow)) {
+        const path = directoryRow.dataset.dropPath;
+        if (path) return { path, rowPath: path };
+      }
+      const list = activeListRef.current;
+      return { path: list.path };
+    };
+
+    void webview.window.scaleFactor().then((value) => {
+      scaleFactor = value;
+    });
+    void webview.window.onScaleChanged(({ payload }) => {
+      scaleFactor = payload.scaleFactor;
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenScale = unlisten;
+    });
+    void webview.onDragDropEvent(({ payload }) => {
+      if (payload.type === "leave") {
+        setDropTarget(undefined);
+        return;
+      }
+      const target = targetAtPosition(payload.position.x, payload.position.y);
+      if (payload.type === "enter" || payload.type === "over") {
+        setDropTarget(target);
+        return;
+      }
+      setDropTarget(undefined);
+      if (target && payload.paths.length > 0) {
+        void uploadDroppedPathsRef.current(payload.paths, target);
+      }
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenDrop = unlisten;
+    });
+    return () => {
+      disposed = true;
+      unlistenDrop?.();
+      unlistenScale?.();
+    };
+  }, []);
 
   const download = async (target?: RemoteFile) => {
     const file = target ?? files.find((item) => item.path === selected);
@@ -554,7 +690,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   ];
 
   return (
-    <div className="pane file-pane">
+    <div ref={paneRef} className={`pane file-pane ${dropTarget ? "drag-active" : ""}`}>
       <div className="pane-header">
         <div className="pane-title"><Folder size={14} /><span>文件</span></div>
         <label className="file-search file-header-search">
@@ -649,7 +785,8 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
               {visibleFiles.map((file) => (
                 <tr
                   key={file.path}
-                  className={selected === file.path ? "selected" : ""}
+                  className={`${selected === file.path ? "selected" : ""} ${dropTarget?.rowPath === file.path ? "drop-target" : ""}`}
+                  data-drop-path={file.isDir ? file.path : undefined}
                   onClick={() => selectFile(file)}
                   onDoubleClick={() => openFile(file)}
                   onContextMenu={(event) => openMenu(event, file)}
@@ -665,8 +802,20 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
           {!loading && visibleFiles.length === 0 && <div className="table-empty">当前目录为空</div>}
         </div>
       )}
+      {dropTarget && (
+        <div className="file-drop-overlay" aria-hidden="true">
+          <span><ArrowUpToLine size={18} /></span>
+          <strong>释放以上传</strong>
+          <small>目标：{dropTarget.path}</small>
+        </div>
+      )}
       <div className="file-footer">
-        {editorStatus && (
+        {dropUploadStatus ? (
+          <span className="file-drop-status" title={dropUploadStatus} role="status" aria-live="polite">
+            <ArrowUpToLine size={10} />
+            <span>{dropUploadStatus}</span>
+          </span>
+        ) : editorStatus && (
           <span className={`file-editor-status ${editorStatus.status}`} title={editorStatus.localPath || editorStatus.remotePath}>
             <FilePenLine size={10} />
             <span>{editorStatus.message}</span>

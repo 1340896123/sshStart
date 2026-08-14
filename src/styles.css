@@ -2319,6 +2319,11 @@ body.is-resizing-rows .system-dock {
   grid-template-rows: 34px 28px 32px minmax(0, 1fr) 22px;
 }
 
+.file-pane.drag-active {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
 .file-list-tabs {
   min-width: 0;
   display: flex;
@@ -2600,6 +2605,11 @@ body.is-resizing-rows .system-dock {
   color: var(--fg);
 }
 
+.file-table tr.drop-target td {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
 .file-table td:first-child {
   display: flex;
   align-items: center;
@@ -2635,6 +2645,61 @@ body.is-resizing-rows .system-dock {
   padding: 28px;
   color: var(--muted);
   text-align: center;
+}
+
+.file-drop-overlay {
+  position: absolute;
+  z-index: 12;
+  inset: 94px 8px 24px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 5px;
+  border: 1px dashed var(--accent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface-raised) 92%, var(--accent));
+  color: var(--accent-strong);
+  pointer-events: none;
+}
+
+.file-drop-overlay > span {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--accent);
+  border-radius: 50%;
+  background: var(--accent-soft);
+}
+
+.file-drop-overlay strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.file-drop-overlay small {
+  max-width: min(420px, 70vw);
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-drop-status {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: auto;
+  color: var(--accent-strong);
+}
+
+.file-drop-status span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pane-error {

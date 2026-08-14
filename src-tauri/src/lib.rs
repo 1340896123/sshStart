@@ -61,6 +61,21 @@ struct RemoteFile {
     modified: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalUploadFile {
+    local_path: String,
+    relative_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalUploadManifest {
+    files: Vec<LocalUploadFile>,
+    directories: Vec<String>,
+    skipped_entries: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VscodeEditSession {
@@ -1889,6 +1904,206 @@ async fn list_directory(server: ServerProfile, path: String) -> Result<Vec<Remot
     .map_err(|error| format!("SFTP 任务失败: {error}"))?
 }
 
+const MAX_LOCAL_UPLOAD_FILES: usize = 5_000;
+const MAX_LOCAL_UPLOAD_DIRECTORIES: usize = 10_000;
+
+fn local_upload_name(path: &Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("无法确定拖入项的名称：{}", path.display()))?;
+    Ok(name)
+}
+
+fn local_upload_child_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn is_local_upload_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn reserve_local_upload_path(
+    occupied: &mut HashMap<String, bool>,
+    relative_path: &str,
+    is_dir: bool,
+) -> Result<(), String> {
+    if let Some(existing_is_dir) = occupied.insert(relative_path.to_string(), is_dir) {
+        let existing_kind = if existing_is_dir {
+            "文件夹"
+        } else {
+            "文件"
+        };
+        let next_kind = if is_dir { "文件夹" } else { "文件" };
+        return Err(format!(
+            "拖入内容存在目标路径冲突：{relative_path}（{existing_kind} 与 {next_kind}）"
+        ));
+    }
+    Ok(())
+}
+
+fn collect_local_upload_manifest_sync(paths: Vec<String>) -> Result<LocalUploadManifest, String> {
+    if paths.is_empty() {
+        return Err("没有可上传的本地文件或文件夹".to_string());
+    }
+
+    let mut roots = paths
+        .into_iter()
+        .map(|value| {
+            let path = PathBuf::from(value);
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("无法读取拖入项 {}：{error}", path.display()))?;
+            if is_local_upload_link(&metadata) {
+                return Err(format!("不支持上传符号链接：{}", path.display()));
+            }
+            if !metadata.is_file() && !metadata.is_dir() {
+                return Err(format!("只支持普通文件和文件夹：{}", path.display()));
+            }
+            let canonical = fs::canonicalize(&path)
+                .map_err(|error| format!("无法解析拖入项 {}：{error}", path.display()))?;
+            Ok((path, canonical, metadata.is_dir()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    roots.sort_by(|left, right| {
+        left.1
+            .components()
+            .count()
+            .cmp(&right.1.components().count())
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    let mut accepted_directories = Vec::<PathBuf>::new();
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut occupied = HashMap::<String, bool>::new();
+    let mut skipped_entries = 0usize;
+
+    for (root, canonical, is_dir) in roots {
+        if accepted_directories
+            .iter()
+            .any(|directory| canonical.starts_with(directory))
+        {
+            skipped_entries = skipped_entries.saturating_add(1);
+            continue;
+        }
+
+        let root_name = local_upload_name(&root)?;
+        if is_dir {
+            if directories.len() >= MAX_LOCAL_UPLOAD_DIRECTORIES {
+                return Err(format!(
+                    "拖入目录超过 {MAX_LOCAL_UPLOAD_DIRECTORIES} 个文件夹限制"
+                ));
+            }
+            accepted_directories.push(canonical);
+            reserve_local_upload_path(&mut occupied, &root_name, true)?;
+            directories.push(root_name.clone());
+            let mut pending = vec![(root, root_name)];
+            while let Some((directory, relative_directory)) = pending.pop() {
+                let mut entries = fs::read_dir(&directory)
+                    .map_err(|error| format!("无法读取本地目录 {}：{error}", directory.display()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        format!("无法读取本地目录 {}：{error}", directory.display())
+                    })?;
+                entries.sort_by(|left, right| {
+                    left.file_name()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .cmp(&right.file_name().to_string_lossy().to_lowercase())
+                });
+                for entry in entries.into_iter().rev() {
+                    let file_type = entry.file_type().map_err(|error| {
+                        format!("无法读取本地项 {}：{error}", entry.path().display())
+                    })?;
+                    let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                        format!("无法读取本地项 {}：{error}", entry.path().display())
+                    })?;
+                    if file_type.is_symlink() || is_local_upload_link(&metadata) {
+                        skipped_entries = skipped_entries.saturating_add(1);
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let relative_path = local_upload_child_path(&relative_directory, &name);
+                    if file_type.is_dir() {
+                        if directories.len() >= MAX_LOCAL_UPLOAD_DIRECTORIES {
+                            return Err(format!(
+                                "拖入目录超过 {MAX_LOCAL_UPLOAD_DIRECTORIES} 个文件夹限制"
+                            ));
+                        }
+                        reserve_local_upload_path(&mut occupied, &relative_path, true)?;
+                        directories.push(relative_path.clone());
+                        pending.push((entry.path(), relative_path));
+                    } else if file_type.is_file() {
+                        if files.len() >= MAX_LOCAL_UPLOAD_FILES {
+                            return Err(format!(
+                                "拖入内容超过 {MAX_LOCAL_UPLOAD_FILES} 个文件限制，请分批上传"
+                            ));
+                        }
+                        reserve_local_upload_path(&mut occupied, &relative_path, false)?;
+                        files.push(LocalUploadFile {
+                            local_path: entry.path().to_string_lossy().into_owned(),
+                            relative_path,
+                        });
+                    } else {
+                        skipped_entries = skipped_entries.saturating_add(1);
+                    }
+                }
+            }
+        } else {
+            if files.len() >= MAX_LOCAL_UPLOAD_FILES {
+                return Err(format!(
+                    "拖入内容超过 {MAX_LOCAL_UPLOAD_FILES} 个文件限制，请分批上传"
+                ));
+            }
+            reserve_local_upload_path(&mut occupied, &root_name, false)?;
+            files.push(LocalUploadFile {
+                local_path: root.to_string_lossy().into_owned(),
+                relative_path: root_name,
+            });
+        }
+    }
+
+    directories.sort_by(|left, right| {
+        left.matches('/')
+            .count()
+            .cmp(&right.matches('/').count())
+            .then_with(|| left.to_lowercase().cmp(&right.to_lowercase()))
+    });
+    files.sort_by(|left, right| {
+        left.relative_path
+            .to_lowercase()
+            .cmp(&right.relative_path.to_lowercase())
+    });
+    Ok(LocalUploadManifest {
+        files,
+        directories,
+        skipped_entries,
+    })
+}
+
+#[tauri::command]
+async fn collect_local_upload_manifest(paths: Vec<String>) -> Result<LocalUploadManifest, String> {
+    tauri::async_runtime::spawn_blocking(move || collect_local_upload_manifest_sync(paths))
+        .await
+        .map_err(|error| format!("读取本地上传内容失败: {error}"))?
+}
+
 const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
 const TRANSFER_PROGRESS_EVENT: &str = "transfer-progress";
 const TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
@@ -3085,6 +3300,49 @@ async fn create_directory(server: ServerProfile, path: String) -> Result<(), Str
 }
 
 #[tauri::command]
+async fn create_directories(server: ServerProfile, mut paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths.sort_by(|left, right| {
+            left.matches('/')
+                .count()
+                .cmp(&right.matches('/').count())
+                .then_with(|| left.cmp(right))
+        });
+        paths.dedup();
+        let session = connect_ssh(&server)?;
+        let sftp = session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
+        for path in paths {
+            if path == "/" {
+                continue;
+            }
+            if !path.starts_with('/') {
+                return Err(format!("远程目录必须是绝对路径：{path}"));
+            }
+            let remote_path = Path::new(&path);
+            if let Ok(stat) = sftp.stat(remote_path) {
+                if stat.perm.unwrap_or(0) & 0o170000 != 0o040000 {
+                    return Err(format!("远程路径已被文件占用：{path}"));
+                }
+                continue;
+            }
+            if let Err(error) = sftp.mkdir(remote_path, 0o755) {
+                let created_by_other = sftp
+                    .stat(remote_path)
+                    .is_ok_and(|stat| stat.perm.unwrap_or(0) & 0o170000 == 0o040000);
+                if !created_by_other {
+                    return Err(format!("创建远程目录 {path} 失败: {error}"));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("批量创建目录任务失败: {error}"))?
+}
+
+#[tauri::command]
 async fn delete_remote_path(
     server: ServerProfile,
     path: String,
@@ -3311,6 +3569,7 @@ pub fn run() {
             list_containers,
             control_container,
             list_directory,
+            collect_local_upload_manifest,
             upload_file,
             upload_ai_attachment,
             download_file,
@@ -3322,6 +3581,7 @@ pub fn run() {
             open_remote_file_in_vscode,
             system_icons::get_system_file_icons,
             create_directory,
+            create_directories,
             delete_remote_path,
             rename_remote_path,
             compress_remote_path,
@@ -3340,9 +3600,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_transfer_bytes, ensure_remote_revision, local_transfer_temp_path, mode_string,
-        parse_containers, parse_network_connections, parse_network_interfaces, parse_processes,
-        parse_size_bytes, parse_system_information,
+        collect_local_upload_manifest_sync, copy_transfer_bytes, ensure_remote_revision,
+        local_transfer_temp_path, mode_string, parse_containers, parse_network_connections,
+        parse_network_interfaces, parse_processes, parse_size_bytes, parse_system_information,
         remote_parent_and_name, remote_transfer_temp_path, replace_local_file, shell_quote,
         RemoteFileRevision, TransferControl,
     };
@@ -3403,6 +3663,74 @@ mod tests {
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"complete");
         assert!(!temp_path.exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn collects_dropped_directories_with_relative_paths() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("portico-upload-manifest-{nonce}"));
+        let payload = root.join("payload");
+        let nested = payload.join("nested");
+        let empty = payload.join("empty");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(payload.join("root.txt"), b"root").unwrap();
+        std::fs::write(nested.join("app.txt"), b"nested").unwrap();
+        let standalone = root.join("standalone.txt");
+        std::fs::write(&standalone, b"standalone").unwrap();
+
+        let manifest = collect_local_upload_manifest_sync(vec![
+            payload.to_string_lossy().into_owned(),
+            standalone.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            manifest.directories,
+            vec!["payload", "payload/empty", "payload/nested"]
+        );
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "payload/nested/app.txt",
+                "payload/root.txt",
+                "standalone.txt"
+            ]
+        );
+        assert_eq!(manifest.skipped_entries, 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn skips_a_child_dropped_with_its_parent_directory() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("portico-upload-dedupe-{nonce}"));
+        let payload = root.join("payload");
+        let nested = payload.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("app.txt"), b"nested").unwrap();
+
+        let manifest = collect_local_upload_manifest_sync(vec![
+            nested.to_string_lossy().into_owned(),
+            payload.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(manifest.directories, vec!["payload", "payload/nested"]);
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].relative_path, "payload/nested/app.txt");
+        assert_eq!(manifest.skipped_entries, 1);
         std::fs::remove_dir_all(root).ok();
     }
 
