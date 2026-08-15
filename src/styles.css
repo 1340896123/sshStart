@@ -2605,11 +2605,6 @@ body.is-resizing-rows .system-dock {
   color: var(--fg);
 }
 
-.file-table tr.drop-target td {
-  background: var(--accent-soft);
-  color: var(--accent-strong);
-}
-
 .file-table td:first-child {
   display: flex;
   align-items: center;

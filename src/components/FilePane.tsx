@@ -59,7 +59,7 @@ type LocalUploadManifest = {
   directories: string[];
   skippedEntries: number;
 };
-type FileDropTarget = { path: string; rowPath?: string };
+type FileDropTarget = { path: string };
 type VscodeSyncEvent = {
   sessionId: string;
   serverId: string;
@@ -435,15 +435,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
       const y = physicalY / scaleFactor;
       const bounds = root.getBoundingClientRect();
       if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) return undefined;
-      const element = document.elementFromPoint(x, y);
-      if (!element || !root.contains(element)) return undefined;
-      const directoryRow = element.closest<HTMLTableRowElement>("tr[data-drop-path]");
-      if (directoryRow && root.contains(directoryRow)) {
-        const path = directoryRow.dataset.dropPath;
-        if (path) return { path, rowPath: path };
-      }
-      const list = activeListRef.current;
-      return { path: list.path };
+      return { path: activeListRef.current.path };
     };
 
     void webview.window.scaleFactor().then((value) => {
@@ -785,8 +777,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
               {visibleFiles.map((file) => (
                 <tr
                   key={file.path}
-                  className={`${selected === file.path ? "selected" : ""} ${dropTarget?.rowPath === file.path ? "drop-target" : ""}`}
-                  data-drop-path={file.isDir ? file.path : undefined}
+                  className={selected === file.path ? "selected" : ""}
                   onClick={() => selectFile(file)}
                   onDoubleClick={() => openFile(file)}
                   onContextMenu={(event) => openMenu(event, file)}
