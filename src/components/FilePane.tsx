@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { FileEditor } from "./FileEditor";
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -39,6 +39,7 @@ type SortKey = "name" | "size" | "modified" | "permissions";
 type SortDirection = "asc" | "desc";
 type ColumnWidths = Record<SortKey, number>;
 type MenuState = { x: number; y: number; file?: RemoteFile };
+type EditorTab = { key: string; file: RemoteFile; dirty: boolean };
 type FileListState = {
   id: string;
   path: string;
@@ -60,14 +61,6 @@ type LocalUploadManifest = {
   skippedEntries: number;
 };
 type FileDropTarget = { path: string };
-type VscodeSyncEvent = {
-  sessionId: string;
-  serverId: string;
-  remotePath: string;
-  localPath: string;
-  status: "opening" | "watching" | "syncing" | "saved" | "closed" | "error";
-  message: string;
-};
 
 const COMMON_TEXT_EXTENSIONS = new Set([
   "astro", "bash", "bat", "c", "cc", "cfg", "cjs", "cmake", "cmd", "conf", "cpp", "css", "csv",
@@ -199,7 +192,9 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   const [activeListId, setActiveListId] = useState(initialListIdRef.current);
   const activeListIdRef = useRef(activeListId);
   const [menu, setMenu] = useState<MenuState>();
-  const [editorStatus, setEditorStatus] = useState<VscodeSyncEvent>();
+  const [editorTabs, setEditorTabs] = useState<EditorTab[]>([]);
+  const [activeEditorKey, setActiveEditorKey] = useState<string>();
+  const [contentView, setContentView] = useState<"files" | "editor">("files");
   const [systemFileIcons, setSystemFileIcons] = useState<Record<string, string>>({});
   const [dropTarget, setDropTarget] = useState<FileDropTarget>();
   const [dropUploadStatus, setDropUploadStatus] = useState<string>();
@@ -299,23 +294,6 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
       window.removeEventListener("blur", close);
     };
   }, [menu]);
-
-  useEffect(() => {
-    setEditorStatus(undefined);
-    if (!isTauri()) return;
-    let dispose: (() => void) | undefined;
-    let disposed = false;
-    void listen<VscodeSyncEvent>("vscode-file-sync", ({ payload }) => {
-      if (payload.serverId === server.id && payload.sessionId === session.id) setEditorStatus(payload);
-    }).then((unlisten) => {
-      if (disposed) unlisten();
-      else dispose = unlisten;
-    });
-    return () => {
-      disposed = true;
-      dispose?.();
-    };
-  }, [server.id, session.id]);
 
   const visibleFiles = useMemo(() => {
     const direction = sort.direction === "asc" ? 1 : -1;
@@ -487,32 +465,56 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
     }
   };
 
-  const openInVscode = async (file: RemoteFile) => {
+  const openEditor = (file: RemoteFile) => {
     if (file.isDir || !isCommonTextFile(file)) return;
-    if (!isTauri()) {
-      patchFileList(activeList.id, { error: "VS Code 编辑仅在桌面应用中可用。" });
+    const key = file.path;
+    setEditorTabs((current) => current.some((tab) => tab.key === key)
+      ? current
+      : [...current, { key, file, dirty: false }]);
+    setActiveEditorKey(key);
+    setContentView("editor");
+    patchFileList(activeList.id, { error: "" });
+  };
+
+  const activateEditor = (key: string) => {
+    setActiveEditorKey(key);
+    setContentView("editor");
+  };
+
+  const closeEditor = (tab: EditorTab) => {
+    if (tab.dirty && !confirm(`关闭 ${tab.file.name}？未保存的修改将丢失。`)) return;
+    const closingIndex = editorTabs.findIndex((item) => item.key === tab.key);
+    const remaining = editorTabs.filter((item) => item.key !== tab.key);
+    if (remaining.length === 0) {
+      setEditorTabs([]);
+      setActiveEditorKey(undefined);
+      setContentView("files");
       return;
     }
-    patchFileList(activeList.id, { error: "" });
-    setEditorStatus({
-      sessionId: session.id,
-      serverId: server.id,
-      remotePath: file.path,
-      localPath: "",
-      status: "opening",
-      message: `正在用 VS Code 打开 ${file.name}`,
-    });
-    try {
-      await invoke("open_remote_file_in_vscode", { sessionId: session.id, server, remotePath: file.path });
-    } catch (reason) {
-      setEditorStatus(undefined);
-      patchFileList(activeList.id, { error: `无法使用 VS Code 打开 ${file.name}：${String(reason)}` });
-    }
+    setEditorTabs(remaining);
+    setActiveEditorKey((key) => key === tab.key
+      ? remaining[Math.min(Math.max(0, closingIndex), remaining.length - 1)].key
+      : key);
+  };
+
+  const closeAllEditors = () => {
+    if (editorTabs.some((tab) => tab.dirty) && !confirm("关闭所有编辑器？未保存的修改将丢失。")) return;
+    setEditorTabs([]);
+    setActiveEditorKey(undefined);
+    setContentView("files");
+  };
+
+  const handleEditorDirtyChange = (key: string, dirty: boolean) => {
+    setEditorTabs((current) => current.map((tab) => tab.key === key ? { ...tab, dirty } : tab));
+  };
+
+  const handleEditorSaved = () => {
+    void load(activeList.path, activeList.id);
   };
 
   const openFile = (file: RemoteFile) => {
     if (file.isDir) return void load(file.path, activeList.id);
-    if (isCommonTextFile(file)) return void openInVscode(file);
+    if (isCommonTextFile(file)) return void openEditor(file);
     return void download(file);
   };
 
@@ -647,6 +649,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
     activeListIdRef.current = list.id;
     setActiveListId(list.id);
     setMenu(undefined);
+    setContentView("files");
     onUpdate({ cwd: list.path, selectedFile: list.selected });
   };
 
@@ -682,7 +685,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   ];
 
   return (
-    <div ref={paneRef} className={`pane file-pane ${dropTarget ? "drag-active" : ""}`}>
+    <div ref={paneRef} className={`pane file-pane ${dropTarget ? "drag-active" : ""} ${editorTabs.length > 0 ? "has-editors" : ""}`}>
       <div className="pane-header">
         <div className="pane-title"><Folder size={14} /><span>文件</span></div>
         <label className="file-search file-header-search">
@@ -734,6 +737,40 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
           <Plus size={12} />
         </button>
       </div>
+      {editorTabs.length > 0 && (
+        <div className="editor-tabs" role="tablist" aria-label="已打开的编辑器">
+          <div className="editor-tab-scroll">
+            {editorTabs.map((tab) => (
+              <div className={`editor-tab ${tab.key === activeEditorKey ? "active" : ""}`} key={tab.key}>
+                <button
+                  className="editor-tab-select"
+                  type="button"
+                  role="tab"
+                  aria-selected={tab.key === activeEditorKey}
+                  title={tab.file.path}
+                  onClick={() => activateEditor(tab.key)}
+                >
+                  <FilePenLine size={11} />
+                  <span>{tab.file.name}</span>
+                  {tab.dirty && <span className="editor-tab-dirty" title="未保存" />}
+                </button>
+                <button
+                  className="editor-tab-close"
+                  type="button"
+                  title={`关闭 ${tab.file.name}`}
+                  aria-label={`关闭 ${tab.file.name}`}
+                  onClick={() => closeEditor(tab)}
+                >
+                  <X size={10} />
+                </button>
+              </div>
+            ))}
+          </div>
+          <button className="editor-tab-close-all" type="button" title="关闭所有编辑器" aria-label="关闭所有编辑器" onClick={closeAllEditors}>
+            <X size={10} />
+          </button>
+        </div>
+      )}
       <div className="file-toolbar">
         <button className="icon-button quiet" title="返回上级目录" disabled={activeList.path === "/"} onClick={() => void load(parentPath(activeList.path), activeList.id)}><ArrowLeft size={13} /></button>
         <button className="icon-button quiet" title="根目录" onClick={() => void load("/", activeList.id)}><Home size={12} /></button>
@@ -754,7 +791,21 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
           <Clipboard size={12} />
         </button>
       </div>
-      {error ? <div className="pane-error">无法完成操作：{error}<button onClick={() => patchFileList(activeList.id, { error: "" })}>关闭</button></div> : (
+      {editorTabs.length > 0 && (
+        <div className="editor-panel" hidden={contentView !== "editor"}>
+          {editorTabs.map((tab) => (
+            <FileEditor
+              key={tab.key}
+              server={server}
+              file={tab.file}
+              active={tab.key === activeEditorKey}
+              onDirtyChange={(dirty) => handleEditorDirtyChange(tab.key, dirty)}
+              onSaved={handleEditorSaved}
+            />
+          ))}
+        </div>
+      )}
+      {contentView !== "editor" && (error ? <div className="pane-error">无法完成操作：{error}<button onClick={() => patchFileList(activeList.id, { error: "" })}>关闭</button></div> : (
         <div className="file-table-wrap" onContextMenu={(event) => openMenu(event)}>
           <table className="file-table">
             <colgroup>
@@ -792,7 +843,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
           </table>
           {!loading && visibleFiles.length === 0 && <div className="table-empty">当前目录为空</div>}
         </div>
-      )}
+      ))}
       {dropTarget && (
         <div className="file-drop-overlay" aria-hidden="true">
           <span><ArrowUpToLine size={18} /></span>
@@ -806,10 +857,10 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
             <ArrowUpToLine size={10} />
             <span>{dropUploadStatus}</span>
           </span>
-        ) : editorStatus && (
-          <span className={`file-editor-status ${editorStatus.status}`} title={editorStatus.localPath || editorStatus.remotePath}>
+        ) : editorTabs.length > 0 && (
+          <span className="file-editor-status">
             <FilePenLine size={10} />
-            <span>{editorStatus.message}</span>
+            <span>已打开 {editorTabs.length} 个编辑器</span>
           </span>
         )}
         <span>{visibleFiles.length} 个项目</span><span>{server.host}</span>
@@ -824,7 +875,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
               ) : (
                 <>
                   {isCommonTextFile(menu.file) && (
-                    <button role="menuitem" onClick={() => { setMenu(undefined); void openInVscode(menu.file!); }}><FilePenLine size={13} />使用 VS Code 打开</button>
+                    <button role="menuitem" onClick={() => { setMenu(undefined); void openEditor(menu.file!); }}><FilePenLine size={13} />编辑</button>
                   )}
                   <button role="menuitem" onClick={() => { setMenu(undefined); void download(menu.file); }}><Download size={13} />下载</button>
                 </>

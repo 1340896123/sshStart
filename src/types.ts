@@ -48,6 +48,16 @@ export interface RemoteFile {
   modified?: number;
 }
 
+export interface RemoteFileRevision {
+  size: number;
+  modified?: number | null;
+}
+
+export interface RemoteFileContent {
+  content: string;
+  revision: RemoteFileRevision;
+}
+
 export interface ProcessInfo {
   pid: number;
   user: string;

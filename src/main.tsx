@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import "@xterm/xterm/css/xterm.css";
 import App from "./App";
 import { diagnosticError, installDiagnostics } from "./diagnostics";
+import "./monaco";
 import "./styles.css";
 
 class RootErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {

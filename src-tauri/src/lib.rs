@@ -9,14 +9,12 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use ssh2::{CheckResult, KnownHostFileKind, OpenFlags, OpenType, RenameFlags, Session, Sftp};
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    collections::HashMap,
     env,
     fs::{self, File, OpenOptions},
-    hash::{Hash, Hasher},
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    process::{Child, Command},
     sync::{mpsc, Arc, Condvar, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -76,27 +74,10 @@ struct LocalUploadManifest {
     skipped_entries: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VscodeEditSession {
-    local_path: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct RemoteFileRevision {
     size: u64,
     modified: Option<u64>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VscodeSyncEvent {
-    session_id: String,
-    server_id: String,
-    remote_path: String,
-    local_path: String,
-    status: String,
-    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,17 +183,6 @@ enum TerminalRequest {
 #[derive(Default)]
 struct TerminalManager {
     terminals: Mutex<HashMap<String, mpsc::Sender<TerminalRequest>>>,
-}
-
-#[derive(Clone, Default)]
-struct EditorManager {
-    active: Arc<Mutex<HashMap<String, ActiveEditor>>>,
-}
-
-#[derive(Clone)]
-struct ActiveEditor {
-    local_path: PathBuf,
-    session_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2339,12 +2309,7 @@ async fn upload_file_impl(
                 control.wait_until_running()?;
             }
             drop(target);
-            sftp.rename(
-                Path::new(&temp_path),
-                Path::new(&remote_path),
-                Some(RenameFlags::OVERWRITE),
-            )
-            .map_err(|error| format!("提交远程文件失败: {error}"))
+            rename_overwrite(&sftp, Path::new(&temp_path), Path::new(&remote_path))
         })();
         if result.is_err() {
             sftp.unlink(Path::new(&temp_path)).ok();
@@ -2613,188 +2578,7 @@ fn cancel_transfer(transfer_id: String, state: State<'_, TransferManager>) -> Re
     Ok(())
 }
 
-const MAX_VSCODE_FILE_SIZE: u64 = 20 * 1024 * 1024;
-
-fn common_text_file_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    let exact_names = [
-        ".babelrc",
-        ".bashrc",
-        ".browserslistrc",
-        ".dockerignore",
-        ".editorconfig",
-        ".gitattributes",
-        ".gitignore",
-        ".npmignore",
-        ".npmrc",
-        ".prettierrc",
-        ".profile",
-        ".stylelintrc",
-        ".vimrc",
-        ".wgetrc",
-        ".zshrc",
-        "cmakelists.txt",
-        "dockerfile",
-        "fstab",
-        "gemfile",
-        "hosts",
-        "justfile",
-        "license",
-        "makefile",
-        "procfile",
-        "rakefile",
-        "readme",
-    ];
-    if exact_names.iter().any(|item| *item == lower)
-        || lower == ".env"
-        || lower.starts_with(".env.")
-    {
-        return true;
-    }
-    let Some(extension) = Path::new(&lower)
-        .extension()
-        .and_then(|value| value.to_str())
-    else {
-        return false;
-    };
-    matches!(
-        extension,
-        "astro"
-            | "bash"
-            | "bat"
-            | "c"
-            | "cc"
-            | "cfg"
-            | "cjs"
-            | "cmake"
-            | "cmd"
-            | "conf"
-            | "cpp"
-            | "css"
-            | "csv"
-            | "dockerignore"
-            | "editorconfig"
-            | "env"
-            | "fish"
-            | "gitattributes"
-            | "gitignore"
-            | "go"
-            | "gql"
-            | "graphql"
-            | "h"
-            | "hpp"
-            | "htm"
-            | "html"
-            | "ini"
-            | "java"
-            | "js"
-            | "json"
-            | "jsonc"
-            | "jsx"
-            | "kt"
-            | "kts"
-            | "less"
-            | "log"
-            | "lua"
-            | "markdown"
-            | "md"
-            | "mjs"
-            | "path"
-            | "php"
-            | "properties"
-            | "ps1"
-            | "py"
-            | "rb"
-            | "rs"
-            | "sass"
-            | "scss"
-            | "service"
-            | "sh"
-            | "socket"
-            | "sql"
-            | "svelte"
-            | "swift"
-            | "target"
-            | "timer"
-            | "toml"
-            | "ts"
-            | "tsx"
-            | "txt"
-            | "vue"
-            | "xml"
-            | "yaml"
-            | "yml"
-            | "zsh"
-    )
-}
-
-fn local_editor_name(name: &str) -> String {
-    let sanitized = name
-        .chars()
-        .map(|character| {
-            if character.is_control()
-                || matches!(
-                    character,
-                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
-                )
-            {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    let trimmed =
-        sanitized.trim_end_matches(|character: char| character == ' ' || character == '.');
-    if trimmed.is_empty() {
-        "remote-file.txt".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn editor_local_path(server_id: &str, remote_path: &str) -> PathBuf {
-    let mut server_hash = DefaultHasher::new();
-    server_id.hash(&mut server_hash);
-    let mut path_hash = DefaultHasher::new();
-    remote_path.hash(&mut path_hash);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let file_name = remote_path
-        .rsplit('/')
-        .next()
-        .map(local_editor_name)
-        .unwrap_or_else(|| "remote-file.txt".to_string());
-    env::temp_dir()
-        .join("portico-ssh-vscode")
-        .join(format!("{:016x}", server_hash.finish()))
-        .join(format!("{:016x}", path_hash.finish()))
-        .join(timestamp.to_string())
-        .join(file_name)
-}
-
-fn editor_file_revision(path: &Path) -> Result<(u64, SystemTime), String> {
-    let metadata = fs::metadata(path).map_err(|error| format!("读取本地编辑副本失败: {error}"))?;
-    let modified = metadata
-        .modified()
-        .map_err(|error| format!("读取本地修改时间失败: {error}"))?;
-    Ok((metadata.len(), modified))
-}
-
-fn editor_file_revision_if_present(path: &Path) -> Result<Option<(u64, SystemTime)>, String> {
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            let modified = metadata
-                .modified()
-                .map_err(|error| format!("读取本地修改时间失败: {error}"))?;
-            Ok(Some((metadata.len(), modified)))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("读取本地编辑副本失败: {error}")),
-    }
-}
+const MAX_EDITOR_FILE_SIZE: u64 = 20 * 1024 * 1024;
 
 fn remote_file_revision(
     sftp: &ssh2::Sftp,
@@ -2820,35 +2604,52 @@ fn ensure_remote_revision(
     }
 }
 
-fn download_editor_file(
-    server: &ServerProfile,
-    remote_path: &str,
-    local_path: &Path,
-) -> Result<RemoteFileRevision, String> {
-    let session = connect_ssh(server)?;
-    let sftp = session
-        .sftp()
-        .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
-    let initial_revision = remote_file_revision(&sftp, remote_path)?;
-    if initial_revision.size > MAX_VSCODE_FILE_SIZE {
-        return Err(format!(
-            "文件超过 VS Code 编辑上限（{} MB）",
-            MAX_VSCODE_FILE_SIZE / 1024 / 1024
-        ));
-    }
-    let mut source = sftp
-        .open(Path::new(remote_path))
-        .map_err(|error| format!("打开远程文件失败: {error}"))?;
-    let mut target =
-        File::create(local_path).map_err(|error| format!("创建本地编辑副本失败: {error}"))?;
-    std::io::copy(&mut source, &mut target)
-        .map_err(|error| format!("下载编辑副本失败: {error}"))?;
-    target
-        .flush()
-        .map_err(|error| format!("写入本地编辑副本失败: {error}"))?;
-    let downloaded_revision = remote_file_revision(&sftp, remote_path)?;
-    ensure_remote_revision(initial_revision, downloaded_revision)?;
-    Ok(downloaded_revision)
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteFileContent {
+    content: String,
+    revision: RemoteFileRevision,
+}
+
+#[tauri::command]
+async fn read_remote_file(
+    server: ServerProfile,
+    remote_path: String,
+) -> Result<RemoteFileContent, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = connect_ssh(&server)?;
+        let sftp = session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
+        let initial_revision = remote_file_revision(&sftp, &remote_path)?;
+        if initial_revision.size > MAX_EDITOR_FILE_SIZE {
+            return Err(format!(
+                "文件超过编辑上限（{} MB）",
+                MAX_EDITOR_FILE_SIZE / 1024 / 1024
+            ));
+        }
+        let mut source = sftp
+            .open(Path::new(&remote_path))
+            .map_err(|error| format!("打开远程文件失败: {error}"))?;
+        let mut bytes = Vec::new();
+        source
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("读取远程文件失败: {error}"))?;
+        if bytes.len() as u64 > MAX_EDITOR_FILE_SIZE {
+            return Err(format!(
+                "文件超过编辑上限（{} MB）",
+                MAX_EDITOR_FILE_SIZE / 1024 / 1024
+            ));
+        }
+        let downloaded_revision = remote_file_revision(&sftp, &remote_path)?;
+        ensure_remote_revision(initial_revision, downloaded_revision)?;
+        Ok(RemoteFileContent {
+            content: String::from_utf8_lossy(&bytes).into_owned(),
+            revision: downloaded_revision,
+        })
+    })
+    .await
+    .map_err(|error| format!("读取远程文件任务失败: {error}"))?
 }
 
 fn editor_remote_temp_path(remote_path: &str) -> Result<String, String> {
@@ -2857,432 +2658,54 @@ fn editor_remote_temp_path(remote_path: &str) -> Result<String, String> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    Ok(format!("{parent}/.{name}.portico-vscode-{nonce}"))
+    Ok(format!("{parent}/.{name}.portico-edit-{nonce}"))
 }
 
-fn upload_editor_file(
-    server: &ServerProfile,
-    remote_path: &str,
-    local_path: &Path,
-    expected_revision: RemoteFileRevision,
-) -> Result<RemoteFileRevision, String> {
-    let session = connect_ssh(server)?;
-    let sftp = session
-        .sftp()
-        .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
-    ensure_remote_revision(expected_revision, remote_file_revision(&sftp, remote_path)?)?;
-    let temp_path = editor_remote_temp_path(remote_path)?;
-    let result = (|| -> Result<RemoteFileRevision, String> {
-        let mut source =
-            File::open(local_path).map_err(|error| format!("打开本地编辑副本失败: {error}"))?;
-        let mut target = sftp
-            .create(Path::new(&temp_path))
-            .map_err(|error| format!("创建远程编辑临时文件失败: {error}"))?;
-        std::io::copy(&mut source, &mut target)
-            .map_err(|error| format!("同步文件失败: {error}"))?;
-        target
-            .flush()
-            .map_err(|error| format!("提交远程编辑临时文件失败: {error}"))?;
-
-        let latest_revision = remote_file_revision(&sftp, remote_path)?;
-        ensure_remote_revision(expected_revision, latest_revision)?;
-        drop(target);
-        sftp.rename(
-            Path::new(&temp_path),
-            Path::new(remote_path),
-            Some(RenameFlags::OVERWRITE),
-        )
+fn rename_overwrite(sftp: &ssh2::Sftp, temp_path: &Path, remote_path: &Path) -> Result<(), String> {
+    if sftp.rename(temp_path, remote_path, Some(RenameFlags::OVERWRITE)).is_ok() {
+        return Ok(());
+    }
+    // 部分 SFTP 服务器不支持覆盖式（POSIX）rename，先删除目标再普通 rename。
+    sftp.unlink(remote_path)
+        .map_err(|error| format!("提交远程文件失败（无法覆盖已有文件）: {error}"))?;
+    sftp.rename(temp_path, remote_path, None)
         .map_err(|error| format!("提交远程文件失败: {error}"))?;
-        remote_file_revision(&sftp, remote_path)
-    })();
-    if result.is_err() {
-        sftp.unlink(Path::new(&temp_path)).ok();
-    }
-    result
-}
-
-fn vscode_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    let mut add = |path: PathBuf| {
-        if !candidates.iter().any(|existing| existing == &path) {
-            candidates.push(path);
-        }
-    };
-    if cfg!(windows) {
-        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-            let root = PathBuf::from(local_app_data).join("Programs/Microsoft VS Code");
-            add(root.join("bin/code.cmd"));
-            add(root.join("Code.exe"));
-        }
-        if let Some(program_files) = env::var_os("PROGRAMFILES") {
-            let root = PathBuf::from(program_files).join("Microsoft VS Code");
-            add(root.join("bin/code.cmd"));
-            add(root.join("Code.exe"));
-        }
-        if let Some(program_files_x86) = env::var_os("PROGRAMFILES(X86)") {
-            let root = PathBuf::from(program_files_x86).join("Microsoft VS Code");
-            add(root.join("bin/code.cmd"));
-            add(root.join("Code.exe"));
-        }
-        if let Ok(output) = Command::new("where.exe").arg("code.cmd").output() {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let cli_path = PathBuf::from(line.trim());
-                add(cli_path.clone());
-                if let Some(root) = cli_path.parent().and_then(Path::parent) {
-                    add(root.join("Code.exe"));
-                }
-            }
-        }
-        add(PathBuf::from("code.cmd"));
-    } else {
-        add(PathBuf::from(
-            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
-        ));
-        add(PathBuf::from("code"));
-    }
-    candidates
-}
-
-fn launch_vscode(local_path: &Path, wait: bool) -> Result<Child, String> {
-    let mut last_error = String::new();
-    for candidate in vscode_candidates() {
-        if candidate.is_absolute() && !candidate.is_file() {
-            continue;
-        }
-        let mut command = Command::new(&candidate);
-        command.arg("--reuse-window");
-        if wait {
-            command.arg("--wait");
-        }
-        match command.arg(local_path).spawn() {
-            Ok(child) => return Ok(child),
-            Err(error) => last_error = error.to_string(),
-        }
-    }
-    if last_error.is_empty() {
-        Err("未找到 VS Code，请先安装并加入系统 PATH".to_string())
-    } else {
-        Err(format!("启动 VS Code 失败：{last_error}"))
-    }
-}
-
-fn emit_vscode_status(
-    app: &tauri::AppHandle,
-    session_id: &str,
-    server_id: &str,
-    remote_path: &str,
-    local_path: &Path,
-    status: &str,
-    message: impl Into<String>,
-) {
-    app.emit(
-        "vscode-file-sync",
-        VscodeSyncEvent {
-            session_id: session_id.to_string(),
-            server_id: server_id.to_string(),
-            remote_path: remote_path.to_string(),
-            local_path: local_path.to_string_lossy().into_owned(),
-            status: status.to_string(),
-            message: message.into(),
-        },
-    )
-    .ok();
-}
-
-fn emit_vscode_status_to_sessions(
-    app: &tauri::AppHandle,
-    session_ids: &Arc<Mutex<HashSet<String>>>,
-    server_id: &str,
-    remote_path: &str,
-    local_path: &Path,
-    status: &str,
-    message: impl Into<String> + Clone,
-) {
-    let recipients = session_ids
-        .lock()
-        .map(|sessions| sessions.iter().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    for session_id in recipients {
-        emit_vscode_status(
-            app,
-            &session_id,
-            server_id,
-            remote_path,
-            local_path,
-            status,
-            message.clone(),
-        );
-    }
-}
-
-fn watch_editor_file(
-    app: tauri::AppHandle,
-    active: Arc<Mutex<HashMap<String, ActiveEditor>>>,
-    key: String,
-    session_ids: Arc<Mutex<HashSet<String>>>,
-    server: ServerProfile,
-    remote_path: String,
-    local_path: PathBuf,
-    mut process: Child,
-    initial_revision: (u64, SystemTime),
-    initial_remote_revision: RemoteFileRevision,
-) {
-    let server_id = server.id.clone();
-    let mut last_synced = initial_revision;
-    let mut last_remote_revision = initial_remote_revision;
-    let mut sync_ok = true;
-    let mut sync_blocked = false;
-    loop {
-        thread::sleep(Duration::from_millis(450));
-        let process_exited = match process.try_wait() {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(error) => {
-                emit_vscode_status_to_sessions(
-                    &app,
-                    &session_ids,
-                    &server_id,
-                    &remote_path,
-                    &local_path,
-                    "error",
-                    format!("VS Code 状态读取失败：{error}"),
-                );
-                sync_ok = false;
-                true
-            }
-        };
-        let mut current_revision = match editor_file_revision_if_present(&local_path) {
-            Ok(Some(revision)) => revision,
-            Ok(None) if !process_exited => continue,
-            Ok(None) => {
-                emit_vscode_status_to_sessions(
-                    &app,
-                    &session_ids,
-                    &server_id,
-                    &remote_path,
-                    &local_path,
-                    "error",
-                    format!("本地编辑副本已不存在：{}", local_path.display()),
-                );
-                break;
-            }
-            Err(error) => {
-                emit_vscode_status_to_sessions(
-                    &app,
-                    &session_ids,
-                    &server_id,
-                    &remote_path,
-                    &local_path,
-                    "error",
-                    error,
-                );
-                break;
-            }
-        };
-        if current_revision != last_synced && !sync_blocked {
-            thread::sleep(Duration::from_millis(260));
-            let stable_revision = match editor_file_revision_if_present(&local_path) {
-                Ok(Some(revision)) => revision,
-                Ok(None) => continue,
-                Err(error) => {
-                    emit_vscode_status_to_sessions(
-                        &app,
-                        &session_ids,
-                        &server_id,
-                        &remote_path,
-                        &local_path,
-                        "error",
-                        error,
-                    );
-                    break;
-                }
-            };
-            emit_vscode_status_to_sessions(
-                &app,
-                &session_ids,
-                &server_id,
-                &remote_path,
-                &local_path,
-                "syncing",
-                "正在同步保存到远程服务器",
-            );
-            match upload_editor_file(&server, &remote_path, &local_path, last_remote_revision) {
-                Ok(remote_revision) => {
-                    last_remote_revision = remote_revision;
-                    last_synced = stable_revision;
-                    current_revision = stable_revision;
-                    sync_ok = true;
-                    emit_vscode_status_to_sessions(
-                        &app,
-                        &session_ids,
-                        &server_id,
-                        &remote_path,
-                        &local_path,
-                        "saved",
-                        "已保存到远程服务器",
-                    );
-                }
-                Err(error) => {
-                    sync_ok = false;
-                    let conflict = error.contains("编辑期间发生变化");
-                    emit_vscode_status_to_sessions(
-                        &app,
-                        &session_ids,
-                        &server_id,
-                        &remote_path,
-                        &local_path,
-                        "error",
-                        format!("同步失败：{error}"),
-                    );
-                    if conflict {
-                        sync_blocked = true;
-                    }
-                    if !process_exited {
-                        thread::sleep(Duration::from_secs(2));
-                    }
-                }
-            }
-        }
-        if process_exited {
-            if sync_ok && current_revision == last_synced {
-                emit_vscode_status_to_sessions(
-                    &app,
-                    &session_ids,
-                    &server_id,
-                    &remote_path,
-                    &local_path,
-                    "closed",
-                    "VS Code 已关闭，最后修改已同步",
-                );
-                fs::remove_file(&local_path).ok();
-                if let Some(parent) = local_path.parent() {
-                    fs::remove_dir_all(parent).ok();
-                }
-            } else {
-                emit_vscode_status_to_sessions(
-                    &app,
-                    &session_ids,
-                    &server_id,
-                    &remote_path,
-                    &local_path,
-                    "error",
-                    format!("同步未完成，本地副本保留在 {}", local_path.display()),
-                );
-            }
-            break;
-        }
-    }
-    active.lock().ok().map(|mut editors| editors.remove(&key));
-}
-
-fn open_editor_session(
-    app: tauri::AppHandle,
-    active: Arc<Mutex<HashMap<String, ActiveEditor>>>,
-    session_id: String,
-    server: ServerProfile,
-    remote_path: String,
-) -> Result<VscodeEditSession, String> {
-    let file_name = remote_path.rsplit('/').next().unwrap_or_default();
-    if !common_text_file_name(file_name) {
-        return Err("只有常用文本文件支持 VS Code 编辑".to_string());
-    }
-    let key = format!("{}:{remote_path}", server.id);
-    if let Some(editor) = active
-        .lock()
-        .map_err(|_| "编辑器状态锁已损坏")?
-        .get(&key)
-        .cloned()
-    {
-        launch_vscode(&editor.local_path, false)?;
-        editor
-            .session_ids
-            .lock()
-            .map_err(|_| "编辑器会话状态锁已损坏")?
-            .insert(session_id.clone());
-        emit_vscode_status(
-            &app,
-            &session_id,
-            &server.id,
-            &remote_path,
-            &editor.local_path,
-            "watching",
-            "已在 VS Code 中打开",
-        );
-        return Ok(VscodeEditSession {
-            local_path: editor.local_path.to_string_lossy().into_owned(),
-        });
-    }
-    let local_path = editor_local_path(&server.id, &remote_path);
-    if let Some(parent) = local_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("创建本地编辑目录失败: {error}"))?;
-    }
-    let session_ids = Arc::new(Mutex::new(HashSet::from([session_id.clone()])));
-    active.lock().map_err(|_| "编辑器状态锁已损坏")?.insert(
-        key.clone(),
-        ActiveEditor {
-            local_path: local_path.clone(),
-            session_ids: Arc::clone(&session_ids),
-        },
-    );
-    let result = (|| {
-        let initial_remote_revision = download_editor_file(&server, &remote_path, &local_path)?;
-        let initial_revision = editor_file_revision(&local_path)?;
-        let process = launch_vscode(&local_path, true)?;
-        emit_vscode_status(
-            &app,
-            &session_id,
-            &server.id,
-            &remote_path,
-            &local_path,
-            "watching",
-            "VS Code 已打开，保存时自动同步",
-        );
-        let watcher_app = app.clone();
-        let watcher_active = active.clone();
-        let watcher_key = key.clone();
-        let watcher_session_ids = Arc::clone(&session_ids);
-        let watcher_server = server.clone();
-        let watcher_remote_path = remote_path.clone();
-        let watcher_local_path = local_path.clone();
-        thread::spawn(move || {
-            watch_editor_file(
-                watcher_app,
-                watcher_active,
-                watcher_key,
-                watcher_session_ids,
-                watcher_server,
-                watcher_remote_path,
-                watcher_local_path,
-                process,
-                initial_revision,
-                initial_remote_revision,
-            )
-        });
-        Ok(VscodeEditSession {
-            local_path: local_path.to_string_lossy().into_owned(),
-        })
-    })();
-    if result.is_err() {
-        active.lock().ok().map(|mut editors| editors.remove(&key));
-        fs::remove_file(&local_path).ok();
-    }
-    result
+    Ok(())
 }
 
 #[tauri::command]
-async fn open_remote_file_in_vscode(
-    app: tauri::AppHandle,
-    editor_manager: State<'_, EditorManager>,
-    session_id: String,
+async fn write_remote_file(
     server: ServerProfile,
     remote_path: String,
-) -> Result<VscodeEditSession, String> {
-    let active = editor_manager.active.clone();
+    content: String,
+) -> Result<RemoteFileRevision, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        open_editor_session(app, active, session_id, server, remote_path)
+        let session = connect_ssh(&server)?;
+        let sftp = session
+            .sftp()
+            .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
+        let temp_path = editor_remote_temp_path(&remote_path)?;
+        let result = (|| -> Result<RemoteFileRevision, String> {
+            let mut target = sftp
+                .create(Path::new(&temp_path))
+                .map_err(|error| format!("创建远程临时文件失败: {error}"))?;
+            target
+                .write_all(content.as_bytes())
+                .map_err(|error| format!("写入远程文件失败: {error}"))?;
+            target
+                .flush()
+                .map_err(|error| format!("提交远程文件失败: {error}"))?;
+            drop(target);
+            rename_overwrite(&sftp, Path::new(&temp_path), Path::new(&remote_path))?;
+            remote_file_revision(&sftp, &remote_path)
+        })();
+        if result.is_err() {
+            sftp.unlink(Path::new(&temp_path)).ok();
+        }
+        result
     })
     .await
-    .map_err(|error| format!("VS Code 编辑任务失败: {error}"))?
+    .map_err(|error| format!("保存远程文件任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -3524,7 +2947,6 @@ pub fn run() {
             Ok(())
         })
         .manage(TerminalManager::default())
-        .manage(EditorManager::default())
         .manage(TransferManager::default())
         .manage(ai::AiRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
@@ -3578,7 +3000,8 @@ pub fn run() {
             pause_transfer,
             resume_transfer,
             cancel_transfer,
-            open_remote_file_in_vscode,
+            read_remote_file,
+            write_remote_file,
             system_icons::get_system_file_icons,
             create_directory,
             create_directories,
@@ -3896,45 +3319,5 @@ mod tests {
         assert_eq!(rows[0].name, "api");
         assert_eq!(rows[0].memory_limit_bytes, 2_147_483_648);
         assert_eq!(rows[0].network_input_bytes, 1_200_000);
-    }
-
-    #[test]
-    fn recognizes_common_vscode_text_files() {
-        for name in [
-            "Dockerfile",
-            ".env.production",
-            ".gitignore",
-            ".npmrc",
-            "app.tsx",
-            "config.yaml",
-            "service.conf",
-            "README",
-        ] {
-            assert!(
-                super::common_text_file_name(name),
-                "expected {name} to be editable"
-            );
-        }
-        for name in [
-            "release.tar.gz",
-            "photo.png",
-            "database.sqlite",
-            "program.exe",
-        ] {
-            assert!(
-                !super::common_text_file_name(name),
-                "expected {name} to remain a download"
-            );
-        }
-    }
-
-    #[test]
-    fn sanitizes_remote_names_for_the_local_editor_copy() {
-        assert_eq!(
-            super::local_editor_name("nginx:prod?.conf"),
-            "nginx_prod_.conf"
-        );
-        assert_eq!(super::local_editor_name("..."), "remote-file.txt");
-        assert_eq!(super::local_editor_name(".env"), ".env");
     }
 }
