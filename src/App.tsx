@@ -861,8 +861,28 @@ export default function App() {
     setSidebarOpen(true);
   };
 
-  const openServerDialog = (server?: ServerProfile, group?: string) => {
-    setEditingServer(server);
+  const openServerDialog = async (server?: ServerProfile, group?: string) => {
+    let editing = server;
+    if (server && isTauri()) {
+      try {
+        const secrets = await invoke<ServerSecretBundle>("load_server_secrets", { serverId: server.id });
+        editing = {
+          ...server,
+          password: secrets.password ?? server.password,
+          passphrase: secrets.passphrase ?? server.passphrase,
+          jumpHost: server.jumpHost
+            ? {
+                ...server.jumpHost,
+                password: secrets.jumpPassword ?? server.jumpHost.password,
+                passphrase: secrets.jumpPassphrase ?? server.jumpHost.passphrase,
+              }
+            : server.jumpHost,
+        };
+      } catch (error) {
+        console.warn("加载服务器凭据失败", error);
+      }
+    }
+    setEditingServer(editing);
     setServerDialogGroup(group);
     setServerDialogOpen(true);
   };
