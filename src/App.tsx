@@ -452,7 +452,7 @@ export default function App() {
       disposed = true;
       dispose();
     };
-  }, []);
+  }, [storageReady]);
 
   useEffect(() => {
     if (!isTauri()) return;
