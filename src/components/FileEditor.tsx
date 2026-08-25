@@ -23,6 +23,8 @@ export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Pro
   const [dirty, setDirty] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>();
   const dirtyRef = useRef(false);
+  // onMount 只触发一次，addCommand 的闭包会随之固化；用 ref 转发最新的 save，确保 Ctrl+S 永远保存当前内容。
+  const saveRef = useRef<() => Promise<void>>(async () => undefined);
 
   const markDirty = useCallback(() => {
     if (dirtyRef.current) return;
@@ -75,6 +77,7 @@ export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Pro
       setSaving(false);
     }
   }, [content, file.path, onDirtyChange, onSaved, saving, server]);
+  saveRef.current = save;
 
   const handleChange = useCallback((value?: string) => {
     setContent(value ?? "");
@@ -82,9 +85,9 @@ export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Pro
   }, [markDirty]);
 
   const handleMount: OnMount = useCallback((editor, monaco) => {
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void save());
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void saveRef.current());
     editor.focus();
-  }, [save]);
+  }, []);
 
   return (
     <div className={`file-editor ${active ? "active" : ""}`} hidden={!active}>
