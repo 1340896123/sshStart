@@ -2685,6 +2685,7 @@ async fn write_remote_file(
             .sftp()
             .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
         let temp_path = editor_remote_temp_path(&remote_path)?;
+        let original_permissions = sftp.stat(Path::new(&remote_path)).ok().and_then(|stat| stat.perm);
         let result = (|| -> Result<RemoteFileRevision, String> {
             let mut target = sftp
                 .create(Path::new(&temp_path))
@@ -2697,6 +2698,21 @@ async fn write_remote_file(
                 .map_err(|error| format!("提交远程文件失败: {error}"))?;
             drop(target);
             rename_overwrite(&sftp, Path::new(&temp_path), Path::new(&remote_path))?;
+            // 临时文件以默认权限创建，提交后恢复原文件的权限（如执行位），失败不影响保存结果。
+            if let Some(perm) = original_permissions {
+                sftp.setstat(
+                    Path::new(&remote_path),
+                    ssh2::FileStat {
+                        size: None,
+                        uid: None,
+                        gid: None,
+                        perm: Some(perm),
+                        atime: None,
+                        mtime: None,
+                    },
+                )
+                .ok();
+            }
             remote_file_revision(&sftp, &remote_path)
         })();
         if result.is_err() {
