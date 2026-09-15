@@ -165,8 +165,8 @@ export const saveCollapsedGroups = (groups: string[]) =>
 export const saveSyncMetadata = (syncMeta: CloudSyncMetadata) =>
   isTauri() ? invoke("save_sync_metadata", { syncMeta }) : Promise.resolve();
 
-export const getCloudSyncStatus = () =>
-  isTauri() ? invoke<CloudSyncStatus>("sync_status") : Promise.resolve({ authenticated: false, keyPath: "" });
+export const getCloudSyncStatus = (endpoint: string): Promise<CloudSyncStatus> =>
+  isTauri() ? invoke<CloudSyncStatus>("sync_status", { endpoint }) : Promise.resolve({ authenticated: false, keyPath: "" });
 
 export const registerCloudSync = (endpoint: string, email: string, password: string) =>
   isTauri() ? invoke<{ email: string }>("sync_register", { endpoint, email, password }) : Promise.reject(new Error("云端同步仅可在桌面应用中使用"));

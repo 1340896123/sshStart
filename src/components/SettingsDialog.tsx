@@ -40,19 +40,18 @@ import { isTauri } from "../lib";
 import {
   clearCloudSyncData,
   downloadCloudSyncKeys,
-  getCloudSyncStatus,
   listCloudSyncKeyFiles,
   loginCloudSync,
   logoutCloudSync,
   registerCloudSync,
   uploadCloudSyncKeys,
-  type CloudSyncStatus,
   type CloudDataScope,
   type CloudSyncContentSummary,
   type CloudSyncProgress,
   type KeyFileInfo,
   type ServerKeyPathUpdate,
 } from "../storage";
+import { useCloudSyncStatus } from "../useCloudSyncStatus";
 import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiToolKey, type ServerProfile } from "../types";
 
 interface Props {
@@ -158,7 +157,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
   const [removingKey, setRemovingKey] = useState(false);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [error, setError] = useState("");
-  const [syncStatus, setSyncStatus] = useState<CloudSyncStatus>();
+  const { syncStatus, refreshSyncStatus } = useCloudSyncStatus(value.cloudSync.endpoint, cloudSyncActivity);
   const [syncEmail, setSyncEmail] = useState("");
   const [syncPassword, setSyncPassword] = useState("");
   const [syncBusy, setSyncBusy] = useState(false);
@@ -179,18 +178,20 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
 
   useEffect(() => {
     if (!isTauri()) return;
-    void Promise.all([getCloudSyncStatus(), listCloudSyncKeyFiles(servers)])
-      .then(([status, files]) => {
-        setSyncStatus(status);
-        setKeyFiles(files);
-      })
+    void listCloudSyncKeyFiles(servers)
+      .then(setKeyFiles)
       .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, [servers]);
 
-  useEffect(() => {
-    if (!isTauri() || !cloudSyncActivity || cloudSyncActivity.status === "running") return;
-    void getCloudSyncStatus().then(setSyncStatus).catch(() => undefined);
-  }, [cloudSyncActivity]);
+  const changeSyncEndpoint = (endpoint: string) => {
+    setValue((current) => ({ ...current, cloudSync: { ...current.cloudSync, endpoint } }));
+    setSyncPassword("");
+    setKeyPassphrase("");
+    setKeyPassphraseConfirmation("");
+    setKeySyncNotice("");
+    setCloudClearNotice("");
+    setError("");
+  };
 
   const authenticateSync = async (mode: "login" | "register") => {
     setSyncBusy(true);
@@ -199,11 +200,12 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
       const result = mode === "register"
         ? await registerCloudSync(value.cloudSync.endpoint, syncEmail, syncPassword)
         : await loginCloudSync(value.cloudSync.endpoint, syncEmail, syncPassword);
-      setSyncStatus((current) => ({ ...(current ?? { keyPath: "" }), authenticated: true, email: result.email }));
+      setSyncEmail(result.email);
       setSyncPassword("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
+      await refreshSyncStatus();
       setSyncBusy(false);
     }
   };
@@ -213,7 +215,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     setError("");
     try {
       await logoutCloudSync();
-      setSyncStatus((current) => ({ ...(current ?? { keyPath: "" }), authenticated: false, email: undefined }));
       setKeyPassphrase("");
       setKeyPassphraseConfirmation("");
       setKeySyncNotice("");
@@ -224,6 +225,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
+      await refreshSyncStatus();
       setSyncBusy(false);
     }
   };
@@ -352,6 +354,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
+      await refreshSyncStatus();
       setKeySyncAction(undefined);
     }
   };
@@ -394,6 +397,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
+      await refreshSyncStatus();
       setKeySyncAction(undefined);
     }
   };
@@ -431,6 +435,8 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
       await onSyncNow();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      await refreshSyncStatus();
     }
   };
 
@@ -460,11 +466,12 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     setCloudClearNotice("");
     setError("");
     try {
-      setSyncStatus(await clearCloudSyncData(value.cloudSync.endpoint, scope));
+      await clearCloudSyncData(value.cloudSync.endpoint, scope);
       setCloudClearNotice(scope === "all" ? "已清空当前账号的全部云端数据，本机数据保持不变。" : `已清除云端${labels[scope]}，本机数据保持不变。`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
+      await refreshSyncStatus();
       setCloudClearTarget(undefined);
     }
   };
@@ -745,10 +752,10 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                 <section className="settings-panel">
                   <header><strong>云端同步</strong><small>服务器列表和全部设置会在本地加密后再上传，云端永远只保存密文</small></header>
                   <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>同步服务地址</strong><small>填写团队或自建同步服务的 API 根地址</small></span>
+                    <span className="settings-row-copy"><strong>同步服务地址</strong><small>填写团队或自建同步服务的 API 根地址；更换服务器后需重新登录</small></span>
                     <span className="settings-sync-endpoint-control">
-                      <input className="settings-input settings-mono-input" value={value.cloudSync.endpoint} onChange={(event) => setValue({ ...value, cloudSync: { ...value.cloudSync, endpoint: event.target.value } })} placeholder="https://sync.example.com/api" />
-                      <button className="secondary-button" type="button" onClick={() => setValue((current) => ({ ...current, cloudSync: { ...current.cloudSync, endpoint: OFFICIAL_CLOUD_SYNC_ENDPOINT } }))}>使用官方同步地址</button>
+                      <input className="settings-input settings-mono-input" disabled={busy || syncOperationRunning} value={value.cloudSync.endpoint} onChange={(event) => changeSyncEndpoint(event.target.value)} placeholder="https://sync.example.com/api" />
+                      <button className="secondary-button" type="button" disabled={busy || syncOperationRunning} onClick={() => changeSyncEndpoint(OFFICIAL_CLOUD_SYNC_ENDPOINT)}>使用官方同步地址</button>
                     </span>
                   </label>
                   <label className="mutating-tools-toggle">

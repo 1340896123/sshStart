@@ -28,6 +28,17 @@ const LOCAL_STORAGE_KEY_FILE: &str = "sync.key";
 const CLOUD_SYNC_KEY_FILE: &str = "cloud.key";
 
 static SYNC_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SYNC_AUTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+// Keep the token and its issuing server in a single credential write. Legacy
+// bare tokens have no trustworthy server binding and require a fresh login.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SyncSession {
+    id: String,
+    endpoint: String,
+    email: String,
+    token: String,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +83,7 @@ pub struct KeySyncRecord {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedSyncState {
+    endpoint: Option<String>,
     email: Option<String>,
     last_data_sync: Option<SyncRecord>,
     last_key_sync: Option<KeySyncRecord>,
@@ -189,12 +201,29 @@ struct PreparedKeyBundle {
     managed_copies: Vec<(String, Vec<u8>)>,
 }
 
-fn token() -> Option<String> {
-    super::read_secret(TOKEN_ACCOUNT).filter(|value| !value.trim().is_empty())
+fn read_session(entry: &keyring::Entry) -> Option<SyncSession> {
+    let value = entry.get_password().ok()?;
+    serde_json::from_str::<SyncSession>(&value)
+        .ok()
+        .filter(|session| !session.token.trim().is_empty())
 }
 
-fn email() -> Option<String> {
-    super::read_secret(EMAIL_ACCOUNT).filter(|value| !value.trim().is_empty())
+fn session_for_endpoint(session: Option<SyncSession>, endpoint: &str) -> Option<SyncSession> {
+    session.filter(|session| normalize_endpoint(&session.endpoint).as_deref() == Ok(endpoint))
+}
+
+fn current_session(endpoint: &str) -> Option<SyncSession> {
+    let entry = super::keyring_entry(TOKEN_ACCOUNT).ok()?;
+    session_for_endpoint(read_session(&entry), endpoint)
+}
+
+fn require_session(endpoint: &str) -> Result<SyncSession, String> {
+    current_session(endpoint)
+        .ok_or_else(|| "请先登录当前同步服务器；更改服务地址后需要重新登录".to_string())
+}
+
+fn sync_auth_lock() -> &'static Mutex<()> {
+    SYNC_AUTH_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn normalize_endpoint(value: &str) -> Result<String, String> {
@@ -202,10 +231,53 @@ fn normalize_endpoint(value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Err("请先配置云端同步服务地址".to_string());
     }
-    if !value.starts_with("https://") && !value.starts_with("http://") {
+    let url = reqwest::Url::parse(value).map_err(|_| "请输入有效的云端同步服务地址".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
         return Err("云端同步服务地址必须以 http:// 或 https:// 开头".to_string());
     }
-    Ok(value.to_string())
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("同步服务地址不能包含账号、密码、查询参数或片段".to_string());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn authenticated_response_error(
+    response: reqwest::blocking::Response,
+    session: &SyncSession,
+    entry: &keyring::Entry,
+) -> String {
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return response_error(response);
+    }
+    let _guard = sync_auth_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // A response from an older request must not log out a newer session.
+    let clear_result = if read_session(entry).as_ref() == Some(session) {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(())
+    };
+    let message = "同步登录已失效，请重新登录当前同步服务器（HTTP 401）";
+    match clear_result {
+        Ok(()) => message.to_string(),
+        Err(error) => format!("{message}；清除过期登录状态失败: {error}"),
+    }
+}
+
+fn sync_response_error(response: reqwest::blocking::Response, session: &SyncSession) -> String {
+    match super::keyring_entry(TOKEN_ACCOUNT) {
+        Ok(entry) => authenticated_response_error(response, session, &entry),
+        Err(error) => format!("{}；{error}", response_error(response)),
+    }
 }
 
 fn response_error(response: reqwest::blocking::Response) -> String {
@@ -259,10 +331,9 @@ fn load_sync_state() -> Result<PersistedSyncState, String> {
     }
 }
 
-fn save_sync_state_unlocked(mut state: PersistedSyncState) -> Result<(), String> {
+fn save_sync_state_unlocked(state: PersistedSyncState) -> Result<(), String> {
     let directory = portico_directory()?;
     fs::create_dir_all(&directory).map_err(|error| format!("创建同步状态目录失败: {error}"))?;
-    state.email = email();
     let payload = serde_json::to_vec_pretty(&state)
         .map_err(|error| format!("序列化同步状态失败: {error}"))?;
     fs::write(directory.join(SYNC_STATE_FILE), payload)
@@ -273,50 +344,54 @@ fn sync_state_lock() -> &'static Mutex<()> {
     SYNC_STATE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn sync_state_for_current_account() -> Result<PersistedSyncState, String> {
-    let _guard = sync_state_lock()
-        .lock()
-        .map_err(|_| "同步状态锁已损坏".to_string())?;
-    let state = load_sync_state()?;
-    if state.email == email() {
-        Ok(state)
+fn scope_sync_state(state: PersistedSyncState, session: &SyncSession) -> PersistedSyncState {
+    if state.endpoint.as_deref() == Some(&session.endpoint)
+        && state.email.as_deref() == Some(&session.email)
+    {
+        state
     } else {
-        Ok(PersistedSyncState::default())
+        PersistedSyncState {
+            endpoint: Some(session.endpoint.clone()),
+            email: Some(session.email.clone()),
+            ..PersistedSyncState::default()
+        }
     }
 }
 
-fn update_data_sync_state(record: SyncRecord) -> Result<(), String> {
+fn sync_state_for_session(session: &SyncSession) -> Result<PersistedSyncState, String> {
     let _guard = sync_state_lock()
         .lock()
         .map_err(|_| "同步状态锁已损坏".to_string())?;
-    let mut state = load_sync_state()?;
-    if state.email != email() {
-        state = PersistedSyncState::default();
-    }
+    Ok(scope_sync_state(load_sync_state()?, session))
+}
+
+fn update_data_sync_state(session: &SyncSession, record: SyncRecord) -> Result<(), String> {
+    let _guard = sync_state_lock()
+        .lock()
+        .map_err(|_| "同步状态锁已损坏".to_string())?;
+    let mut state = scope_sync_state(load_sync_state()?, session);
     state.last_data_sync = Some(record);
     save_sync_state_unlocked(state)
 }
 
-fn update_key_sync_state(record: KeySyncRecord) -> Result<(), String> {
+fn update_key_sync_state(session: &SyncSession, record: KeySyncRecord) -> Result<(), String> {
     let _guard = sync_state_lock()
         .lock()
         .map_err(|_| "同步状态锁已损坏".to_string())?;
-    let mut state = load_sync_state()?;
-    if state.email != email() {
-        state = PersistedSyncState::default();
-    }
+    let mut state = scope_sync_state(load_sync_state()?, session);
     state.last_key_sync = Some(record);
     save_sync_state_unlocked(state)
 }
 
-fn clear_sync_state(clear_data: bool, clear_keys: bool) -> Result<(), String> {
+fn clear_sync_state(
+    session: &SyncSession,
+    clear_data: bool,
+    clear_keys: bool,
+) -> Result<(), String> {
     let _guard = sync_state_lock()
         .lock()
         .map_err(|_| "同步状态锁已损坏".to_string())?;
-    let mut state = load_sync_state()?;
-    if state.email != email() {
-        state = PersistedSyncState::default();
-    }
+    let mut state = scope_sync_state(load_sync_state()?, session);
     if clear_data {
         state.last_data_sync = None;
     }
@@ -959,12 +1034,25 @@ fn auth_request(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "同步服务没有返回登录令牌".to_string())?;
+    let email = payload
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or(&email)
+        .to_string();
+    let session = SyncSession {
+        id: uuid::Uuid::new_v4().to_string(),
+        endpoint,
+        email: email.clone(),
+        token: access_token.to_string(),
+    };
+    let credential = serde_json::to_string(&session)
+        .map_err(|error| format!("序列化同步登录状态失败: {error}"))?;
+    let _guard = sync_auth_lock()
+        .lock()
+        .map_err(|_| "同步登录状态锁已损坏".to_string())?;
     super::keyring_entry(TOKEN_ACCOUNT)?
-        .set_password(access_token)
+        .set_password(&credential)
         .map_err(|error| format!("保存同步登录状态失败: {error}"))?;
-    super::keyring_entry(EMAIL_ACCOUNT)?
-        .set_password(&email)
-        .map_err(|error| format!("保存同步账号失败: {error}"))?;
     Ok(SyncAuthResult { email })
 }
 
@@ -1008,11 +1096,16 @@ pub async fn sync_login(
 }
 
 #[tauri::command]
-pub fn sync_status() -> Result<SyncStatus, String> {
-    let state = sync_state_for_current_account()?;
+pub fn sync_status(endpoint: String) -> Result<SyncStatus, String> {
+    let endpoint = normalize_endpoint(&endpoint)?;
+    let session = current_session(&endpoint);
+    let state = match &session {
+        Some(session) => sync_state_for_session(session)?,
+        None => PersistedSyncState::default(),
+    };
     Ok(SyncStatus {
-        authenticated: token().is_some(),
-        email: email(),
+        authenticated: session.is_some(),
+        email: session.map(|session| session.email),
         key_path: cloud_key_file_path()?,
         last_data_sync: state.last_data_sync,
         last_key_sync: state.last_key_sync,
@@ -1021,6 +1114,9 @@ pub fn sync_status() -> Result<SyncStatus, String> {
 
 #[tauri::command]
 pub fn sync_logout() -> Result<(), String> {
+    let _guard = sync_auth_lock()
+        .lock()
+        .map_err(|_| "同步登录状态锁已损坏".to_string())?;
     for account in [TOKEN_ACCOUNT, EMAIL_ACCOUNT] {
         match super::keyring_entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -1306,18 +1402,22 @@ fn clear_snapshot_category(snapshot: &mut Value, scope: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn rewrite_cloud_snapshot_without(endpoint: &str, token: &str, scope: &str) -> Result<(), String> {
+fn rewrite_cloud_snapshot_without(
+    endpoint: &str,
+    session: &SyncSession,
+    scope: &str,
+) -> Result<(), String> {
     let client = request_client()?;
     let response = client
         .get(format!("{endpoint}/sync/data"))
-        .bearer_auth(token)
+        .bearer_auth(&session.token)
         .send()
         .map_err(|error| format!("读取云端应用快照失败: {error}"))?;
     if response.status().as_u16() == 404 {
-        return clear_sync_state(true, false);
+        return clear_sync_state(session, true, false);
     }
     if !response.status().is_success() {
-        return Err(response_error(response));
+        return Err(sync_response_error(response, &session));
     }
     let payload = response
         .json::<Value>()
@@ -1339,7 +1439,7 @@ fn rewrite_cloud_snapshot_without(endpoint: &str, token: &str, scope: &str) -> R
     let updated_at = unix_timestamp();
     let response = client
         .put(format!("{endpoint}/sync/data"))
-        .bearer_auth(token)
+        .bearer_auth(&session.token)
         .json(&json!({
             "ciphertext": encrypted,
             "updatedAt": updated_at,
@@ -1348,23 +1448,26 @@ fn rewrite_cloud_snapshot_without(endpoint: &str, token: &str, scope: &str) -> R
         .send()
         .map_err(|error| format!("更新云端应用快照失败: {error}"))?;
     if !response.status().is_success() {
-        return Err(response_error(response));
+        return Err(sync_response_error(response, &session));
     }
-    update_data_sync_state(SyncRecord {
-        direction: "upload".to_string(),
-        completed_at: unix_timestamp(),
-        remote_updated_at: Some(updated_at),
-        content,
-    })
+    update_data_sync_state(
+        &session,
+        SyncRecord {
+            direction: "upload".to_string(),
+            completed_at: unix_timestamp(),
+            remote_updated_at: Some(updated_at),
+            content,
+        },
+    )
 }
 
 fn clear_cloud_data(endpoint: String, scope: String) -> Result<(), String> {
-    let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
+    let session = require_session(&endpoint)?;
     if matches!(
         scope.as_str(),
         "servers" | "groups" | "ai-config" | "conversations"
     ) {
-        return rewrite_cloud_snapshot_without(&endpoint, &token, &scope);
+        return rewrite_cloud_snapshot_without(&endpoint, &session, &scope);
     }
     let (path, clear_data, clear_keys) = match scope.as_str() {
         "keys" => ("/sync/keys", false, true),
@@ -1373,22 +1476,24 @@ fn clear_cloud_data(endpoint: String, scope: String) -> Result<(), String> {
     };
     let response = request_client()?
         .delete(format!("{endpoint}{path}"))
-        .bearer_auth(token)
+        .bearer_auth(&session.token)
         .send()
         .map_err(|error| format!("清除云端数据失败: {error}"))?;
     if !response.status().is_success() {
-        return Err(response_error(response));
+        return Err(sync_response_error(response, &session));
     }
-    clear_sync_state(clear_data, clear_keys)
+    clear_sync_state(&session, clear_data, clear_keys)
 }
 
 #[tauri::command]
 pub async fn sync_clear_cloud_data(endpoint: String, scope: String) -> Result<SyncStatus, String> {
     let endpoint = normalize_endpoint(&endpoint)?;
-    tauri::async_runtime::spawn_blocking(move || clear_cloud_data(endpoint, scope))
-        .await
-        .map_err(|error| format!("清除云端数据任务失败: {error}"))??;
-    sync_status()
+    tauri::async_runtime::spawn_blocking(move || {
+        clear_cloud_data(endpoint.clone(), scope)?;
+        sync_status(endpoint)
+    })
+    .await
+    .map_err(|error| format!("清除云端数据任务失败: {error}"))?
 }
 
 fn push_sync(
@@ -1407,7 +1512,7 @@ fn push_sync(
         12,
         "正在整理应用数据",
     );
-    let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
+    let session = require_session(&endpoint)?;
     let client = request_client()?;
     let snapshot =
         make_snapshot_key_paths_portable(hydrate_snapshot(snapshot), &portico_directory()?)?;
@@ -1438,7 +1543,7 @@ fn push_sync(
     let updated_at = unix_timestamp();
     let response = client
         .put(format!("{endpoint}/sync/data"))
-        .bearer_auth(token)
+        .bearer_auth(&session.token)
         .json(&json!({
             "ciphertext": encrypted,
             "updatedAt": updated_at,
@@ -1458,12 +1563,15 @@ fn push_sync(
         );
         Ok(false)
     } else if response.status().is_success() {
-        update_data_sync_state(SyncRecord {
-            direction: "upload".to_string(),
-            completed_at: unix_timestamp(),
-            remote_updated_at: Some(updated_at),
-            content,
-        })?;
+        update_data_sync_state(
+            &session,
+            SyncRecord {
+                direction: "upload".to_string(),
+                completed_at: unix_timestamp(),
+                remote_updated_at: Some(updated_at),
+                content,
+            },
+        )?;
         emit_progress(
             &app,
             &operation_id,
@@ -1475,7 +1583,7 @@ fn push_sync(
         );
         Ok(true)
     } else {
-        Err(response_error(response))
+        Err(sync_response_error(response, &session))
     }
 }
 
@@ -1494,7 +1602,7 @@ fn pull_sync(
         12,
         "正在连接同步服务",
     );
-    let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
+    let session = require_session(&endpoint)?;
     let client = request_client()?;
     emit_progress(
         &app,
@@ -1507,7 +1615,7 @@ fn pull_sync(
     );
     let response = client
         .get(format!("{endpoint}/sync/data"))
-        .bearer_auth(token)
+        .bearer_auth(&session.token)
         .send()
         .map_err(|error| format!("下载同步数据失败: {error}"))?;
     if response.status().as_u16() == 404 {
@@ -1526,7 +1634,7 @@ fn pull_sync(
         });
     }
     if !response.status().is_success() {
-        return Err(response_error(response));
+        return Err(sync_response_error(response, &session));
     }
     let payload = response
         .json::<Value>()
@@ -1559,12 +1667,15 @@ fn pull_sync(
         "正在应用已同步内容",
     );
     store_snapshot_secrets(&snapshot, &local_snapshot)?;
-    update_data_sync_state(SyncRecord {
-        direction: "download".to_string(),
-        completed_at: unix_timestamp(),
-        remote_updated_at,
-        content,
-    })?;
+    update_data_sync_state(
+        &session,
+        SyncRecord {
+            direction: "download".to_string(),
+            completed_at: unix_timestamp(),
+            remote_updated_at,
+            content,
+        },
+    )?;
     emit_progress(
         &app,
         &operation_id,
@@ -1655,7 +1766,7 @@ fn upload_keys(
         14,
         "正在整理本地密钥文件",
     );
-    let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
+    let session = require_session(&endpoint)?;
     let prepared = build_key_bundle(&servers)?;
     persist_managed_key_copies(&prepared.managed_copies)?;
     let client = request_client()?;
@@ -1672,7 +1783,7 @@ fn upload_keys(
         );
         let remote_response = client
             .get(format!("{endpoint}/sync/keys"))
-            .bearer_auth(&token)
+            .bearer_auth(&session.token)
             .send()
             .map_err(|error| format!("读取云端密钥备份失败: {error}"))?;
         let (remote_bundle, expected_updated_at) = if remote_response.status().as_u16() == 404 {
@@ -1692,7 +1803,7 @@ fn upload_keys(
                 payload.get("updatedAt").and_then(Value::as_u64),
             )
         } else {
-            return Err(response_error(remote_response));
+            return Err(sync_response_error(remote_response, &session));
         };
         let bundle = merge_key_bundles(&prepared.bundle, remote_bundle)?;
         key_bundle_file_infos(&bundle)?;
@@ -1719,7 +1830,7 @@ fn upload_keys(
         );
         let response = client
             .put(format!("{endpoint}/sync/keys"))
-            .bearer_auth(&token)
+            .bearer_auth(&session.token)
             .json(&json!({
                 "ciphertext": ciphertext,
                 "updatedAt": bundle.created_at,
@@ -1731,7 +1842,7 @@ fn upload_keys(
             continue;
         }
         if !response.status().is_success() {
-            return Err(response_error(response));
+            return Err(sync_response_error(response, &session));
         }
         merged_bundle = Some(bundle);
         break;
@@ -1743,13 +1854,16 @@ fn upload_keys(
         updated_at: merged_bundle.created_at,
         path_updates: prepared.path_updates,
     };
-    update_key_sync_state(KeySyncRecord {
-        direction: "upload".to_string(),
-        completed_at: unix_timestamp(),
-        updated_at: result.updated_at,
-        file_count: result.files.len(),
-        total_bytes: result.files.iter().map(|file| file.size).sum(),
-    })?;
+    update_key_sync_state(
+        &session,
+        KeySyncRecord {
+            direction: "upload".to_string(),
+            completed_at: unix_timestamp(),
+            updated_at: result.updated_at,
+            file_count: result.files.len(),
+            total_bytes: result.files.iter().map(|file| file.size).sum(),
+        },
+    )?;
     emit_progress(
         &app,
         &operation_id,
@@ -1815,18 +1929,18 @@ fn download_keys(
         24,
         "正在下载密钥备份",
     );
-    let token = token().ok_or_else(|| "请先登录同步账号".to_string())?;
+    let session = require_session(&endpoint)?;
     let client = request_client()?;
     let response = client
         .get(format!("{endpoint}/sync/keys"))
-        .bearer_auth(token)
+        .bearer_auth(&session.token)
         .send()
         .map_err(|error| format!("下载密钥备份失败: {error}"))?;
     if response.status().as_u16() == 404 {
         return Err("当前账号还没有上传密钥备份".to_string());
     }
     if !response.status().is_success() {
-        return Err(response_error(response));
+        return Err(sync_response_error(response, &session));
     }
     let payload = response
         .json::<Value>()
@@ -1860,13 +1974,16 @@ fn download_keys(
     if let Some(updated_at) = server_updated_at {
         result.updated_at = updated_at;
     }
-    update_key_sync_state(KeySyncRecord {
-        direction: "download".to_string(),
-        completed_at: unix_timestamp(),
-        updated_at: result.updated_at,
-        file_count: result.files.len(),
-        total_bytes: result.files.iter().map(|file| file.size).sum(),
-    })?;
+    update_key_sync_state(
+        &session,
+        KeySyncRecord {
+            direction: "download".to_string(),
+            completed_at: unix_timestamp(),
+            updated_at: result.updated_at,
+            file_count: result.files.len(),
+            total_bytes: result.files.iter().map(|file| file.size).sum(),
+        },
+    )?;
     emit_progress(
         &app,
         &operation_id,
@@ -1920,6 +2037,174 @@ pub async fn sync_download_keys(
 mod tests {
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn test_session(endpoint: &str) -> super::SyncSession {
+        super::SyncSession {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: super::normalize_endpoint(endpoint).unwrap(),
+            email: "user@example.com".to_string(),
+            token: "test-token".to_string(),
+        }
+    }
+
+    fn mock_entry(session: &super::SyncSession) -> keyring::Entry {
+        let entry =
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        entry
+            .set_password(&serde_json::to_string(session).unwrap())
+            .unwrap();
+        entry
+    }
+
+    fn error_response(status: u16) -> reqwest::blocking::Response {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|value| value == b"\r\n\r\n") {
+                let size = stream.read(&mut buffer).unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&buffer[..size]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let response = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/sync/data"))
+            .send()
+            .unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    #[test]
+    fn login_credentials_are_bound_to_the_issuing_server() {
+        let session = test_session(" https://SYNC.example.com:443/api/ ");
+        let entry = mock_entry(&session);
+        assert!(super::session_for_endpoint(
+            super::read_session(&entry),
+            "https://sync.example.com/api"
+        )
+        .is_some());
+        for endpoint in [
+            "https://other.example.com/api",
+            "http://sync.example.com/api",
+            "https://sync.example.com:8443/api",
+            "https://sync.example.com/other",
+        ] {
+            assert!(
+                super::session_for_endpoint(super::read_session(&entry), endpoint).is_none(),
+                "accepted {endpoint}"
+            );
+        }
+        // Selecting another endpoint does not destroy a still-valid login.
+        assert!(super::read_session(&entry).as_ref() == Some(&session));
+    }
+
+    #[test]
+    fn legacy_and_incomplete_credentials_require_a_fresh_login() {
+        let mut session = test_session("https://sync.example.com");
+        let entry = mock_entry(&session);
+        for value in ["legacy.jwt.token", "{}", r#"{"token":"legacy-token"}"#] {
+            entry.set_password(value).unwrap();
+            assert!(super::read_session(&entry).is_none());
+        }
+        session.token = " ".to_string();
+        entry
+            .set_password(&serde_json::to_string(&session).unwrap())
+            .unwrap();
+        assert!(super::read_session(&entry).is_none());
+    }
+
+    #[test]
+    fn unauthorized_response_clears_the_rejected_login_and_allows_reauthentication() {
+        let session = test_session("https://sync.example.com");
+        let entry = mock_entry(&session);
+        let error = super::authenticated_response_error(error_response(401), &session, &entry);
+        assert!(error.contains("重新登录当前同步服务器"));
+        assert!(super::read_session(&entry).is_none());
+        let next_session = test_session("https://sync.example.com");
+        entry
+            .set_password(&serde_json::to_string(&next_session).unwrap())
+            .unwrap();
+        assert!(
+            super::session_for_endpoint(super::read_session(&entry), &next_session.endpoint)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn late_unauthorized_responses_do_not_clear_a_newer_login() {
+        let rejected = test_session("https://sync.example.com");
+        // Include re-login to the same server, even if it issues the same JWT.
+        for endpoint in ["https://sync.example.com", "https://other.example.com"] {
+            let current = test_session(endpoint);
+            let entry = mock_entry(&current);
+            super::authenticated_response_error(error_response(401), &rejected, &entry);
+            assert!(super::read_session(&entry).as_ref() == Some(&current));
+        }
+    }
+
+    #[test]
+    fn other_http_failures_preserve_the_login() {
+        let session = test_session("https://sync.example.com");
+        let entry = mock_entry(&session);
+        for status in [403, 500] {
+            let error =
+                super::authenticated_response_error(error_response(status), &session, &entry);
+            assert!(error.contains(&format!("HTTP {status}")));
+            assert!(super::read_session(&entry).as_ref() == Some(&session));
+        }
+    }
+
+    #[test]
+    fn sync_history_is_scoped_to_both_server_and_account() {
+        let session = test_session("https://sync.example.com");
+        let state = || super::PersistedSyncState {
+            endpoint: Some(session.endpoint.clone()),
+            email: Some(session.email.clone()),
+            last_key_sync: Some(super::KeySyncRecord {
+                direction: "upload".to_string(),
+                completed_at: 1,
+                updated_at: 1,
+                file_count: 2,
+                total_bytes: 3,
+            }),
+            ..Default::default()
+        };
+        assert!(super::scope_sync_state(state(), &session)
+            .last_key_sync
+            .is_some());
+        let other_server = test_session("https://other.example.com");
+        assert!(super::scope_sync_state(state(), &other_server)
+            .last_key_sync
+            .is_none());
+        let mut other_account = session.clone();
+        other_account.email = "other@example.com".to_string();
+        assert!(super::scope_sync_state(state(), &other_account)
+            .last_key_sync
+            .is_none());
+        let legacy = super::PersistedSyncState {
+            endpoint: None,
+            ..state()
+        };
+        assert!(super::scope_sync_state(legacy, &session)
+            .last_key_sync
+            .is_none());
+    }
 
     #[test]
     fn key_backup_names_stay_inside_portico_directory() {

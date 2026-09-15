@@ -1,0 +1,24 @@
+[Unit]
+Description=Portico SSH cloud sync service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=portico-sync
+Group=portico-sync
+WorkingDirectory=/opt/portico-sync
+EnvironmentFile=/etc/portico-sync.env
+ExecStart=/usr/local/bin/node /opt/portico-sync/src/index.mjs
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/portico-sync
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
