@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { uid } from "../lib";
+import { buildApprovalContext } from "./approvalContext";
 import type {
   AiAgentEvent,
   AiApproval,
@@ -35,6 +36,7 @@ interface ActiveRun {
   runId: string;
   messageId: string;
   cancelRequested: boolean;
+  runtimeStarted?: boolean;
   activeReasoningId?: string;
   activeTextSegmentId?: string;
   unlisten?: UnlistenFn;
@@ -111,6 +113,8 @@ export function useAiAgent({
   const onMessagesChangeRef = useRef(onMessagesChange);
   const activeRunRef = useRef<ActiveRun>();
   const approvalPolicyRef = useRef(approvalPolicy);
+  const policySyncRef = useRef<Promise<void>>(Promise.resolve());
+  const reviewingApprovalsRef = useRef(new Set<string>());
 
   if (messages !== lastPropMessagesRef.current) {
     lastPropMessagesRef.current = messages;
@@ -148,21 +152,28 @@ export function useAiAgent({
     note: string,
     rejectionReason?: string,
   ) => {
-    updateAssistant(messageId, (message) => ({
-      ...message,
-      approvalState: decision === "approve" ? "approved" : "rejected",
-      approvalNote: note,
-      updatedAt: Date.now(),
-    }), true);
     await invoke("resolve_ai_approval", {
       approvalId: approval.id,
       decision,
       arguments: decision === "approve" ? approval.arguments : undefined,
       reason: decision === "reject" ? rejectionReason : undefined,
     });
+    updateAssistant(messageId, (message) => message.approval?.id !== approval.id ? message : ({
+      ...message,
+      approvalState: decision === "approve" ? "approved" : "rejected",
+      approvalNote: note,
+      updatedAt: Date.now(),
+    }), true);
   };
 
-  const fallbackToManualApproval = (messageId: string, reason: unknown) => {
+  const isPendingApproval = (messageId: string, approvalId: string) => {
+    if (activeRunRef.current?.messageId !== messageId || activeRunRef.current.cancelRequested) return false;
+    const message = messagesRef.current.find((candidate) => candidate.id === messageId);
+    return message?.approval?.id === approvalId && message.approvalState === "pending";
+  };
+
+  const fallbackToManualApproval = (messageId: string, approvalId: string, reason: unknown) => {
+    if (!isPendingApproval(messageId, approvalId)) return;
     updateAssistant(messageId, (message) => ({
       ...message,
       approvalState: "pending",
@@ -182,13 +193,15 @@ export function useAiAgent({
     try {
       await commitApprovalDecision(messageId, approval, decision, note, rejectionReason);
     } catch (reason) {
-      fallbackToManualApproval(messageId, reason);
+      fallbackToManualApproval(messageId, approval.id, reason);
     } finally {
-      setResolvingApprovalId(undefined);
+      setResolvingApprovalId((current) => current === approval.id ? undefined : current);
     }
   };
 
   const reviewApproval = async (messageId: string, approval: AiApproval) => {
+    if (reviewingApprovalsRef.current.has(approval.id) || !isPendingApproval(messageId, approval.id)) return;
+    reviewingApprovalsRef.current.add(approval.id);
     setResolvingApprovalId(approval.id);
     updateAssistant(messageId, (message) => ({
       ...message,
@@ -196,9 +209,6 @@ export function useAiAgent({
       updatedAt: Date.now(),
     }), true);
     try {
-      const requestContext = [...messagesRef.current]
-        .reverse()
-        .find((message) => message.role === "user")?.content ?? "";
       const review = await invoke<AiApprovalReview>("review_ai_approval", {
         config,
         server,
@@ -206,8 +216,9 @@ export function useAiAgent({
         command: approval.command,
         arguments: approval.arguments,
         reason: approval.reason,
-        requestContext,
+        requestContext: buildApprovalContext(messagesRef.current),
       });
+      if (approvalPolicyRef.current !== "reviewer" || !isPendingApproval(messageId, approval.id)) return;
       await commitApprovalDecision(
         messageId,
         approval,
@@ -216,10 +227,37 @@ export function useAiAgent({
         review.reason,
       );
     } catch (reason) {
-      fallbackToManualApproval(messageId, reason);
+      if (approvalPolicyRef.current === "reviewer") {
+        fallbackToManualApproval(messageId, approval.id, reason);
+      }
     } finally {
-      setResolvingApprovalId(undefined);
+      reviewingApprovalsRef.current.delete(approval.id);
+      setResolvingApprovalId((current) => current === approval.id ? undefined : current);
     }
+  };
+
+  const syncApprovalPolicy = () => {
+    const activeRun = activeRunRef.current;
+    if (!activeRun?.runtimeStarted || activeRun.cancelRequested) return;
+    // Serialize updates so a slower earlier request cannot restore an old policy.
+    policySyncRef.current = policySyncRef.current.then(async () => {
+      if (activeRunRef.current !== activeRun || activeRun.cancelRequested) return;
+      await invoke("set_ai_approval_policy", {
+        runId: activeRun.runId,
+        approvalPolicy: approvalPolicyRef.current,
+      });
+      if (activeRunRef.current !== activeRun) return;
+      const message = messagesRef.current.find((candidate) => candidate.id === activeRun.messageId);
+      if (message?.approval && message.approvalState === "pending" && approvalPolicyRef.current === "reviewer") {
+        void reviewApproval(activeRun.messageId, message.approval);
+      }
+    }).catch((reason) => {
+      if (activeRunRef.current !== activeRun || activeRun.cancelRequested) return;
+      updateAssistant(activeRun.messageId, (message) => ({
+        ...message,
+        approvalNote: `审批策略更新失败：${String(reason)}`,
+      }), true);
+    });
   };
 
   const applyEvent = (event: AiAgentEvent) => {
@@ -229,6 +267,11 @@ export function useAiAgent({
 
     switch (event.type) {
       case "run_started":
+        activeRun.runtimeStarted = true;
+        if (activeRun.cancelRequested) {
+          void invoke("cancel_ai_run", { runId: activeRun.runId }).catch(() => undefined);
+        }
+        syncApprovalPolicy();
         updateAssistant(messageId, (message) => ({
           ...message,
           status: "running",
@@ -270,6 +313,9 @@ export function useAiAgent({
         activeRun.activeTextSegmentId = undefined;
         updateAssistant(messageId, (message) => ({
           ...message,
+          approvalState: message.approval?.actionId === event.actionId ? "approved" : message.approvalState,
+          approvalNote: message.approval?.actionId === event.actionId && approvalPolicyRef.current === "full-access"
+            ? "完全访问已放行，Agent 正在继续" : message.approvalNote,
           messageType: "tool",
           toolCalls: mergeToolCall(message.toolCalls, {
             id: event.actionId,
@@ -307,9 +353,7 @@ export function useAiAgent({
           status: "running",
           updatedAt: event.timestamp,
         }), true);
-        if (approvalPolicyRef.current === "full-access") {
-          void submitApproval(messageId, approval, "approve", "完全访问已自动批准，Agent 正在继续");
-        } else if (approvalPolicyRef.current === "reviewer") {
+        if (approvalPolicyRef.current === "reviewer") {
           void reviewApproval(messageId, approval);
         }
         break;
@@ -347,6 +391,8 @@ export function useAiAgent({
       case "run_cancelled":
         updateAssistant(messageId, (message) => ({
           ...message,
+          approval: undefined,
+          approvalState: undefined,
           content: message.content || "已停止当前 Agent 运行。",
           messageType: "text",
           status: "cancelled",
@@ -357,6 +403,8 @@ export function useAiAgent({
       case "run_failed":
         updateAssistant(messageId, (message) => ({
           ...message,
+          approval: undefined,
+          approvalState: undefined,
           content: message.content || `请求失败：${event.error}`,
           messageType: "error",
           status: "error",
@@ -405,6 +453,7 @@ export function useAiAgent({
       });
       if (!activeRunRef.current || activeRunRef.current.runId !== runId) return;
       activeRunRef.current.unlisten = unlisten;
+      if (activeRunRef.current.cancelRequested) return;
       const result = await invoke<AiRunResult>("run_ai_agent", {
         config,
         server,
@@ -426,6 +475,7 @@ export function useAiAgent({
           })),
         allowTools,
         runId,
+        approvalPolicy: approvalPolicyRef.current,
       });
       if (activeRunRef.current?.runId !== runId) return;
       const completedAt = Date.now();
@@ -463,6 +513,8 @@ export function useAiAgent({
           content: message.content || "已停止当前 Agent 运行。",
           messageType: "text",
           status: "cancelled",
+          approval: undefined,
+          approvalState: undefined,
           updatedAt: completedAt,
           completedAt,
         }), true);
@@ -473,6 +525,8 @@ export function useAiAgent({
           content: message.content || `请求失败：${error}`,
           messageType: "error",
           status: "error",
+          approval: undefined,
+          approvalState: undefined,
           updatedAt: completedAt,
           completedAt,
         }), true);
@@ -489,6 +543,8 @@ export function useAiAgent({
               content: current.content || "已停止当前 Agent 运行。",
               messageType: "text",
               status: "cancelled",
+              approval: undefined,
+              approvalState: undefined,
               updatedAt: completedAt,
               completedAt,
             }), true);
@@ -496,6 +552,7 @@ export function useAiAgent({
         }
         unlisten?.();
         activeRunRef.current = undefined;
+        setResolvingApprovalId(undefined);
         setRunning(false);
       }
     }
@@ -525,17 +582,15 @@ export function useAiAgent({
   };
 
   useEffect(() => {
-    if (approvalPolicy === "request" || resolvingApprovalId) return;
-    const activeRun = activeRunRef.current;
-    if (!activeRun) return;
-    const message = messagesRef.current.find((candidate) => candidate.id === activeRun.messageId);
-    const approval = message?.approval;
-    if (!approval || message.approvalState !== "pending") return;
-    if (approvalPolicy === "full-access") {
-      void submitApproval(activeRun.messageId, approval, "approve", "完全访问已自动批准，Agent 正在继续");
-    } else {
-      void reviewApproval(activeRun.messageId, approval);
+    if (approvalPolicy !== "reviewer") {
+      const messageId = activeRunRef.current?.messageId;
+      const message = messagesRef.current.find((candidate) => candidate.id === messageId);
+      if (message?.approval && message.approvalState === "pending" && reviewingApprovalsRef.current.has(message.approval.id)) {
+        setResolvingApprovalId(undefined);
+        updateAssistant(message.id, (current) => ({ ...current, approvalNote: undefined }), true);
+      }
     }
+    syncApprovalPolicy();
   }, [approvalPolicy]);
 
   useEffect(() => () => {

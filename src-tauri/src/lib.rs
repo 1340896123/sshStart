@@ -3029,6 +3029,7 @@ pub fn run() {
             ai::review_ai_approval,
             ai::cancel_ai_run,
             ai::resolve_ai_approval,
+            ai::set_ai_approval_policy,
             ai::run_ai_agent,
             ai::import::parse_ai_server_import
         ])

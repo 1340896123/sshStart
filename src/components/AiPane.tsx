@@ -129,7 +129,7 @@ const MESSAGE_TYPE_LABELS: Record<AiMessageType, string> = {
 const APPROVAL_POLICY_META: Record<AiApprovalPolicy, { label: string; description: string }> = {
   request: { label: "请求批准", description: "高风险或变更型工具调用等待你确认" },
   reviewer: { label: "替我审批", description: "由设置中的审核模型逐次批准或拒绝" },
-  "full-access": { label: "完全访问", description: "自动批准所有运行时审批请求" },
+  "full-access": { label: "完全访问", description: "直接执行已启用工具，无需审批，并允许任务所需变更" },
 };
 const TOKEN_NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN");
 const TOKEN_COMPACT_FORMATTER = new Intl.NumberFormat("zh-CN", {

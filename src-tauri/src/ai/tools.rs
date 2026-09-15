@@ -1,11 +1,12 @@
 use super::super::{
-    CommandResult, ServerProfile, download_file, is_high_risk_command, list_directory,
-    list_network_connections, list_network_interfaces, list_processes, risk_reasons,
-    run_command_sync, shell_quote, signal_process, upload_file,
+    download_file, is_high_risk_command, list_directory, list_network_connections,
+    list_network_interfaces, list_processes, risk_reasons, run_command_sync, shell_quote,
+    signal_process, upload_file, CommandResult, ServerProfile,
 };
+use super::policy::AiApprovalPolicy;
 use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,7 +161,7 @@ fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
     );
     add(
         "pty_interaction",
-        "向需要一次输入的命令传入响应。密码、确认提示和变更型命令必须先请求人工确认。",
+        "向需要一次输入的命令传入响应。调用权限由当前会话的审批策略决定。",
         json!({
             "command": { "type": "string", "description": "需要交互的命令" },
             "input": { "type": "string", "description": "写入标准输入的内容，不包含回车" }
@@ -175,7 +176,7 @@ fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
     );
     add(
         "write_file",
-        "覆写远端文本文件。仅在设置中显式允许变更型工具后可用。",
+        "覆写远端文本文件。调用权限由当前会话的审批策略决定。",
         json!({
             "path": { "type": "string", "description": "远端文件路径" },
             "content": { "type": "string", "description": "要写入的完整文本" }
@@ -184,7 +185,7 @@ fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
     );
     add(
         "sftp_upload",
-        "通过 SFTP 将本机文件上传到当前服务器。仅在设置中显式允许变更型工具后可用。",
+        "通过 SFTP 将本机文件上传到当前服务器。调用权限由当前会话的审批策略决定。",
         json!({
             "localPath": { "type": "string", "description": "本机文件路径" },
             "remotePath": { "type": "string", "description": "远端目标路径" }
@@ -214,7 +215,7 @@ fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
     );
     add(
         "process_manager",
-        "列出高占用进程，或在人工允许后发送 TERM/KILL 信号。",
+        "列出高占用进程，或发送 TERM/KILL 信号；调用权限由当前会话的审批策略决定。",
         json!({
             "action": { "type": "string", "enum": ["list", "terminate"], "description": "list 或 terminate" },
             "pid": { "type": "integer", "description": "terminate 时的 PID" },
@@ -234,7 +235,7 @@ fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
     );
     add(
         "docker_manager",
-        "查看 Docker 容器、镜像和日志；生命周期变更需要人工允许。",
+        "查看 Docker 容器、镜像和日志；生命周期变更按当前会话的审批策略执行。",
         json!({
             "action": { "type": "string", "enum": ["ps", "images", "logs", "pull", "start", "stop", "restart", "rm"], "description": "Docker 动作" },
             "target": { "type": "string", "description": "容器、镜像或镜像名" },
@@ -244,7 +245,7 @@ fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
     );
     add(
         "systemd_control",
-        "查看 systemd 服务状态和日志；启动、停止、重启等动作需要人工允许。",
+        "查看 systemd 服务状态和日志；启动、停止、重启等动作按当前会话的审批策略执行。",
         json!({
             "action": { "type": "string", "enum": ["status", "logs", "start", "stop", "restart", "enable", "disable"], "description": "服务动作" },
             "service": { "type": "string", "description": "systemd 服务名" },
@@ -254,7 +255,7 @@ fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
     );
     add(
         "risk_checker",
-        "在执行前检查命令是否包含删除、格式化、防火墙、重启或其他高危动作。",
+        "按需分析命令中的删除、格式化、防火墙或重启等风险。结果仅为参考提示，不代表运行时拒绝，也不是执行命令的前置条件。",
         json!({ "command": { "type": "string", "description": "要评估的命令" } }),
         &["command"],
     );
@@ -768,7 +769,7 @@ async fn execute_tool(
             let command = required_ai_arg(arguments, "command")?;
             let reasons = risk_reasons(command);
             let result = json_command_result(
-                &json!({ "blocked": is_high_risk_command(command), "reasons": reasons }),
+                &json!({ "highRisk": is_high_risk_command(command), "reasons": reasons, "advisory": true }),
             );
             AiToolExecution {
                 display_command: format!("risk_checker {command}"),
@@ -808,7 +809,6 @@ async fn execute_tool(
     };
     Ok(execution)
 }
-
 
 pub(super) fn build_dynamic_tools(
     server: &ServerProfile,
@@ -852,17 +852,37 @@ pub(super) fn build_dynamic_tools(
         .collect()
 }
 
-pub(super) fn tool_is_allowed(
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ToolPermission {
+    Allow,
+    Ask(String),
+    Deny(&'static str),
+}
+
+pub(super) fn tool_permission(
     settings: &AiToolSettings,
+    policy: AiApprovalPolicy,
     name: &str,
     arguments: &Value,
-) -> bool {
-    !ai_tool_is_mutating(name, arguments) || settings.allow_mutating_tools
+) -> ToolPermission {
+    if !ai_tool_enabled(settings, name) {
+        return ToolPermission::Deny("该工具未启用");
+    }
+    if policy == AiApprovalPolicy::FullAccess {
+        return ToolPermission::Allow;
+    }
+    if ai_tool_is_mutating(name, arguments) && !settings.allow_mutating_tools {
+        return ToolPermission::Deny("设置已禁止变更型工具");
+    }
+    match approval_reason(name, arguments) {
+        Some(reason) => ToolPermission::Ask(reason),
+        None => ToolPermission::Allow,
+    }
 }
 
 pub(super) fn approval_reason(name: &str, arguments: &Value) -> Option<String> {
     if ai_tool_is_mutating(name, arguments) {
-        return Some("该工具会修改远端状态，需要人工确认".to_string());
+        return Some("该工具可修改远端或本机状态，需要按当前策略审批".to_string());
     }
     let command = ai_tool_command_for_risk(name, arguments)?;
     let reasons = risk_reasons(&command);
@@ -870,8 +890,7 @@ pub(super) fn approval_reason(name: &str, arguments: &Value) -> Option<String> {
 }
 
 pub(super) fn display_command(name: &str, arguments: &Value) -> String {
-    ai_tool_command_for_risk(name, arguments)
-        .unwrap_or_else(|| format!("{name} {}", arguments))
+    ai_tool_command_for_risk(name, arguments).unwrap_or_else(|| format!("{name} {}", arguments))
 }
 
 fn bounded_tool_output(output: String, limit: usize) -> String {
@@ -881,4 +900,132 @@ fn bounded_tool_output(output: String, limit: usize) -> String {
     let mut bounded = output.chars().take(limit).collect::<String>();
     bounded.push_str("\n…[tool output truncated]");
     bounded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_access_allows_commands_and_changes_despite_the_legacy_global_gate() {
+        let settings = AiToolSettings {
+            write_file: true,
+            sftp_upload: true,
+            pty_interaction: true,
+            ..Default::default()
+        };
+        assert!(!settings.allow_mutating_tools);
+        for (name, arguments) in [
+            ("execute_command", json!({"command": "uptime"})),
+            (
+                "execute_command",
+                json!({"command": "sudo systemctl restart nginx"}),
+            ),
+            (
+                "execute_command",
+                json!({"command": "rm -rf /srv/app/build"}),
+            ),
+            (
+                "write_file",
+                json!({"path": "/srv/app/config", "content": "updated"}),
+            ),
+            (
+                "sftp_upload",
+                json!({"localPath": "build.zip", "remotePath": "/srv/build.zip"}),
+            ),
+            (
+                "sftp_download",
+                json!({"remotePath": "/var/log/app.log", "localPath": "app.log"}),
+            ),
+            (
+                "systemd_control",
+                json!({"action": "restart", "service": "nginx"}),
+            ),
+            (
+                "docker_manager",
+                json!({"action": "restart", "target": "app"}),
+            ),
+            (
+                "process_manager",
+                json!({"action": "terminate", "pid": 1234}),
+            ),
+            (
+                "background_task",
+                json!({"action": "start", "command": "npm run build"}),
+            ),
+            (
+                "pty_interaction",
+                json!({"command": "setup", "input": "yes"}),
+            ),
+        ] {
+            assert_eq!(
+                tool_permission(&settings, AiApprovalPolicy::FullAccess, name, &arguments),
+                ToolPermission::Allow,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_modes_preserve_mutation_settings_and_approval() {
+        for policy in [AiApprovalPolicy::Request, AiApprovalPolicy::Reviewer] {
+            let mut settings = AiToolSettings::default();
+            let arguments = json!({"action": "restart", "service": "nginx"});
+            assert!(matches!(
+                tool_permission(&settings, policy, "systemd_control", &arguments),
+                ToolPermission::Deny(_)
+            ));
+            settings.allow_mutating_tools = true;
+            assert!(matches!(
+                tool_permission(&settings, policy, "systemd_control", &arguments),
+                ToolPermission::Ask(_)
+            ));
+            assert_eq!(
+                tool_permission(
+                    &settings,
+                    policy,
+                    "read_file",
+                    &json!({"path": "/etc/os-release"})
+                ),
+                ToolPermission::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn full_access_respects_individually_disabled_and_unknown_tools() {
+        let settings = AiToolSettings {
+            execute_command: false,
+            ..Default::default()
+        };
+        for name in ["execute_command", "write_file", "unknown_tool"] {
+            assert!(matches!(
+                tool_permission(&settings, AiApprovalPolicy::FullAccess, name, &json!({})),
+                ToolPermission::Deny(_)
+            ));
+            assert!(!tool_definitions(&settings)
+                .iter()
+                .any(|tool| tool["function"]["name"] == name));
+        }
+    }
+
+    #[tokio::test]
+    async fn risk_checker_reports_advice_instead_of_a_fake_denial() {
+        let server: ServerProfile = serde_json::from_value(json!({
+            "id": "test", "host": "localhost", "port": 22, "username": "test", "authType": "password"
+        })).unwrap();
+        let result = execute_tool(
+            "risk_checker",
+            &json!({"command": "reboot"}),
+            &server,
+            &AiToolSettings::default(),
+        )
+        .await
+        .unwrap();
+        let output: Value = serde_json::from_str(&result.result.stdout).unwrap();
+        assert_eq!(output["highRisk"], true);
+        assert_eq!(output["advisory"], true);
+        assert!(output.get("blocked").is_none());
+        assert_eq!(result.result.exit_code, 0);
+    }
 }

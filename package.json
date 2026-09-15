@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test:sync": "node --test test/cloudSyncMerge.test.mjs",
+    "test:ai": "node --experimental-test-module-mocks --test test/ai*.test.mjs",
     "preview": "vite preview",
     "sync-server": "npm --prefix server start",
     "sync-server:test": "npm --prefix server test",
@@ -35,6 +36,7 @@
     "@vitejs/plugin-react": "^6.0.4",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.49",
+    "react-test-renderer": "^18.3.1",
     "tailwindcss": "^3.4.16",
     "typescript": "~5.6.2",
     "vite": "^8.1.5"

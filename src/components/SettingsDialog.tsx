@@ -113,7 +113,7 @@ const TOOL_GROUPS: Array<{
     description: "在执行前评估风险，并复用经过整理的片段。",
     icon: ShieldCheck,
     tools: [
-      { key: "riskChecker", label: "高危拦截", description: "识别删除、格式化、防火墙等危险动作。", icon: CircleAlert },
+      { key: "riskChecker", label: "风险提示", description: "按需分析命令风险，执行权限由会话审批策略决定。", icon: CircleAlert },
       { key: "snippetLibrary", label: "代码片段库", description: "提供常用的只读运维命令模板。", icon: FileCode2 },
     ],
   },
@@ -133,7 +133,7 @@ const SETTINGS_SECTIONS: Array<{
   { id: "tools", label: "工具能力", description: "终端、诊断与服务工具", icon: Wrench },
   { id: "transfer", label: "文件传输", description: "文件系统与 SFTP 权限", icon: Upload },
   { id: "server-data", label: "导入导出", description: "服务器列表与密钥策略", icon: Download },
-  { id: "security", label: "安全策略", description: "高危拦截与变更边界", icon: ShieldCheck },
+  { id: "security", label: "安全策略", description: "风险提示与变更权限", icon: ShieldCheck },
   { id: "cloud-sync", label: "云端同步", description: "登录、加密与自动同步", icon: Cloud },
 ];
 
@@ -725,7 +725,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                 <section className="settings-panel">
                   <header><strong>审批审核模型</strong><small>供会话中的“替我审批”策略评估单次工具调用</small></header>
                   <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>审核模型</strong><small>复用主模型的接口模式、Base URL 与 API Key；未配置时只能人工审批</small></span>
+                    <span className="settings-row-copy"><strong>审核模型</strong><small>复用主模型的接口模式、Base URL 与 API Key；替我审批需配置此项，完全访问无需审核模型</small></span>
                     <span className="settings-model-control">
                       <input className="settings-input settings-mono-input" value={value.reviewerModel} onChange={(event) => setValue({ ...value, reviewerModel: event.target.value })} placeholder="输入审核模型 ID" />
                       <button type="button" disabled={loadingModels} onClick={() => void openModelPicker("reviewer")}>
@@ -735,7 +735,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                     </span>
                   </label>
                 </section>
-                <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许 Agent 请求变更</strong><small>开启后 Rig 可提出写入、上传、服务和进程操作；是否放行由当前会话的审批策略决定。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
+                <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许 Agent 请求变更</strong><small>控制请求批准、替我审批模式中的变更操作；完全访问模式直接允许已启用工具的变更。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
                 <div className="settings-note"><ShieldCheck size={15} /><span>审核模型返回无法解析的结果或请求失败时，Portico 会退回人工审批，不会默认放行。</span></div>
               </>
             )}

@@ -356,6 +356,9 @@ type AiConfigInput = Omit<Partial<AiConfig>, "tools" | "serverImportExport" | "c
   cloudSync?: Partial<CloudSyncSettings>;
 };
 
+const LEGACY_AI_SYSTEM_PROMPT =
+  "你是 Portico SSH 的 Rig 运维 Agent。先观察再行动，优先使用结构化工具获取事实；明确说明风险和执行结果。不要声称读取过尚未通过工具访问的文件，高风险或变更型动作必须等待人工审批。";
+
 export const DEFAULT_AI_CONFIG: AiConfig = {
   apiMode: "responses",
   endpoint: "https://api.deepseek.com",
@@ -366,13 +369,14 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   maxOutputTokens: 384000,
   temperature: 0.2,
   systemPrompt:
-    "你是 Portico SSH 的 Rig 运维 Agent。先观察再行动，优先使用结构化工具获取事实；明确说明风险和执行结果。不要声称读取过尚未通过工具访问的文件，高风险或变更型动作必须等待人工审批。",
+    "你是 Portico SSH 的 Rig 运维 Agent。主动完成用户任务，先观察再行动，优先使用结构化工具获取事实，并验证执行结果。遵守用户限定的范围与当前会话审批策略，已有授权持续有效，不要重复请求确认。遇到可恢复的错误应自行修正并继续。不要声称读取过尚未通过工具访问的文件，只有确实缺少必要信息或授权时才询问用户。",
   tools: DEFAULT_AI_TOOL_SETTINGS,
   serverImportExport: DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,
   cloudSync: DEFAULT_CLOUD_SYNC_SETTINGS,
 };
 
 export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig = DEFAULT_AI_CONFIG): AiConfig {
+  const systemPrompt = config.systemPrompt ?? fallback.systemPrompt;
   return {
     apiMode: config.apiMode ?? fallback.apiMode,
     endpoint: config.endpoint ?? fallback.endpoint,
@@ -382,7 +386,7 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
     contextWindow: config.contextWindow ?? fallback.contextWindow,
     maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,
     temperature: config.temperature ?? fallback.temperature,
-    systemPrompt: config.systemPrompt ?? fallback.systemPrompt,
+    systemPrompt: systemPrompt === LEGACY_AI_SYSTEM_PROMPT ? DEFAULT_AI_CONFIG.systemPrompt : systemPrompt,
     tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...fallback.tools, ...(config.tools ?? {}) },
     serverImportExport: {
       ...DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,

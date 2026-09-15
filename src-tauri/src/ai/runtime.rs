@@ -1,4 +1,8 @@
-use super::tools::{self, AiToolSettings};
+use super::{
+    policy::AiApprovalPolicy,
+    tools::{self, AiToolSettings, ToolPermission},
+    AI_RUN_CANCELLED,
+};
 use rig::agent::{
     AgentHook, HookContext, StepEventKind, ToolCall, ToolCallAction, ToolResultAction,
     ToolResultEvent,
@@ -8,8 +12,8 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -25,27 +29,79 @@ pub(crate) struct AiRuntimeState {
 #[derive(Default)]
 struct AiRuntimeInner {
     approvals: Mutex<HashMap<String, PendingApproval>>,
-    runs: Mutex<HashMap<String, watch::Sender<bool>>>,
+    runs: Mutex<HashMap<String, ActiveRun>>,
+}
+
+struct ActiveRun {
+    cancellation: watch::Sender<bool>,
+    approval_policy: watch::Sender<AiApprovalPolicy>,
 }
 
 struct PendingApproval {
     sender: oneshot::Sender<ApprovalDecision>,
 }
 
+#[derive(Debug)]
 enum ApprovalDecision {
     Approve(Option<Value>),
     Reject(String),
 }
 
+// Clean up even when the surrounding stream drops this approval future on cancellation.
+struct ApprovalGuard {
+    runtime: AiRuntimeState,
+    approval_id: String,
+}
+
+impl Drop for ApprovalGuard {
+    fn drop(&mut self) {
+        if let Ok(mut approvals) = self.runtime.inner.approvals.lock() {
+            approvals.remove(&self.approval_id);
+        }
+    }
+}
+
 impl AiRuntimeState {
-    pub(super) fn begin_run(&self, run_id: &str) -> Result<watch::Receiver<bool>, String> {
-        let (sender, receiver) = watch::channel(false);
-        self.inner
+    pub(super) fn begin_run(
+        &self,
+        run_id: &str,
+        policy: AiApprovalPolicy,
+    ) -> Result<(watch::Receiver<bool>, watch::Receiver<AiApprovalPolicy>), String> {
+        let (cancellation, receiver) = watch::channel(false);
+        let (approval_policy, policy_receiver) = watch::channel(policy);
+        let mut runs = self
+            .inner
             .runs
             .lock()
-            .map_err(|_| "AI 运行状态已损坏".to_string())?
-            .insert(run_id.to_string(), sender);
-        Ok(receiver)
+            .map_err(|_| "AI 运行状态已损坏".to_string())?;
+        if runs.contains_key(run_id) {
+            return Err("AI 运行已存在".to_string());
+        }
+        runs.insert(
+            run_id.to_string(),
+            ActiveRun {
+                cancellation,
+                approval_policy,
+            },
+        );
+        Ok((receiver, policy_receiver))
+    }
+
+    pub(super) fn set_approval_policy(
+        &self,
+        run_id: &str,
+        policy: AiApprovalPolicy,
+    ) -> Result<(), String> {
+        let runs = self
+            .inner
+            .runs
+            .lock()
+            .map_err(|_| "AI 运行状态已损坏".to_string())?;
+        let run = runs
+            .get(run_id)
+            .ok_or_else(|| "AI 运行不存在或已结束".to_string())?;
+        run.approval_policy.send_replace(policy);
+        Ok(())
     }
 
     pub(super) fn finish_run(&self, run_id: &str) {
@@ -64,40 +120,60 @@ impl AiRuntimeState {
             .get(run_id)
             .ok_or_else(|| "AI 运行不存在或已结束".to_string())?;
         sender
+            .cancellation
             .send(true)
             .map_err(|_| "AI 运行已结束".to_string())
     }
 
     async fn request_approval(
         &self,
-        run_id: String,
         approval_id: String,
         mut cancellation: watch::Receiver<bool>,
+        mut approval_policy: watch::Receiver<AiApprovalPolicy>,
+        notify: impl FnOnce(),
     ) -> Result<ApprovalDecision, String> {
+        if *cancellation.borrow() {
+            return Err(AI_RUN_CANCELLED.to_string());
+        }
+        if *approval_policy.borrow() == AiApprovalPolicy::FullAccess {
+            return Ok(ApprovalDecision::Approve(None));
+        }
         let (sender, receiver) = oneshot::channel();
         self.inner
             .approvals
             .lock()
             .map_err(|_| "AI 审批状态已损坏".to_string())?
             .insert(approval_id.clone(), PendingApproval { sender });
-        let decision = tokio::select! {
-            decision = receiver => decision.map_err(|_| format!("审批 {approval_id} 已取消")),
-            changed = cancellation.changed() => {
-                changed.map_err(|_| "AI 运行已结束".to_string())?;
-                Err(format!("AI 运行 {run_id} 已取消"))
-            }
+        let _guard = ApprovalGuard {
+            runtime: self.clone(),
+            approval_id: approval_id.clone(),
         };
-        if let Ok(mut approvals) = self.inner.approvals.lock() {
-            approvals.remove(&approval_id);
+        // Register before notifying: a frontend/reviewer can reply immediately.
+        notify();
+        tokio::pin!(receiver);
+        loop {
+            if *cancellation.borrow() {
+                return Err(AI_RUN_CANCELLED.to_string());
+            }
+            if *approval_policy.borrow() == AiApprovalPolicy::FullAccess {
+                return Ok(ApprovalDecision::Approve(None));
+            }
+            tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    changed.map_err(|_| "AI 运行已结束".to_string())?;
+                }
+                changed = approval_policy.changed() => {
+                    changed.map_err(|_| "AI 运行已结束".to_string())?;
+                }
+                decision = &mut receiver => {
+                    return decision.map_err(|_| format!("审批 {approval_id} 已取消"));
+                }
+            }
         }
-        decision
     }
 
-    fn resolve(
-        &self,
-        approval_id: &str,
-        decision: ApprovalDecision,
-    ) -> Result<(), String> {
+    fn resolve(&self, approval_id: &str, decision: ApprovalDecision) -> Result<(), String> {
         let pending = self
             .inner
             .approvals
@@ -171,7 +247,11 @@ struct AiAgentEvent {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub(super) enum AiAgentEventKind {
     RunStarted {
         model: String,
@@ -234,9 +314,9 @@ struct ActionState {
 pub(super) struct RunHook {
     runtime: AiRuntimeState,
     sink: EventSink,
-    run_id: String,
     cancellation: watch::Receiver<bool>,
     settings: AiToolSettings,
+    approval_policy: watch::Receiver<AiApprovalPolicy>,
     actions: Arc<Mutex<HashMap<String, ActionState>>>,
 }
 
@@ -244,64 +324,67 @@ impl RunHook {
     pub(super) fn new(
         runtime: AiRuntimeState,
         sink: EventSink,
-        run_id: String,
         cancellation: watch::Receiver<bool>,
         settings: AiToolSettings,
+        approval_policy: watch::Receiver<AiApprovalPolicy>,
     ) -> Self {
         Self {
             runtime,
             sink,
-            run_id,
             cancellation,
             settings,
+            approval_policy,
             actions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl AgentHook for RunHook {
-    async fn on_tool_call(
-        &self,
-        _context: &HookContext,
-        event: ToolCall<'_>,
-    ) -> ToolCallAction {
+    async fn on_tool_call(&self, _context: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        if *self.cancellation.borrow() {
+            return ToolCallAction::stop(AI_RUN_CANCELLED);
+        }
         let arguments = serde_json::from_str::<Value>(event.args).unwrap_or(Value::Null);
         let command = tools::display_command(event.tool_name, &arguments);
         let started_at = timestamp_ms();
-        self.actions
-            .lock()
-            .ok()
-            .map(|mut actions| {
-                actions.insert(
-                    event.internal_call_id.to_string(),
-                    ActionState {
-                        tool: event.tool_name.to_string(),
-                        command: command.clone(),
-                        started_at,
-                    },
-                )
-            });
+        self.actions.lock().ok().map(|mut actions| {
+            actions.insert(
+                event.internal_call_id.to_string(),
+                ActionState {
+                    tool: event.tool_name.to_string(),
+                    command: command.clone(),
+                    started_at,
+                },
+            )
+        });
 
-        if !tools::tool_is_allowed(&self.settings, event.tool_name, &arguments) {
-            return ToolCallAction::skip("设置已禁止变更型工具");
+        let permission = tools::tool_permission(
+            &self.settings,
+            *self.approval_policy.borrow(),
+            event.tool_name,
+            &arguments,
+        );
+        if let ToolPermission::Deny(reason) = permission {
+            return ToolCallAction::skip(reason);
         }
-
-        if let Some(reason) = tools::approval_reason(event.tool_name, &arguments) {
+        if let ToolPermission::Ask(reason) = permission {
             let approval_id = format!("approval-{}", Uuid::new_v4());
-            self.sink.emit(AiAgentEventKind::ApprovalRequired {
-                approval_id: approval_id.clone(),
-                action_id: event.internal_call_id.to_string(),
-                tool: event.tool_name.to_string(),
-                command: command.clone(),
-                arguments: arguments.clone(),
-                reason,
-            });
             return match self
                 .runtime
                 .request_approval(
-                    self.run_id.clone(),
-                    approval_id,
+                    approval_id.clone(),
                     self.cancellation.clone(),
+                    self.approval_policy.clone(),
+                    || {
+                        self.sink.emit(AiAgentEventKind::ApprovalRequired {
+                            approval_id,
+                            action_id: event.internal_call_id.to_string(),
+                            tool: event.tool_name.to_string(),
+                            command: command.clone(),
+                            arguments: arguments.clone(),
+                            reason,
+                        })
+                    },
                 )
                 .await
             {
@@ -406,7 +489,10 @@ fn timestamp_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AiAgentEvent, AiAgentEventKind, AiRuntimeState};
+    use super::{
+        AiAgentEvent, AiAgentEventKind, AiApprovalPolicy, AiRuntimeState, ApprovalDecision,
+        AI_RUN_CANCELLED,
+    };
     use serde_json::json;
 
     #[test]
@@ -436,7 +522,7 @@ mod tests {
     #[test]
     fn cancels_registered_agent_runs() {
         let state = AiRuntimeState::default();
-        let mut cancellation = state.begin_run("run-1").unwrap();
+        let (mut cancellation, _) = state.begin_run("run-1", AiApprovalPolicy::Request).unwrap();
 
         state.cancel_run("run-1").unwrap();
         futures::executor::block_on(cancellation.changed()).unwrap();
@@ -444,5 +530,133 @@ mod tests {
         assert!(*cancellation.borrow());
         state.finish_run("run-1");
         assert!(state.cancel_run("run-1").is_err());
+    }
+
+    #[tokio::test]
+    async fn registers_approval_before_an_immediate_reply() {
+        for policy in [AiApprovalPolicy::Request, AiApprovalPolicy::Reviewer] {
+            let state = AiRuntimeState::default();
+            let (cancellation, approval_policy) = state.begin_run("run-1", policy).unwrap();
+            let result = state
+                .request_approval("approval-1".into(), cancellation, approval_policy, || {
+                    state
+                        .resolve(
+                            "approval-1",
+                            ApprovalDecision::Approve(Some(json!({"command": "uptime"}))),
+                        )
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, ApprovalDecision::Approve(Some(args)) if args["command"] == "uptime")
+            );
+            assert!(state.inner.approvals.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn full_access_needs_no_frontend_or_reviewer() {
+        let state = AiRuntimeState::default();
+        let (cancellation, approval_policy) = state
+            .begin_run("run-1", AiApprovalPolicy::FullAccess)
+            .unwrap();
+        let result = state
+            .request_approval("approval-1".into(), cancellation, approval_policy, || {
+                panic!("full access must not publish an approval request");
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result, ApprovalDecision::Approve(None)));
+        assert!(state.inner.approvals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_to_full_access_resumes_a_waiting_approval() {
+        let state = AiRuntimeState::default();
+        let (cancellation, approval_policy) = state
+            .begin_run("run-1", AiApprovalPolicy::Reviewer)
+            .unwrap();
+        let mut request = Box::pin(state.request_approval(
+            "approval-1".into(),
+            cancellation,
+            approval_policy.clone(),
+            || {},
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        state
+            .set_approval_policy("run-1", AiApprovalPolicy::FullAccess)
+            .unwrap();
+        assert!(matches!(
+            request.await.unwrap(),
+            ApprovalDecision::Approve(None)
+        ));
+        assert_eq!(*approval_policy.borrow(), AiApprovalPolicy::FullAccess);
+        assert!(state.inner.approvals.lock().unwrap().is_empty());
+        assert!(state
+            .resolve(
+                "approval-1",
+                ApprovalDecision::Reject("late reviewer".into())
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn switching_back_to_request_restores_approval() {
+        let state = AiRuntimeState::default();
+        let (cancellation, approval_policy) = state
+            .begin_run("run-1", AiApprovalPolicy::FullAccess)
+            .unwrap();
+        state
+            .set_approval_policy("run-1", AiApprovalPolicy::Request)
+            .unwrap();
+        let result = state
+            .request_approval("approval-1".into(), cancellation, approval_policy, || {
+                state
+                    .resolve("approval-1", ApprovalDecision::Reject("用户拒绝".into()))
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result, ApprovalDecision::Reject(reason) if reason == "用户拒绝"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_takes_priority_over_full_access() {
+        let state = AiRuntimeState::default();
+        let (cancellation, approval_policy) = state
+            .begin_run("run-1", AiApprovalPolicy::FullAccess)
+            .unwrap();
+        state.cancel_run("run-1").unwrap();
+        let result = state
+            .request_approval("approval-1".into(), cancellation, approval_policy, || {
+                panic!("cancelled")
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), AI_RUN_CANCELLED);
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_dropped_futures_remove_pending_approvals() {
+        for cancel in [true, false] {
+            let state = AiRuntimeState::default();
+            let (cancellation, approval_policy) =
+                state.begin_run("run-1", AiApprovalPolicy::Request).unwrap();
+            let mut request = Box::pin(state.request_approval(
+                "approval-1".into(),
+                cancellation,
+                approval_policy,
+                || {},
+            ));
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            assert_eq!(state.inner.approvals.lock().unwrap().len(), 1);
+            if cancel {
+                state.cancel_run("run-1").unwrap();
+                assert_eq!(request.await.unwrap_err(), AI_RUN_CANCELLED);
+            } else {
+                drop(request);
+            }
+            assert!(state.inner.approvals.lock().unwrap().is_empty());
+        }
     }
 }
