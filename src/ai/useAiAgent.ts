@@ -212,7 +212,6 @@ export function useAiAgent({
     await invoke("resolve_ai_approval", {
       approvalId: approval.id,
       decision,
-      arguments: decision === "approve" ? approval.arguments : undefined,
       reason: decision === "reject" ? rejectionReason : undefined,
     });
     updateAssistant(messageId, (message) => message.approval?.id !== approval.id ? message : ({

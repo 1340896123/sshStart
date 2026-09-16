@@ -459,10 +459,9 @@ pub(crate) fn resolve_ai_approval(
     state: tauri::State<'_, AiRuntimeState>,
     approval_id: String,
     decision: String,
-    arguments: Option<serde_json::Value>,
     reason: Option<String>,
 ) -> Result<(), String> {
-    runtime::resolve_approval(state.inner(), approval_id, decision, arguments, reason)
+    runtime::resolve_approval(state.inner(), approval_id, decision, reason)
 }
 
 async fn run_with_model<M>(
@@ -482,7 +481,7 @@ where
 {
     let (prompt, history) = split_messages(messages)?;
     let dynamic_tools = if allow_tools {
-        tools::build_dynamic_tools(server, &config.tools)
+        tools::build_dynamic_tools(server, &config.tools, cancellation.clone())
     } else {
         Vec::new()
     };

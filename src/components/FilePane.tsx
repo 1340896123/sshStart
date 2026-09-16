@@ -185,6 +185,9 @@ function SortGlyph({ active, direction }: { active: boolean; direction: SortDire
 
 export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   const paneRef = useRef<HTMLDivElement>(null);
+  const loadGenerations = useRef(new Map<string, symbol>());
+  const serverRef = useRef(server);
+  serverRef.current = server;
   const initialListIdRef = useRef(uid("file-list"));
   const [fileLists, setFileLists] = useState<FileListState[]>(() => [
     createFileListState(initialListIdRef.current, session.cwd),
@@ -217,12 +220,17 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
   }, []);
 
   const load = useCallback(async (path: string, listId = activeListIdRef.current) => {
+    if (serverRef.current !== server) return;
+    const generation = Symbol();
+    loadGenerations.current.set(listId, generation);
+    const isCurrent = () => serverRef.current === server && loadGenerations.current.get(listId) === generation;
     const normalizedPath = path.trim() === "" ? "/" : path.trim().startsWith("/") ? path.trim() : `/${path.trim()}`;
-    patchFileList(listId, { loading: true, error: "" });
+    patchFileList(listId, { loading: true, error: "", files: [], selected: undefined });
     try {
       const next = isTauri()
         ? await invoke<RemoteFile[]>("list_directory", { server, path: normalizedPath })
         : DEMO_FILES.map((file) => ({ ...file, path: joinRemotePath(normalizedPath, file.name) }));
+      if (!isCurrent()) return;
       patchFileList(listId, {
         files: next,
         path: normalizedPath,
@@ -233,22 +241,24 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
         onUpdate({ cwd: normalizedPath, selectedFile: undefined });
       }
     } catch (reason) {
-      patchFileList(listId, { error: String(reason) });
+      if (isCurrent()) patchFileList(listId, { error: String(reason) });
     } finally {
-      patchFileList(listId, { loading: false });
+      if (isCurrent()) patchFileList(listId, { loading: false });
     }
   }, [onUpdate, patchFileList, server]);
 
   useEffect(() => {
+    loadGenerations.current.clear();
     const initialList = createFileListState(uid("file-list"), session.cwd);
     activeListIdRef.current = initialList.id;
     setFileLists([initialList]);
     setActiveListId(initialList.id);
     setMenu(undefined);
     void load(session.cwd, initialList.id);
+    return () => { loadGenerations.current.clear(); };
     // Navigation calls load directly after the initial session load.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.id]);
+  }, [session.id, server]);
 
   useEffect(() => {
     if (!isTauri() || files.length === 0) return;
@@ -665,6 +675,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
 
   const closeFileList = (listId: string) => {
     if (fileLists.length === 1) return;
+    loadGenerations.current.delete(listId);
     const closingIndex = fileLists.findIndex((list) => list.id === listId);
     if (closingIndex < 0) return;
     const remaining = fileLists.filter((list) => list.id !== listId);

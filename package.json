@@ -12,6 +12,7 @@
     "test:e2e:files": "python test/e2e/file_editor_e2e.py",
     "test:e2e:sidebar": "npm run build && python test/e2e/sidebar_e2e.py",
     "test:e2e:website": "python test/e2e/website_e2e.py",
+    "test:workspace": "node --experimental-test-module-mocks --test test/editor.test.mjs test/workspace.test.mjs test/requestRaces.test.mjs test/terminal.test.mjs",
     "preview": "vite preview",
     "dev:website": "npm --prefix website run dev",
     "build:website": "npm --prefix website run build",

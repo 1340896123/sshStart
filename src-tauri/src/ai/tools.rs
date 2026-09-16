@@ -1,7 +1,7 @@
 use super::super::{
     download_file, is_high_risk_command, list_directory, list_network_connections,
-    list_network_interfaces, list_processes, risk_reasons, run_command_sync, shell_quote,
-    signal_process, upload_file, CommandResult, ServerProfile,
+    list_network_interfaces, list_processes, risk_reasons, shell_quote, signal_process,
+    upload_file, CommandResult, ServerProfile,
 };
 use super::policy::AiApprovalPolicy;
 use rig::message::ToolName;
@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AiToolSettings {
+    #[serde(skip)]
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     #[serde(default = "default_true")]
     pub(super) execute_command: bool,
     #[serde(default = "default_true")]
@@ -57,6 +59,7 @@ pub(super) struct AiToolSettings {
 impl Default for AiToolSettings {
     fn default() -> Self {
         Self {
+            cancellation: None,
             execute_command: true,
             background_task: true,
             pty_interaction: false,
@@ -303,7 +306,7 @@ fn bounded_ai_command(command: &str, timeout_seconds: u32) -> String {
     let timeout_seconds = timeout_seconds.max(5);
     let quoted = shell_quote(command);
     format!(
-        "if command -v timeout >/dev/null 2>&1; then timeout --signal=TERM {timeout_seconds}s sh -lc {quoted}; else sh -lc {quoted}; fi"
+        "if command -v timeout >/dev/null 2>&1; then timeout --kill-after=5s --signal=TERM {timeout_seconds}s sh -lc {quoted}; else sh -lc {quoted}; fi"
     )
 }
 
@@ -312,11 +315,37 @@ async fn run_ai_command(
     command: String,
     settings: &AiToolSettings,
 ) -> Result<CommandResult, String> {
+    use super::super::command::{self, CancelOnDrop, CommandControl};
+    if settings
+        .cancellation
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return Err(super::AI_RUN_CANCELLED.to_string());
+    }
     let server = server.clone();
     let command = bounded_ai_command(&command, settings.command_timeout_seconds);
-    tauri::async_runtime::spawn_blocking(move || run_command_sync(&server, &command))
-        .await
-        .map_err(|error| format!("AI 工具任务失败: {error}"))?
+    let control = std::sync::Arc::new(CommandControl::new(
+        std::time::Duration::from_secs(u64::from(settings.command_timeout_seconds.clamp(5, 3600))),
+        settings
+            .max_output_chars
+            .clamp(1024, 2_000_000)
+            .saturating_mul(4),
+    ));
+    let guard = CancelOnDrop(control.clone());
+    let task =
+        tauri::async_runtime::spawn_blocking(move || command::run(&server, &command, &control));
+    let result = if let Some(mut cancellation) = settings.cancellation.clone() {
+        tokio::select! {
+            result = task => result.map_err(|error| format!("AI 工具任务失败: {error}"))?,
+            _ = super::wait_for_cancellation(&mut cancellation) => Err(super::AI_RUN_CANCELLED.to_string()),
+        }
+    } else {
+        task.await
+            .map_err(|error| format!("AI 工具任务失败: {error}"))?
+    };
+    drop(guard);
+    result
 }
 
 fn json_command_result<T: Serialize>(value: &T) -> CommandResult {
@@ -814,8 +843,11 @@ async fn execute_tool(
 pub(super) fn build_dynamic_tools(
     server: &ServerProfile,
     settings: &AiToolSettings,
+    cancellation: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<DynamicTool> {
-    tool_definitions(settings)
+    let mut settings = settings.clone();
+    settings.cancellation = Some(cancellation);
+    tool_definitions(&settings)
         .into_iter()
         .filter_map(|definition| {
             let function = definition.get("function")?;
@@ -882,6 +914,9 @@ pub(super) fn tool_permission(
 }
 
 pub(super) fn approval_reason(name: &str, arguments: &Value) -> Option<String> {
+    if matches!(name, "read_file" | "log_analyzer") {
+        return Some("读取远端文件或日志并发送给 AI 服务，需要确认读取范围".to_string());
+    }
     if ai_tool_is_mutating(name, arguments) {
         return Some("该工具可修改远端或本机状态，需要按当前策略审批".to_string());
     }
@@ -981,15 +1016,24 @@ mod tests {
                 tool_permission(&settings, policy, "systemd_control", &arguments),
                 ToolPermission::Ask(_)
             ));
-            assert_eq!(
+            assert!(matches!(
                 tool_permission(
                     &settings,
                     policy,
                     "read_file",
                     &json!({"path": "/etc/os-release"})
                 ),
-                ToolPermission::Allow
-            );
+                ToolPermission::Ask(_)
+            ));
+            assert!(matches!(
+                tool_permission(
+                    &settings,
+                    policy,
+                    "log_analyzer",
+                    &json!({"path": "/root/.ssh/id_ed25519"})
+                ),
+                ToolPermission::Ask(_)
+            ));
         }
     }
 

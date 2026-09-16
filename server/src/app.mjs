@@ -303,6 +303,9 @@ export function createSyncServer({
   if (typeof tokenSecret !== "string" || Buffer.byteLength(tokenSecret) < 32) {
     throw new Error("SSHSTAR_SYNC_TOKEN_SECRET 必须至少包含 32 字节");
   }
+  if (tokenSecret.trim() === "replace-with-at-least-32-random-bytes") {
+    throw new Error("PORTICO_SYNC_TOKEN_SECRET 不能使用示例占位值，请生成随机密钥");
+  }
   if (!Number.isInteger(tokenTtlSeconds) || tokenTtlSeconds <= 0) {
     throw new Error("tokenTtlSeconds 必须是正整数");
   }

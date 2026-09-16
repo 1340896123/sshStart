@@ -23,11 +23,16 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
   const terminalRef = useRef<Terminal>();
   const fitRef = useRef<FitAddon>();
   const inputBuffer = useRef("");
+  const generationRef = useRef<string>();
+  const closedGenerations = useRef(new Map<string, string>());
+  const reconnectingRef = useRef(false);
+  const mountedRef = useRef(false);
   const [status, setStatus] = useState<"connecting" | "connected" | "failed">("connecting");
   const [error, setError] = useState("");
 
   useEffect(() => {
     if (!hostRef.current || terminalRef.current) return;
+    mountedRef.current = true;
 
     const terminal = new Terminal({
       cursorBlink: true,
@@ -69,6 +74,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
     fitRef.current = fit;
 
     let unlisten: UnlistenFn | undefined;
+    let unlistenClosed: UnlistenFn | undefined;
     let disposed = false;
     let inputCount = 0;
     let inputBytes = 0;
@@ -106,6 +112,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
 
       try {
         unlisten = await listen<string>(`terminal-output-${session.id}`, (event) => {
+          if (disposed) return;
           outputChunks += 1;
           outputBytes += event.payload.length;
           if (outputChunks <= 3 || outputChunks % 100 === 0) {
@@ -126,8 +133,18 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
             });
           }
         });
+        if (disposed) { unlisten(); return; }
+        unlistenClosed = await listen<{ generation: string; error?: string }>(`terminal-closed-${session.id}`, ({ payload }) => {
+          if (disposed) return;
+          closedGenerations.current.set(payload.generation, payload.error || "终端连接已关闭");
+          if (generationRef.current !== payload.generation) return;
+          setStatus("failed");
+          setError(payload.error || "终端连接已关闭");
+          onUpdate({ connected: false, terminalStarted: false });
+        });
+        if (disposed) { unlisten(); unlistenClosed(); return; }
         diagnosticLog("info", "terminal.output_listener.ready", { sessionId: session.id });
-        await invoke("start_terminal", {
+        const generation = await invoke<string>("start_terminal", {
           sessionId: session.id,
           server,
           cols: terminal.cols,
@@ -139,10 +156,14 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
           rows: terminal.rows,
         });
         if (!disposed) {
+          generationRef.current = generation;
+          const closed = closedGenerations.current.get(generation);
+          if (closed) throw new Error(closed);
           setStatus("connected");
           onUpdate({ connected: true, terminalStarted: true });
         }
       } catch (reason) {
+        if (disposed) return;
         const message = String(reason);
         diagnosticError("terminal.frontend.start_failed", reason, { sessionId: session.id });
         terminal.writeln(`\r\n\x1b[31m连接失败: ${message}\x1b[0m`);
@@ -220,6 +241,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
 
     return () => {
       disposed = true;
+      mountedRef.current = false;
       diagnosticLog("info", "terminal.pane.unmounted", {
         sessionId: session.id,
         inputCount,
@@ -228,6 +250,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
         outputBytes,
       });
       unlisten?.();
+      unlistenClosed?.();
       observer.disconnect();
       dataDisposable.dispose();
       terminal.dispose();
@@ -243,25 +266,37 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
   }, [session.id]);
 
   const reconnect = async () => {
-    if (!isTauri()) return;
+    if (!isTauri() || reconnectingRef.current || !mountedRef.current) return;
+    reconnectingRef.current = true;
     diagnosticLog("info", "terminal.reconnect.begin", { sessionId: session.id });
     setStatus("connecting");
     setError("");
+    onUpdate({ connected: false });
+    generationRef.current = undefined;
+    closedGenerations.current.clear();
     try {
       await invoke("stop_terminal", { sessionId: session.id });
-      await invoke("start_terminal", {
+      if (!mountedRef.current) return;
+      const generation = await invoke<string>("start_terminal", {
         sessionId: session.id,
         server,
         cols: terminalRef.current?.cols ?? 100,
         rows: terminalRef.current?.rows ?? 30,
       });
+      if (!mountedRef.current) return;
+      generationRef.current = generation;
+      const closed = closedGenerations.current.get(generation);
+      if (closed) throw new Error(closed);
       setStatus("connected");
       onUpdate({ connected: true });
       diagnosticLog("info", "terminal.reconnect.completed", { sessionId: session.id });
     } catch (reason) {
+      if (!mountedRef.current) return;
       diagnosticError("terminal.reconnect.failed", reason, { sessionId: session.id });
       setError(String(reason));
       setStatus("failed");
+    } finally {
+      reconnectingRef.current = false;
     }
   };
 
@@ -275,7 +310,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
         </div>
         <span className="header-spacer" />
         <button className="icon-button quiet" title="复制选中内容" onClick={() => navigator.clipboard.writeText(terminalRef.current?.getSelection() ?? "")}><Copy size={13} /></button>
-        <button className="icon-button quiet" title="重新连接" onClick={() => void reconnect()}><RotateCcw size={13} /></button>
+        <button className="icon-button quiet" title="重新连接" disabled={status === "connecting"} onClick={() => void reconnect()}><RotateCcw size={13} /></button>
         <button className="icon-button quiet" title="最大化终端"><Maximize2 size={13} /></button>
       </div>
       {error && <div className="inline-error"><span>{error}</span><button onClick={() => void reconnect()}>重试</button></div>}

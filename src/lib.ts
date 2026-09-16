@@ -16,6 +16,13 @@ export const formatBytes = (size: number) => {
 export const connectionLabel = (server: ServerProfile) =>
   `${server.username}@${server.host}:${server.port}`;
 
+export const connectionIdentity = (server: ServerProfile) => JSON.stringify([
+  server.id, server.host, server.port, server.username, server.authType,
+  server.privateKeyPath, server.password, server.passphrase,
+  server.jumpHost?.enabled ? [server.jumpHost.host, server.jumpHost.port, server.jumpHost.username,
+    server.jumpHost.authType, server.jumpHost.privateKeyPath, server.jumpHost.password, server.jumpHost.passphrase] : null,
+]);
+
 export const parentPath = (path: string) => {
   if (path === "/") return "/";
   const clean = path.replace(/\/$/, "");

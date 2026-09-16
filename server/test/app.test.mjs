@@ -8,6 +8,11 @@ import { createSyncServer } from "../src/app.mjs";
 
 const TEST_SECRET = "sshstar-sync-test-secret-that-is-long-enough";
 
+test("rejects the predictable deployment placeholder before opening a database", () => {
+  assert.throws(() => createSyncServer({ databasePath: ":memory:", tokenSecret: "replace-with-at-least-32-random-bytes" }), /占位值/);
+  assert.throws(() => createSyncServer({ databasePath: ":memory:", tokenSecret: "" }), /32/);
+});
+
 async function startFixture(options = {}) {
   const directory = await mkdtemp(join(tmpdir(), "sshstar-sync-"));
   const databasePath = join(directory, "sync.sqlite");

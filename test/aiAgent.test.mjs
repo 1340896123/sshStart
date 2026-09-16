@@ -75,6 +75,16 @@ const approval = {
   type: "approval_required", approvalId: "approval-1", actionId: "action-1", tool: "execute_command",
   command: "systemctl restart app", arguments: { command: "systemctl restart app" }, reason: "变更状态",
 };
+
+test("manual approval sends only the pending approval ID and decision, never executable arguments", async t => {
+  const h = await setup(t, "request");
+  await h.emit(approval);
+  await act(async () => { await h.agent().resolveApproval(h.latest().id, "approve"); });
+  const call = h.calls.find(call => call.command === "resolve_ai_approval");
+  assert.equal(call.args.approvalId, approval.approvalId);
+  assert.equal(call.args.decision, "approve");
+  assert.equal(Object.hasOwn(call.args, "arguments"), false);
+});
 const started = { ...approval, type: "tool_started", startedAt: 1 };
 
 test("full access is sent to the backend without frontend auto-approval", async (t) => {

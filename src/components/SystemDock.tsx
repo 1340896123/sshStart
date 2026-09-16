@@ -176,36 +176,68 @@ export function SystemDock({ server, filePane }: Props) {
   const [dockHeight, setDockHeight] = useState<number>();
   const resizeCleanupRef = useRef<() => void>();
 
+  const requestGeneration = useRef(0);
+  const currentView = useRef({ server, active });
+  currentView.current = { server, active };
+  useEffect(() => {
+    requestGeneration.current += 1;
+    setSystemInformation(undefined);
+    setProcesses([]);
+    setConnections([]);
+    setInterfaces([]);
+    setContainers([]);
+    setSelectedPid(undefined);
+    setSelectedContainerId(undefined);
+    setLoading(false);
+    setError("");
+    setNotice("");
+    return () => { requestGeneration.current += 1; };
+  }, [server]);
+
   const loadSystemInformation = useCallback(async (quiet = false) => {
+    if (currentView.current.server !== server || currentView.current.active !== "information") return;
+    const generation = ++requestGeneration.current;
+    const view = currentView.current.active;
+    const isCurrent = () => generation === requestGeneration.current && currentView.current.server === server && currentView.current.active === view;
     if (!quiet) setLoading(true);
     setError("");
     try {
       const value = isTauri()
         ? await invoke<SystemInformation>("get_system_information", { server })
         : DEMO_SYSTEM_INFORMATION;
+      if (!isCurrent()) return;
       setSystemInformation(value);
     } catch (reason) {
-      setError(String(reason));
+      if (isCurrent()) setError(String(reason));
     } finally {
-      if (!quiet) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [server]);
 
   const loadProcesses = useCallback(async (quiet = false) => {
+    if (currentView.current.server !== server || currentView.current.active !== "processes") return;
+    const generation = ++requestGeneration.current;
+    const view = currentView.current.active;
+    const isCurrent = () => generation === requestGeneration.current && currentView.current.server === server && currentView.current.active === view;
     if (!quiet) setLoading(true);
     setError("");
     try {
       const rows = isTauri() ? await invoke<ProcessInfo[]>("list_processes", { server }) : DEMO_PROCESSES;
+      if (!isCurrent()) return;
       setProcesses(rows);
       setSelectedPid((current) => current !== undefined && rows.some((row) => row.pid === current) ? current : undefined);
     } catch (reason) {
-      setError(String(reason));
+      if (isCurrent()) setError(String(reason));
     } finally {
-      if (!quiet) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [server]);
 
   const loadNetwork = useCallback(async (quiet = false) => {
+    if (currentView.current.server !== server || currentView.current.active !== "network") return;
+    const generation = ++requestGeneration.current;
+    const view = currentView.current.active;
+    const isCurrent = () => generation === requestGeneration.current && currentView.current.server === server && currentView.current.active === view;
     if (!quiet) setLoading(true);
     setError("");
     try {
@@ -215,26 +247,32 @@ export function SystemDock({ server, filePane }: Props) {
             invoke<NetworkInterface[]>("list_network_interfaces", { server }),
           ])
         : [DEMO_CONNECTIONS, DEMO_INTERFACES];
+      if (!isCurrent()) return;
       setConnections(nextConnections);
       setInterfaces(nextInterfaces);
     } catch (reason) {
-      setError(String(reason));
+      if (isCurrent()) setError(String(reason));
     } finally {
-      if (!quiet) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [server]);
 
   const loadContainers = useCallback(async (quiet = false) => {
+    if (currentView.current.server !== server || currentView.current.active !== "containers") return;
+    const generation = ++requestGeneration.current;
+    const view = currentView.current.active;
+    const isCurrent = () => generation === requestGeneration.current && currentView.current.server === server && currentView.current.active === view;
     if (!quiet) setLoading(true);
     setError("");
     try {
       const rows = isTauri() ? await invoke<ContainerInfo[]>("list_containers", { server }) : DEMO_CONTAINERS;
+      if (!isCurrent()) return;
       setContainers(rows);
       setSelectedContainerId((current) => current && rows.some((row) => row.id === current) ? current : undefined);
     } catch (reason) {
-      setError(String(reason));
+      if (isCurrent()) setError(String(reason));
     } finally {
-      if (!quiet) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [server]);
 
