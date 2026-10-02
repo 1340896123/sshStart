@@ -797,6 +797,7 @@ export function FilePane({ session, server, onUpdate, onTransfer }: Props) {
             <FileEditor
               key={tab.key}
               server={server}
+              sessionId={session.id}
               file={tab.file}
               active={tab.key === activeEditorKey}
               onDirtyChange={(dirty) => handleEditorDirtyChange(tab.key, dirty)}

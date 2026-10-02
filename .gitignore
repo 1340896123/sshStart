@@ -14,3 +14,4 @@ server/data/
 deploy/portico-sync.env
 .claude/
 .codegraph/
+__pycache__/

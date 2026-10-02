@@ -1,0 +1,2 @@
+paramiko>=3.5,<6
+selenium>=4.30,<5

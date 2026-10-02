@@ -16,7 +16,7 @@ registerHooks({
 
 let invokeHandler;
 globalThis.window = { __TAURI_INTERNALS__: {} };
-mock.module("@tauri-apps/api/core", { exports: { invoke: (...args) => invokeHandler(...args) } });
+mock.module("@tauri-apps/api/core", { namedExports: { invoke: (...args) => invokeHandler(...args) } });
 const { useCloudSyncStatus } = await import("../src/useCloudSyncStatus.ts");
 const serverA = "https://a.example.com";
 const serverB = "https://b.example.com";

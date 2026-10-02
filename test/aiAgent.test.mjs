@@ -16,8 +16,8 @@ registerHooks({
 
 let invokeHandler;
 let eventListener;
-mock.module("@tauri-apps/api/core", { exports: { invoke: (...args) => invokeHandler(...args) } });
-mock.module("@tauri-apps/api/event", { exports: {
+mock.module("@tauri-apps/api/core", { namedExports: { invoke: (...args) => invokeHandler(...args) } });
+mock.module("@tauri-apps/api/event", { namedExports: {
   listen: async (_name, handler) => { eventListener = handler; return () => {}; },
 } });
 const { useAiAgent } = await import("../src/ai/useAiAgent.ts");

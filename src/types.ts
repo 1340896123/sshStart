@@ -51,6 +51,8 @@ export interface RemoteFile {
 export interface RemoteFileRevision {
   size: number;
   modified?: number | null;
+  sha256: string;
+  resolvedPath: string;
 }
 
 export interface RemoteFileContent {

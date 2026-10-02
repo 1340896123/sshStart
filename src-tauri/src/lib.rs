@@ -15,7 +15,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Condvar, Mutex, OnceLock},
+    sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -74,10 +74,13 @@ struct LocalUploadManifest {
     skipped_entries: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemoteFileRevision {
     size: u64,
     modified: Option<u64>,
+    sha256: String,
+    resolved_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2309,7 +2312,7 @@ async fn upload_file_impl(
                 control.wait_until_running()?;
             }
             drop(target);
-            rename_overwrite(&sftp, Path::new(&temp_path), Path::new(&remote_path))
+            rename_overwrite(&session, &sftp, Path::new(&temp_path), Path::new(&remote_path))
         })();
         if result.is_err() {
             sftp.unlink(Path::new(&temp_path)).ok();
@@ -2580,22 +2583,91 @@ fn cancel_transfer(transfer_id: String, state: State<'_, TransferManager>) -> Re
 
 const MAX_EDITOR_FILE_SIZE: u64 = 20 * 1024 * 1024;
 
-fn remote_file_revision(
-    sftp: &ssh2::Sftp,
-    remote_path: &str,
-) -> Result<RemoteFileRevision, String> {
-    let stat = sftp
-        .stat(Path::new(remote_path))
+struct RemoteFileSnapshot {
+    bytes: Vec<u8>,
+    revision: RemoteFileRevision,
+    metadata: ssh2::FileStat,
+}
+
+fn editor_content_hash(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn editor_metadata_matches(left: &ssh2::FileStat, right: &ssh2::FileStat) -> bool {
+    left.size == right.size
+        && left.mtime == right.mtime
+        && left.perm == right.perm
+        && left.uid == right.uid
+        && left.gid == right.gid
+}
+
+fn read_remote_snapshot(sftp: &Sftp, remote_path: &str) -> Result<RemoteFileSnapshot, String> {
+    let resolved = sftp
+        .realpath(Path::new(remote_path))
+        .map_err(|error| format!("解析远程文件路径失败: {error}"))?;
+    let resolved_path = resolved
+        .to_str()
+        .ok_or_else(|| "远程文件路径不是有效的 UTF-8".to_string())?
+        .to_string();
+    let initial = sftp
+        .stat(&resolved)
         .map_err(|error| format!("读取远程文件版本失败: {error}"))?;
-    Ok(RemoteFileRevision {
-        size: stat.size.unwrap_or(0),
-        modified: stat.mtime,
+    if !initial.is_file() {
+        return Err("只能编辑普通文件或指向普通文件的符号链接".to_string());
+    }
+    if initial.size.unwrap_or(0) > MAX_EDITOR_FILE_SIZE {
+        return Err("文件超过编辑上限（20 MB）".to_string());
+    }
+    let mut source = sftp
+        .open(&resolved)
+        .map_err(|error| format!("打开远程文件失败: {error}"))?;
+    let mut bytes = Vec::new();
+    (&mut source)
+        .take(MAX_EDITOR_FILE_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取远程文件失败: {error}"))?;
+    if bytes.len() as u64 > MAX_EDITOR_FILE_SIZE {
+        return Err("文件超过编辑上限（20 MB）".to_string());
+    }
+    let downloaded = source
+        .stat()
+        .map_err(|error| format!("读取远程文件版本失败: {error}"))?;
+    source
+        .close()
+        .map_err(|error| format!("关闭远程文件失败: {error}"))?;
+    let current = sftp
+        .stat(&resolved)
+        .map_err(|error| format!("读取远程文件版本失败: {error}"))?;
+    let current_path = sftp
+        .realpath(Path::new(remote_path))
+        .map_err(|error| format!("解析远程文件路径失败: {error}"))?;
+    if !editor_metadata_matches(&initial, &downloaded)
+        || !editor_metadata_matches(&downloaded, &current)
+        || current_path != resolved
+        || downloaded.size != Some(bytes.len() as u64)
+    {
+        return Err("远程文件在读取期间发生变化，请重新打开".to_string());
+    }
+    let revision = RemoteFileRevision {
+        size: bytes.len() as u64,
+        modified: downloaded.mtime,
+        sha256: editor_content_hash(&bytes),
+        resolved_path,
+    };
+    Ok(RemoteFileSnapshot {
+        bytes,
+        revision,
+        metadata: downloaded,
     })
 }
 
 fn ensure_remote_revision(
-    expected: RemoteFileRevision,
-    current: RemoteFileRevision,
+    expected: &RemoteFileRevision,
+    current: &RemoteFileRevision,
 ) -> Result<(), String> {
     if current == expected {
         Ok(())
@@ -2621,31 +2693,10 @@ async fn read_remote_file(
         let sftp = session
             .sftp()
             .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
-        let initial_revision = remote_file_revision(&sftp, &remote_path)?;
-        if initial_revision.size > MAX_EDITOR_FILE_SIZE {
-            return Err(format!(
-                "文件超过编辑上限（{} MB）",
-                MAX_EDITOR_FILE_SIZE / 1024 / 1024
-            ));
-        }
-        let mut source = sftp
-            .open(Path::new(&remote_path))
-            .map_err(|error| format!("打开远程文件失败: {error}"))?;
-        let mut bytes = Vec::new();
-        source
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("读取远程文件失败: {error}"))?;
-        if bytes.len() as u64 > MAX_EDITOR_FILE_SIZE {
-            return Err(format!(
-                "文件超过编辑上限（{} MB）",
-                MAX_EDITOR_FILE_SIZE / 1024 / 1024
-            ));
-        }
-        let downloaded_revision = remote_file_revision(&sftp, &remote_path)?;
-        ensure_remote_revision(initial_revision, downloaded_revision)?;
+        let snapshot = read_remote_snapshot(&sftp, &remote_path)?;
         Ok(RemoteFileContent {
-            content: String::from_utf8_lossy(&bytes).into_owned(),
-            revision: downloaded_revision,
+            content: decode_editor_content(snapshot.bytes)?,
+            revision: snapshot.revision,
         })
     })
     .await
@@ -2654,22 +2705,134 @@ async fn read_remote_file(
 
 fn editor_remote_temp_path(remote_path: &str) -> Result<String, String> {
     let (parent, name) = remote_parent_and_name(remote_path)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let nonce = uuid::Uuid::new_v4();
     Ok(format!("{parent}/.{name}.portico-edit-{nonce}"))
 }
 
-fn rename_overwrite(sftp: &ssh2::Sftp, temp_path: &Path, remote_path: &Path) -> Result<(), String> {
-    if sftp.rename(temp_path, remote_path, Some(RenameFlags::OVERWRITE)).is_ok() {
+fn rename_overwrite(
+    session: &Session,
+    sftp: &Sftp,
+    temp_path: &Path,
+    remote_path: &Path,
+) -> Result<(), String> {
+    if sftp
+        .rename(
+            temp_path,
+            remote_path,
+            Some(RenameFlags::OVERWRITE | RenameFlags::ATOMIC | RenameFlags::NATIVE),
+        )
+        .is_ok()
+    {
         return Ok(());
     }
-    // 部分 SFTP 服务器不支持覆盖式（POSIX）rename，先删除目标再普通 rename。
-    sftp.unlink(remote_path)
-        .map_err(|error| format!("提交远程文件失败（无法覆盖已有文件）: {error}"))?;
-    sftp.rename(temp_path, remote_path, None)
+    // SFTP v3 cannot express overwrite. Both paths are in the same directory,
+    // so mv replaces the entry with rename; never unlink the original first.
+    let command = format!(
+        "mv -f -- {} {}",
+        shell_quote(&temp_path.to_string_lossy()),
+        shell_quote(&remote_path.to_string_lossy())
+    );
+    let mut channel = session
+        .channel_session()
+        .map_err(|error| format!("无法创建文件提交通道: {error}"))?;
+    channel
+        .exec(&command)
         .map_err(|error| format!("提交远程文件失败: {error}"))?;
+    let mut output = Vec::new();
+    channel
+        .read_to_end(&mut output)
+        .map_err(|error| format!("读取文件提交结果失败: {error}"))?;
+    let mut errors = String::new();
+    channel
+        .stderr()
+        .read_to_string(&mut errors)
+        .map_err(|error| format!("读取文件提交结果失败: {error}"))?;
+    channel
+        .wait_close()
+        .map_err(|error| format!("等待文件提交失败: {error}"))?;
+    if channel
+        .exit_status()
+        .map_err(|error| format!("读取文件提交状态失败: {error}"))?
+        == 0
+    {
+        Ok(())
+    } else {
+        Err(format!("提交远程文件失败，原文件已保留: {}", errors.trim()))
+    }
+}
+
+fn decode_editor_content(bytes: Vec<u8>) -> Result<String, String> {
+    let content = String::from_utf8(bytes)
+        .map_err(|_| "文件不是有效的 UTF-8 文本，请下载后使用支持原编码的编辑器打开".to_string())?;
+    if content.contains('\0') {
+        return Err("文件包含二进制内容，请下载后打开".to_string());
+    }
+    Ok(content)
+}
+
+fn editor_save_lock(server: &ServerProfile, path: &str) -> Result<Arc<Mutex<()>>, String> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+    let key = format!(
+        "{}:{}:{}:{}",
+        server.host, server.port, server.username, path
+    );
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "文件保存状态锁已损坏".to_string())?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = locks.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    });
+    Ok(lock)
+}
+
+fn preserve_editor_metadata(
+    target: &mut ssh2::File,
+    original: &ssh2::FileStat,
+) -> Result<(), String> {
+    let current = target
+        .stat()
+        .map_err(|error| format!("读取临时文件属性失败: {error}"))?;
+    let uid = original.uid.filter(|uid| Some(*uid) != current.uid);
+    let gid = original.gid.filter(|gid| Some(*gid) != current.gid);
+    if uid.is_some() || gid.is_some() {
+        target
+            .setstat(ssh2::FileStat {
+                uid,
+                gid,
+                size: None,
+                perm: None,
+                atime: None,
+                mtime: None,
+            })
+            .map_err(|error| format!("保留文件所有者和用户组失败，原文件未修改: {error}"))?;
+    }
+    let perm = original
+        .perm
+        .map(|perm| perm & 0o7777)
+        .ok_or_else(|| "服务器未提供文件权限，无法安全保存".to_string())?;
+    target
+        .setstat(ssh2::FileStat {
+            perm: Some(perm),
+            uid: None,
+            gid: None,
+            size: None,
+            atime: None,
+            mtime: None,
+        })
+        .map_err(|error| format!("保留文件权限失败，原文件未修改: {error}"))?;
+    let preserved = target
+        .stat()
+        .map_err(|error| format!("校验临时文件属性失败: {error}"))?;
+    if preserved.uid != original.uid
+        || preserved.gid != original.gid
+        || preserved.perm.map(|mode| mode & 0o7777) != Some(perm)
+    {
+        return Err("无法保留原文件属性，原文件未修改".to_string());
+    }
     Ok(())
 }
 
@@ -2678,42 +2841,60 @@ async fn write_remote_file(
     server: ServerProfile,
     remote_path: String,
     content: String,
+    expected_revision: RemoteFileRevision,
 ) -> Result<RemoteFileRevision, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        if content.len() as u64 > MAX_EDITOR_FILE_SIZE {
+            return Err("文件超过编辑上限（20 MB）".to_string());
+        }
+        let lock = editor_save_lock(&server, &expected_revision.resolved_path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| "文件保存状态锁已损坏".to_string())?;
         let session = connect_ssh(&server)?;
         let sftp = session
             .sftp()
             .map_err(|error| format!("SFTP 初始化失败: {error}"))?;
-        let temp_path = editor_remote_temp_path(&remote_path)?;
-        let original_permissions = sftp.stat(Path::new(&remote_path)).ok().and_then(|stat| stat.perm);
+        let original = read_remote_snapshot(&sftp, &remote_path)?;
+        ensure_remote_revision(&expected_revision, &original.revision)?;
+        let destination = original.revision.resolved_path.clone();
+        let temp_path = editor_remote_temp_path(&destination)?;
         let result = (|| -> Result<RemoteFileRevision, String> {
             let mut target = sftp
-                .create(Path::new(&temp_path))
+                .open_mode(
+                    Path::new(&temp_path),
+                    OpenFlags::WRITE | OpenFlags::EXCLUSIVE,
+                    0o600,
+                    OpenType::File,
+                )
                 .map_err(|error| format!("创建远程临时文件失败: {error}"))?;
             target
                 .write_all(content.as_bytes())
                 .map_err(|error| format!("写入远程文件失败: {error}"))?;
+            preserve_editor_metadata(&mut target, &original.metadata)?;
+            let committed = target
+                .stat()
+                .map_err(|error| format!("读取待提交文件版本失败: {error}"))?;
             target
-                .flush()
-                .map_err(|error| format!("提交远程文件失败: {error}"))?;
-            drop(target);
-            rename_overwrite(&sftp, Path::new(&temp_path), Path::new(&remote_path))?;
-            // 临时文件以默认权限创建，提交后恢复原文件的权限（如执行位），失败不影响保存结果。
-            if let Some(perm) = original_permissions {
-                sftp.setstat(
-                    Path::new(&remote_path),
-                    ssh2::FileStat {
-                        size: None,
-                        uid: None,
-                        gid: None,
-                        perm: Some(perm),
-                        atime: None,
-                        mtime: None,
-                    },
-                )
-                .ok();
+                .close()
+                .map_err(|error| format!("关闭待提交文件失败，原文件未修改: {error}"))?;
+            let current = read_remote_snapshot(&sftp, &remote_path)?;
+            ensure_remote_revision(&expected_revision, &current.revision)?;
+            if !editor_metadata_matches(&original.metadata, &current.metadata) {
+                return Err("远程文件属性在编辑期间发生变化，请重新打开后再保存".to_string());
             }
-            remote_file_revision(&sftp, &remote_path)
+            rename_overwrite(
+                &session,
+                &sftp,
+                Path::new(&temp_path),
+                Path::new(&destination),
+            )?;
+            Ok(RemoteFileRevision {
+                size: content.len() as u64,
+                modified: committed.mtime,
+                sha256: editor_content_hash(content.as_bytes()),
+                resolved_path: destination.clone(),
+            })
         })();
         if result.is_err() {
             sftp.unlink(Path::new(&temp_path)).ok();
@@ -3179,17 +3360,31 @@ mod tests {
         let expected = RemoteFileRevision {
             size: 12,
             modified: Some(100),
+            sha256: "original".to_string(),
+            resolved_path: "/config.txt".to_string(),
         };
-        assert!(ensure_remote_revision(expected, expected).is_ok());
+        assert!(ensure_remote_revision(&expected, &expected).is_ok());
         let error = ensure_remote_revision(
-            expected,
-            RemoteFileRevision {
+            &expected,
+            &RemoteFileRevision {
                 size: 13,
                 modified: Some(101),
+                ..expected.clone()
             },
         )
         .unwrap_err();
         assert!(error.contains("编辑期间发生变化"));
+        let changed = RemoteFileRevision { sha256: "same-size-new-content".to_string(), ..expected.clone() };
+        assert!(ensure_remote_revision(&expected, &changed).is_err());
+        let retargeted = RemoteFileRevision { resolved_path: "/other.txt".to_string(), ..expected.clone() };
+        assert!(ensure_remote_revision(&expected, &retargeted).is_err());
+    }
+
+    #[test]
+    fn rejects_non_utf8_and_binary_editor_content() {
+        assert!(super::decode_editor_content(vec![0xd6, 0xd0, 0xce, 0xc4]).is_err());
+        assert!(super::decode_editor_content(b"binary\0data".to_vec()).is_err());
+        assert_eq!(super::decode_editor_content("\u{feff}中文\r\n".as_bytes().to_vec()).unwrap(), "\u{feff}中文\r\n");
     }
 
     #[test]

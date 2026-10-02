@@ -1,0 +1,8 @@
+{
+  "identifier": "com.portico.ssh.e2e",
+  "build": { "devUrl": "http://127.0.0.1:1420/test/e2e/file-editor.html" },
+  "app": {
+    "windows": [{ "label": "main", "title": "Portico SSH 保存链路 E2E", "width": 1440, "height": 900 }],
+    "security": { "devCsp": null }
+  }
+}

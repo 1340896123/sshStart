@@ -3,10 +3,11 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { invoke } from "@tauri-apps/api/core";
 import { CheckCircle2, CircleAlert, LoaderCircle, Save } from "lucide-react";
 import { isTauri } from "../lib";
-import type { RemoteFile, RemoteFileContent, ServerProfile } from "../types";
+import type { RemoteFile, RemoteFileContent, RemoteFileRevision, ServerProfile } from "../types";
 
 interface Props {
   server: ServerProfile;
+  sessionId: string;
   file: RemoteFile;
   active: boolean;
   onDirtyChange: (dirty: boolean) => void;
@@ -15,7 +16,7 @@ interface Props {
 
 type SaveStatus = { kind: "ok" | "error"; message: string };
 
-export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Props) {
+export function FileEditor({ server, sessionId, file, active, onDirtyChange, onSaved }: Props) {
   const [content, setContent] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -23,6 +24,18 @@ export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Pro
   const [dirty, setDirty] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>();
   const dirtyRef = useRef(false);
+  const contentRef = useRef<string>();
+  const revisionRef = useRef<RemoteFileRevision>();
+  const bomRef = useRef(false);
+  const editVersionRef = useRef(0);
+  const savingRef = useRef(false);
+  const mountedRef = useRef(true);
+  // An open document belongs to the connection it was opened with. Metadata edits
+  // must neither reload its buffer nor silently redirect its next save.
+  const connectionRef = useRef(server);
+  const callbacksRef = useRef({ onDirtyChange, onSaved });
+  callbacksRef.current = { onDirtyChange, onSaved };
+  const modelPath = `portico://remote/${encodeURIComponent(server.id)}/${encodeURIComponent(sessionId)}${file.path.split("/").map(encodeURIComponent).join("/")}`;
   // onMount 只触发一次，addCommand 的闭包会随之固化；用 ref 转发最新的 save，确保 Ctrl+S 永远保存当前内容。
   const saveRef = useRef<() => Promise<void>>(async () => undefined);
 
@@ -30,8 +43,13 @@ export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Pro
     if (dirtyRef.current) return;
     dirtyRef.current = true;
     setDirty(true);
-    onDirtyChange(true);
-  }, [onDirtyChange]);
+    callbacksRef.current.onDirtyChange(true);
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -40,8 +58,11 @@ export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Pro
       setError("");
       try {
         if (!isTauri()) throw new Error("文件编辑仅在桌面应用中可用");
-        const data = await invoke<RemoteFileContent>("read_remote_file", { server, remotePath: file.path });
+        const data = await invoke<RemoteFileContent>("read_remote_file", { server: connectionRef.current, remotePath: file.path });
         if (disposed) return;
+        contentRef.current = data.content;
+        revisionRef.current = data.revision;
+        bomRef.current = data.content.startsWith("\uFEFF");
         setContent(data.content);
       } catch (reason) {
         if (!disposed) setError(String(reason));
@@ -53,34 +74,48 @@ export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Pro
     return () => {
       disposed = true;
     };
-  }, [file.path, server]);
+  }, [file.path]);
 
   const save = useCallback(async () => {
-    if (!isTauri() || content === undefined || saving) return;
+    if (!isTauri() || contentRef.current === undefined || !revisionRef.current || savingRef.current || !dirtyRef.current) return;
+    savingRef.current = true;
+    const submittedVersion = editVersionRef.current;
+    const submittedContent = contentRef.current;
     setSaving(true);
     setSaveStatus(undefined);
     try {
-      await invoke("write_remote_file", {
-        server,
+      const revision = await invoke<RemoteFileRevision>("write_remote_file", {
+        server: connectionRef.current,
         remotePath: file.path,
-        content,
+        content: submittedContent,
+        expectedRevision: revisionRef.current,
       });
-      dirtyRef.current = false;
-      setDirty(false);
-      onDirtyChange(false);
+      if (!mountedRef.current) return;
+      revisionRef.current = revision;
+      const unchanged = editVersionRef.current === submittedVersion;
+      if (unchanged) {
+        dirtyRef.current = false;
+        setDirty(false);
+        callbacksRef.current.onDirtyChange(false);
+      }
       const time = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
-      setSaveStatus({ kind: "ok", message: `已保存 ${time}` });
-      onSaved();
+      setSaveStatus({ kind: "ok", message: unchanged ? `已保存 ${time}` : `已保存提交版本 ${time}，后续修改未保存` });
+      callbacksRef.current.onSaved();
     } catch (reason) {
-      setSaveStatus({ kind: "error", message: String(reason) });
+      if (mountedRef.current) setSaveStatus({ kind: "error", message: String(reason) });
     } finally {
-      setSaving(false);
+      savingRef.current = false;
+      if (mountedRef.current) setSaving(false);
     }
-  }, [content, file.path, onDirtyChange, onSaved, saving, server]);
+  }, [file.path]);
   saveRef.current = save;
 
   const handleChange = useCallback((value?: string) => {
-    setContent(value ?? "");
+    const next = value ?? "";
+    contentRef.current = bomRef.current && !next.startsWith("\uFEFF") ? `\uFEFF${next}` : next;
+    editVersionRef.current++;
+    setContent(next);
+    setSaveStatus(undefined);
     markDirty();
   }, [markDirty]);
 
@@ -121,7 +156,7 @@ export function FileEditor({ server, file, active, onDirtyChange, onSaved }: Pro
           </div>
         ) : (
           <Editor
-            path={file.path}
+            path={modelPath}
             theme="portico"
             value={content}
             onChange={handleChange}

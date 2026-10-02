@@ -8,6 +8,8 @@
     "build": "tsc && vite build",
     "test:sync": "node --experimental-test-module-mocks --test test/cloudSync*.test.mjs",
     "test:ai": "node --experimental-test-module-mocks --test test/ai*.test.mjs",
+    "test:files": "node --experimental-test-module-mocks --test test/fileEditor.test.mjs",
+    "test:e2e:files": "python test/e2e/file_editor_e2e.py",
     "preview": "vite preview",
     "sync-server": "npm --prefix server start",
     "sync-server:test": "npm --prefix server test",
