@@ -289,7 +289,7 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
           {toolCall.output
             ? <pre>{toolCall.output}</pre>
             : running
-              ? <pre>Rig Agent 正在执行…</pre>
+              ? <pre>助手正在执行…</pre>
               : stopped
                 ? <pre>工具调用已拒绝</pre>
                 : failed
@@ -587,8 +587,8 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
       <div className="ai-header">
         <div className="pane-title">
           <Sparkles size={14} />
-          <span>Rig Agent</span>
-          <small>{config.model} · {config.apiMode === "responses" ? "Responses" : "Chat Completions"}</small>
+          <span>AI 助手</span>
+          <small title={config.model}>{config.model}</small>
         </div>
         <span className="header-spacer" />
         <button className="icon-button quiet" title="新建会话" aria-label="新建会话" onClick={startNewConversation}>
@@ -614,12 +614,13 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             />
           )}
         </div>
-        <button className="icon-button quiet" title="Agent 设置" onClick={onOpenSettings}>
+        <button className="icon-button quiet" title="助手设置" aria-label="助手设置" onClick={onOpenSettings}>
           <Settings2 size={14} />
         </button>
         <button
           className="icon-button quiet"
           title="关闭助手"
+          aria-label="关闭助手"
           onClick={() => document.querySelector<HTMLButtonElement>('.activity-button[title="AI 助手"]')?.click()}
         >
           <X size={14} />
@@ -641,8 +642,8 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
         {session.aiMessages.length === 0 && (
           <div className="ai-welcome">
             <div className="ai-mark"><Bot size={20} /></div>
-            <h3>让 Agent 处理服务器任务</h3>
-            <p>Rig 负责模型、多轮工具和运行生命周期；变更型动作仍由你最终批准。</p>
+            <h3>从当前服务器开始</h3>
+            <p>分析运行状态、检查服务日志，或整理远程文件。</p>
             <div className="starter-list">
               {STARTERS.map((starter) => (
                 <button key={starter} onClick={() => void send(starter)}>
@@ -666,7 +667,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             >
               <div className="message-meta">
                 {message.role === "user" ? <User size={12} /> : <Bot size={12} />}
-                <span>{message.role === "user" ? "你" : "Portico Rig"}</span>
+                <span>{message.role === "user" ? "你" : "Portico AI"}</span>
                 <span>{MESSAGE_TYPE_LABELS[message.messageType]}</span>
                 <span className={`message-status ${message.status}`}>
                   {ACTION_STATUS_LABELS[message.status]}
@@ -737,14 +738,14 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                 && (message.status === "started" || message.status === "running") && (
                   <div className="thinking-progress">
                     <span className="thinking-pulse" />
-                    <span>Rig Agent 正在规划下一步</span>
+                    <span>助手正在规划下一步</span>
                   </div>
                 )}
               {message.approval && message.approvalState === "pending" && (
                 <div className="approval-call">
                   <div className="approval-call-heading">
                     <ShieldAlert size={14} />
-                    <span>Agent 请求执行</span>
+                    <span>助手请求执行</span>
                     <small>{approvalResolving
                       ? approvalPolicy === "reviewer" ? "审核模型评估中" : "正在自动放行"
                       : message.approvalNote ? "需要人工处理" : "等待人工审批"}</small>
@@ -778,7 +779,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                 </div>
               )}
               {message.approvalState === "approved" && (
-                <div className="approval-dismissed"><Check size={12} />{message.approvalNote || "已批准，Agent 正在继续"}</div>
+                <div className="approval-dismissed"><Check size={12} />{message.approvalNote || "已批准，助手正在继续"}</div>
               )}
               {message.approvalState === "rejected" && (
                 <div className="approval-dismissed"><X size={12} />{message.approvalNote || "已拒绝该工具调用"}</div>
@@ -804,7 +805,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           >
             <span />
           </button>
-          <span>启用 Agent 工具</span>
+          <span>允许使用工具</span>
           <div className="token-usage-control">
             <button
               className={`token-usage-button ${tokenUsage.available ? "has-data" : ""}`}
@@ -832,19 +833,19 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                   <div className="token-cache-summary">
                     <span>最近上下文</span>
                     <strong>{formatTokenCount(tokenUsage.contextTokens, true)}</strong>
-                    <small>由 Rig usage 汇总</small>
+                    <small>当前会话的模型用量</small>
                   </div>
                 </>
               ) : (
                 <div className="token-usage-empty">
                   <CircleGauge size={17} strokeWidth={1.6} />
-                  <strong>暂无 usage 数据</strong>
-                  <span>完成一次 Agent 运行后更新</span>
+                  <strong>暂无用量数据</strong>
+                  <span>完成一次助手运行后更新</span>
                 </div>
               )}
             </div>
           </div>
-          <small>{allowTools ? "Rig 自动编排" : "仅对话"}</small>
+          <small>{allowTools ? "自动分析与执行" : "仅对话"}</small>
         </div>
         <div className="ai-composer">
           {attachments.length > 0 && (
@@ -901,7 +902,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
                 void send();
               }
             }}
-            placeholder="描述目标，Rig Agent 会规划并选择工具"
+            placeholder="描述问题或任务，助手会结合当前会话分析"
           />
           <div className="composer-footer">
             <label
@@ -923,7 +924,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             </label>
             {pasteNotice && <span className="composer-status">{pasteNotice}</span>}
             {agent.running ? (
-              <button className="send-button stop" title="停止 Agent" onClick={() => void agent.cancel()}>
+              <button className="send-button stop" title="停止助手" aria-label="停止助手" onClick={() => void agent.cancel()}>
                 <CircleStop size={15} />
               </button>
             ) : (

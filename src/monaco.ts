@@ -16,30 +16,36 @@ self.MonacoEnvironment = {
   },
 };
 
-monaco.editor.defineTheme("portico", {
-  base: "vs",
-  inherit: true,
-  rules: [],
-  colors: {
-    "editor.background": "#fcfdfc",
-    "editor.foreground": "#17201e",
-    "editorLineNumber.foreground": "#a6afac",
-    "editorLineNumber.activeForeground": "#17201e",
-    "editorCursor.foreground": "#1c6f60",
-    "editor.selectionBackground": "#b5ded4",
-    "editor.inactiveSelectionBackground": "#d9ece7",
-    "editor.lineHighlightBackground": "#f0f4f3",
-    "editorIndentGuide.background": "#e6ecea",
-    "editorIndentGuide.activeBackground": "#cdd5d2",
-    "editorWidget.background": "#ffffff",
-    "editorWidget.border": "#dfe4e2",
-    "editorSuggestWidget.selectedBackground": "#d9ece7",
-    "editorOverviewRuler.border": "#dfe4e2",
-    "scrollbarSlider.background": "#c9d2cf",
-    "scrollbarSlider.hoverBackground": "#aeb9b5",
-    "scrollbarSlider.activeBackground": "#93a09b",
-  },
-});
+// Read the workspace tokens just before an editor mounts, after CSS has loaded.
+export function definePorticoEditorTheme() {
+  const tokens = getComputedStyle(document.documentElement);
+  const color = (name: string) => tokens.getPropertyValue(name).trim();
+
+  monaco.editor.defineTheme("portico", {
+    base: "vs",
+    inherit: true,
+    rules: [],
+    colors: {
+      "editor.background": color("--surface-raised"),
+      "editor.foreground": color("--fg"),
+      "editorLineNumber.foreground": color("--muted-2"),
+      "editorLineNumber.activeForeground": color("--fg"),
+      "editorCursor.foreground": color("--accent"),
+      "editor.selectionBackground": color("--editor-selection"),
+      "editor.inactiveSelectionBackground": color("--editor-selection-inactive"),
+      "editor.lineHighlightBackground": color("--surface"),
+      "editorIndentGuide.background1": color("--border"),
+      "editorIndentGuide.activeBackground1": color("--border-strong"),
+      "editorWidget.background": color("--surface-raised"),
+      "editorWidget.border": color("--border"),
+      "editorSuggestWidget.selectedBackground": color("--accent-soft"),
+      "editorOverviewRuler.border": color("--border"),
+      "scrollbarSlider.background": color("--border-strong"),
+      "scrollbarSlider.hoverBackground": color("--muted-2"),
+      "scrollbarSlider.activeBackground": color("--muted"),
+    },
+  });
+}
 
 loader.config({ monaco });
 

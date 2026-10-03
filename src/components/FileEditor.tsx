@@ -3,6 +3,7 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { invoke } from "@tauri-apps/api/core";
 import { CheckCircle2, CircleAlert, LoaderCircle, Save } from "lucide-react";
 import { isTauri } from "../lib";
+import { definePorticoEditorTheme } from "../monaco";
 import type { RemoteFile, RemoteFileContent, RemoteFileRevision, ServerProfile } from "../types";
 
 interface Props {
@@ -158,6 +159,7 @@ export function FileEditor({ server, sessionId, file, active, onDirtyChange, onS
           <Editor
             path={modelPath}
             theme="portico"
+            beforeMount={definePorticoEditorTheme}
             value={content}
             onChange={handleChange}
             onMount={handleMount}

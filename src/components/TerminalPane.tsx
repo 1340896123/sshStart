@@ -32,16 +32,34 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
     const terminal = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
-      fontFamily: "'JetBrains Mono', 'Cascadia Code', Consolas, monospace",
+      fontFamily: cssVariable("--font-mono", "'Cascadia Code', Consolas, monospace"),
       fontSize: 13,
-      lineHeight: 1.42,
+      lineHeight: 1.5,
       scrollback: 5000,
       allowProposedApi: false,
       theme: {
-        background: cssVariable("--terminal-bg", "rgb(248, 250, 249)"),
-        foreground: cssVariable("--terminal-fg", "rgb(32, 38, 36)"),
-        cursor: cssVariable("--accent", "rgb(28, 111, 96)"),
-        selectionBackground: cssVariable("--accent-soft", "rgba(28, 111, 96, .16)"),
+        background: cssVariable("--terminal-bg", "#181c24"),
+        foreground: cssVariable("--terminal-fg", "#dae2ee"),
+        cursor: cssVariable("--terminal-cursor", "#97b7ff"),
+        cursorAccent: cssVariable("--terminal-bg", "#181c24"),
+        selectionBackground: cssVariable("--terminal-selection", "#35476a"),
+        selectionForeground: cssVariable("--terminal-fg", "#dae2ee"),
+        black: cssVariable("--terminal-black", "#242b37"),
+        red: cssVariable("--terminal-red", "#f0979d"),
+        green: cssVariable("--terminal-green", "#95d5b2"),
+        yellow: cssVariable("--terminal-yellow", "#e8c887"),
+        blue: cssVariable("--terminal-blue", "#97b7ff"),
+        magenta: cssVariable("--terminal-magenta", "#c6a6ed"),
+        cyan: cssVariable("--terminal-cyan", "#8bd4df"),
+        white: cssVariable("--terminal-white", "#dae2ee"),
+        brightBlack: cssVariable("--terminal-bright-black", "#a0aabd"),
+        brightRed: cssVariable("--terminal-bright-red", "#ffb3b8"),
+        brightGreen: cssVariable("--terminal-bright-green", "#b4e7cd"),
+        brightYellow: cssVariable("--terminal-bright-yellow", "#f3dfa5"),
+        brightBlue: cssVariable("--terminal-bright-blue", "#bbceff"),
+        brightMagenta: cssVariable("--terminal-bright-magenta", "#debeff"),
+        brightCyan: cssVariable("--terminal-bright-cyan", "#b0e6ee"),
+        brightWhite: cssVariable("--terminal-bright-white", "#f0f4fc"),
       },
     });
     const fit = new FitAddon();
@@ -72,15 +90,15 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
         lastCols = terminal.cols;
         lastRows = terminal.rows;
         diagnosticLog("debug", "terminal.frontend.fitted", { sessionId: session.id, cols: lastCols, rows: lastRows });
-        terminal.writeln(`\x1b[38;2;96;108;104mPortico · ${server.username}@${server.host}\x1b[0m`);
+        terminal.writeln(`\x1b[90mPortico · ${server.username}@${server.host}\x1b[0m`);
       } catch (reason) {
         diagnosticError("terminal.frontend.setup_failed", reason, { sessionId: session.id });
         throw reason;
       }
       if (!isTauri()) {
-        terminal.writeln("\x1b[38;2;28;111;96m✓ Browser preview connected\x1b[0m");
+        terminal.writeln("\x1b[32m✓ Browser preview connected\x1b[0m");
         terminal.writeln("Type a command to explore the terminal interaction.\r\n");
-        terminal.write(`\x1b[1m${server.username}@${server.name.toLowerCase().replace(/\s+/g, "-")}\x1b[0m:\x1b[38;2;28;111;96m~\x1b[0m$ `);
+        terminal.write(`\x1b[1m${server.username}@${server.name.toLowerCase().replace(/\s+/g, "-")}\x1b[0m:\x1b[34m~\x1b[0m$ `);
         setStatus("connected");
         onUpdate({ connected: true, terminalStarted: true });
         return;
@@ -159,7 +177,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
         else if (command === "pwd") terminal.writeln(`/home/${server.username}`);
         else if (command) terminal.writeln(`preview: ${command}`);
         inputBuffer.current = "";
-        terminal.write(`\x1b[1m${server.username}@${server.name.toLowerCase().replace(/\s+/g, "-")}\x1b[0m:\x1b[38;2;28;111;96m~\x1b[0m$ `);
+        terminal.write(`\x1b[1m${server.username}@${server.name.toLowerCase().replace(/\s+/g, "-")}\x1b[0m:\x1b[34m~\x1b[0m$ `);
       } else if (data === "\u007f") {
         if (inputBuffer.current.length) {
           inputBuffer.current = inputBuffer.current.slice(0, -1);
@@ -250,7 +268,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
   return (
     <div className="pane terminal-pane">
       <div className="pane-header">
-        <div className="pane-title"><SquareTerminal size={14} /><span>终端</span><small>zsh</small></div>
+        <div className="pane-title"><SquareTerminal size={14} /><span>终端</span><small>SSH</small></div>
         <div className={`terminal-status ${status}`}>
           {status === "connected" ? <Wifi size={12} /> : <WifiOff size={12} />}
           <span>{status === "connecting" ? "连接中" : status === "connected" ? "已连接" : "连接失败"}</span>

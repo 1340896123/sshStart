@@ -1137,11 +1137,20 @@ export default function App() {
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand-lockup">
           <div className="brand-mark"><Command size={14} /></div>
-          <span>Portico</span>
+          <span>Portico SSH</span>
         </div>
         <div className="titlebar-status">
-          <span className="environment-dot" />
-          <span>{isTauri() ? "Native core ready" : "Browser preview"}</span>
+          <span className={`connection-indicator ${activeSession?.connected ? "online" : ""}`} />
+          <span className="titlebar-breadcrumb">
+            {activeServer ? (
+              <>
+                <span>{activeServer.group || "未分组"}</span>
+                <span className="titlebar-divider" aria-hidden="true">/</span>
+                <strong>{activeServer.name}</strong>
+              </>
+            ) : <span>服务器工作台</span>}
+          </span>
+          {!isTauri() && <span className="titlebar-preview">界面预览</span>}
           {cloudSyncActivity && (
             <span className={`titlebar-sync-status ${cloudSyncActivity.status}`} title={cloudSyncActivity.message}>
               <Cloud size={12} />
@@ -1174,7 +1183,7 @@ export default function App() {
               <SquareTerminal size={18} />
             </button>
             <button className="activity-button" title="命令片段"><Braces size={18} /></button>
-            <button className="activity-button" title="AI 助手" onClick={() => setAiOpen((open) => !open)}><Sparkles size={18} /></button>
+            <button className={`activity-button ${aiOpen ? "active" : ""}`} title="AI 助手" aria-label="AI 助手" aria-pressed={aiOpen} onClick={() => setAiOpen((open) => !open)}><Sparkles size={18} /></button>
           </div>
           <div className="activity-footer">
             <button className={`activity-button transfer-activity ${sidebarView === "transfers" ? "active" : ""}`} title="文件传输" onClick={() => selectSidebar("transfers")}>
