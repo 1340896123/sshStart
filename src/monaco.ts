@@ -1,5 +1,6 @@
 import * as monaco from "monaco-editor";
 import { loader } from "@monaco-editor/react";
+import { normalizeMonacoColor } from "./monacoColors";
 import editorWorker from "../node_modules/monaco-editor/esm/vs/editor/editor.worker?worker";
 import jsonWorker from "../node_modules/monaco-editor/esm/vs/language/json/json.worker?worker";
 import cssWorker from "../node_modules/monaco-editor/esm/vs/language/css/css.worker?worker";
@@ -19,7 +20,7 @@ self.MonacoEnvironment = {
 // Read the workspace tokens just before an editor mounts, after CSS has loaded.
 export function definePorticoEditorTheme() {
   const tokens = getComputedStyle(document.documentElement);
-  const color = (name: string) => tokens.getPropertyValue(name).trim();
+  const color = (name: string) => normalizeMonacoColor(tokens.getPropertyValue(name));
 
   monaco.editor.defineTheme("portico", {
     base: "vs",

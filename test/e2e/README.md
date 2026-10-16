@@ -20,9 +20,13 @@ Selenium 自动定位或下载匹配 Microsoft Edge 的 WebDriver。测试使用
 ```powershell
 npm run test:files
 python test/e2e/file_editor_e2e.py --skip-build --failfast
+python test/e2e/file_editor_e2e.py --production
 ```
 
 `--skip-build` 仅用于已经按 `test/e2e/tauri.conf.json` 构建过的调试程序。
+`--production` 构建并嵌入经过压缩的前端，使用 Tauri 的本地协议运行，
+覆盖仅在安装版出现的 CSS 颜色压缩、Monaco 主题初始化和资源加载问题。
+配合 `--skip-build` 时，必须使用同一模式构建的程序。
 原有 Windows Rust 单测程序缺少 Common Controls v6 manifest 时会以
 `STATUS_ENTRYPOINT_NOT_FOUND` 退出；可用 Windows SDK 的 `mt.exe` 将应用的
 manifest 嵌入单测程序后运行，桌面应用和上述 E2E 不受影响。
@@ -30,6 +34,7 @@ manifest 嵌入单测程序后运行，桌面应用和上述 E2E 不受影响。
 ## 覆盖范围
 
 - 双击打开、按钮保存、Ctrl+S、关闭后重新打开验证远端内容。
+- 双击 YAML 文件时，CSS 的三位十六进制颜色（如 `#fff`）不会导致编辑器崩溃。
 - 不同服务器同路径、同服务器不同会话的编辑器隔离。
 - 保存期间继续编辑、服务器名称变化保持未保存内容。
 - 相同大小及修改时间的内容冲突、上传临时文件之后的冲突。

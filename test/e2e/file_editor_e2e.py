@@ -48,6 +48,7 @@ class Filesystem:
                 "/nonutf8.txt": self.file(bytes([0xD6, 0xD0, 0xCE, 0xC4])),
                 "/bom.txt": self.file(b"\xef\xbb\xbforiginal"),
                 "/quoted ' #?.txt": self.file("quoted-original"),
+                "/docker-compose.yaml": self.file("services:\n  app:\n    image: example/app:latest\n"),
             }
             self.pause = self.fail_write = self.fail_rename = self.fail_setstat = False
             self.change_before_commit = False
@@ -278,6 +279,12 @@ class SaveE2E(unittest.TestCase):
         cls.driver.set_script_timeout(30)
         cls.wait = WebDriverWait(cls.driver, 20)
         cls.wait.until(lambda _: cls.driver.execute_script("return typeof window.e2eConfigure === 'function'"))
+        embedded = cls.driver.execute_script("return location.hostname === 'tauri.localhost' || location.protocol === 'tauri:'")
+        if embedded != cls.production:
+            cls.driver.quit()
+            cls.a.close()
+            cls.b.close()
+            raise RuntimeError("E2E binary build mode does not match --production; rerun without --skip-build")
 
     @classmethod
     def tearDownClass(cls):
@@ -373,6 +380,15 @@ class SaveE2E(unittest.TestCase):
         self.assertIn("unsaved-A", self.elements(".file-editor.active .view-lines")[0].text)
         self.save(); self.saved()
         self.assertEqual(self.a.fs.content("/config.txt"), b"unsaved-A")
+
+    def test_css_minified_theme_opens_yaml(self):
+        # Production CSS shortens #ffffff to #fff. Monaco's token color map
+        # rejects shorthand even though the same value is valid CSS.
+        self.driver.execute_script("document.documentElement.style.setProperty('--surface-raised', '#fff'); document.documentElement.style.setProperty('--fg', '#222')")
+        self.addCleanup(lambda: self.driver.execute_script("document.documentElement.style.removeProperty('--surface-raised'); document.documentElement.style.removeProperty('--fg')"))
+        self.open("docker-compose.yaml"); self.ready()
+        self.assertIn("services:", self.elements(".file-editor.active .view-lines")[0].text)
+        self.assertEqual(self.a.fs.writes, 0)
 
     def test_edit_during_save_remains_dirty(self):
         self.open(); self.edit("submitted")
@@ -474,18 +490,29 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--failfast", action="store_true")
+    parser.add_argument("--production", action="store_true", help="Test embedded, minified production assets instead of the Vite dev server")
     args = parser.parse_args()
+    SaveE2E.production = args.production
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     paramiko.util.log_to_file(str(ARTIFACTS / "ssh.log"), level=logging.ERROR)
     if not args.skip_build:
-        env = {**os.environ, "RUSTUP_TOOLCHAIN": "1.97.1", "CARGO_INCREMENTAL": "0", "RUSTFLAGS": "-C lto=off -C embed-bitcode=no", "TAURI_CONFIG": (ROOT / "test/e2e/tauri.conf.json").read_text()}
-        subprocess.run(["cargo", "build", "--manifest-path", "src-tauri/Cargo.toml"], cwd=ROOT, env=env, check=True)
+        config = json.loads((ROOT / "test/e2e/tauri.conf.json").read_text())
+        command = ["cargo", "build", "--manifest-path", "src-tauri/Cargo.toml"]
+        if args.production:
+            subprocess.run(["node", "node_modules/vite/bin/vite.js", "build", "--config", "test/e2e/vite.config.ts"], cwd=ROOT, check=True)
+            config["build"] = {"frontendDist": "../output/file-editor-e2e/dist"}
+            config["app"]["windows"][0]["url"] = "test/e2e/file-editor.html"
+            command.extend(["--features", "tauri/custom-protocol"])
+        env = {**os.environ, "RUSTUP_TOOLCHAIN": "1.97.1", "CARGO_INCREMENTAL": "0", "RUSTFLAGS": "-C lto=off -C embed-bitcode=no", "TAURI_CONFIG": json.dumps(config)}
+        subprocess.run(command, cwd=ROOT, env=env, check=True)
     driver_path = SeleniumManager().binary_paths(["--browser", "edge", "--avoid-browser-download"])["driver_path"]
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     processes, logs = [], []
     try:
         for name, command in (("vite", ["node", "node_modules/vite/bin/vite.js"]), ("webdriver", ["tauri-driver", "--native-driver", driver_path])):
             if name == "vite":
+                if args.production:
+                    continue
                 try:
                     urllib.request.urlopen("http://127.0.0.1:1420/test/e2e/file-editor.html", timeout=1).close()
                     continue
@@ -497,7 +524,7 @@ def main():
             processes.append(process)
             wait_http("http://127.0.0.1:1420" if name == "vite" else "http://127.0.0.1:4444/status", process)
         result = unittest.TextTestRunner(verbosity=2, failfast=args.failfast).run(unittest.defaultTestLoader.loadTestsFromTestCase(SaveE2E))
-        (ARTIFACTS / "result.json").write_text(json.dumps({"tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors), "successful": result.wasSuccessful()}, indent=2))
+        (ARTIFACTS / "result.json").write_text(json.dumps({"mode": "production" if args.production else "development", "tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors), "successful": result.wasSuccessful()}, indent=2))
         return 0 if result.wasSuccessful() else 1
     finally:
         for process in reversed(processes):
