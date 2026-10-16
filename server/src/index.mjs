@@ -1,14 +1,14 @@
 import { resolve } from "node:path";
 import { createSyncServer } from "./app.mjs";
 
-const host = process.env.PORTICO_SYNC_HOST?.trim() || "127.0.0.1";
-const port = Number.parseInt(process.env.PORTICO_SYNC_PORT ?? "8787", 10);
-const databasePath = resolve(process.env.PORTICO_SYNC_DATABASE_PATH?.trim() || "./data/portico-sync.sqlite");
-const tokenSecret = process.env.PORTICO_SYNC_TOKEN_SECRET;
-const trustProxy = ["1", "true"].includes(process.env.PORTICO_SYNC_TRUST_PROXY?.trim().toLocaleLowerCase("en-US") ?? "");
+const host = process.env.SSHSTAR_SYNC_HOST?.trim() || "127.0.0.1";
+const port = Number.parseInt(process.env.SSHSTAR_SYNC_PORT ?? "8787", 10);
+const databasePath = resolve(process.env.SSHSTAR_SYNC_DATABASE_PATH?.trim() || "./data/sshstar-sync.sqlite");
+const tokenSecret = process.env.SSHSTAR_SYNC_TOKEN_SECRET;
+const trustProxy = ["1", "true"].includes(process.env.SSHSTAR_SYNC_TRUST_PROXY?.trim().toLocaleLowerCase("en-US") ?? "");
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
-  console.error("PORTICO_SYNC_PORT 必须是 1-65535 之间的整数");
+  console.error("SSHSTAR_SYNC_PORT 必须是 1-65535 之间的整数");
   process.exit(1);
 }
 
@@ -21,7 +21,7 @@ try {
 }
 
 app.server.listen(port, host, () => {
-  console.log(`Portico SSH sync server listening on http://${host}:${port}`);
+  console.log(`sshStar sync server listening on http://${host}:${port}`);
   console.log(`SQLite database: ${databasePath}`);
 });
 

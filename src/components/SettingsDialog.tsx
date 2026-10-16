@@ -406,7 +406,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     .flatMap((group) => group.tools)
     .filter((tool) => value.tools[tool.key]).length;
   const keyFileSummary = keyFiles.length === 0
-    ? "未找到 ~/.porticossh/*.key 或服务器私钥"
+    ? "未找到 ~/.sshStar/*.key 或服务器私钥"
     : `${keyFiles.slice(0, 5).map((file) => `${file.name} (${formatKeyFileSize(file.size)})`).join("、")}${keyFiles.length > 5 ? ` 等 ${keyFiles.length} 个文件` : ""}`;
   const lastDataSync = syncStatus?.lastDataSync;
   const lastKeySync = syncStatus?.lastKeySync;
@@ -545,7 +545,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
         <aside className="settings-sidebar">
           <div className="settings-sidebar-header">
             <span className="settings-brand-mark"><Bot size={17} /></span>
-            <span><strong>Portico</strong><small>AI 设置</small></span>
+            <span><strong>sshStar</strong><small>AI 设置</small></span>
             <button className="icon-button quiet" type="button" disabled={busy} onClick={() => { if (!isDirty || window.confirm("设置有未保存的修改，确定要退出吗？")) onClose(); }} title="关闭设置" aria-label="关闭设置"><X size={16} /></button>
           </div>
 
@@ -658,7 +658,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                 <section className="settings-panel">
                   <header><strong>Agent 运行参数</strong><small>由 Rig 管理多轮调用、工具循环和 provider 差异</small></header>
                   <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>最大上下文</strong><small>模型上下文预算；Portico 不额外限制可填写的上限</small></span>
+                    <span className="settings-row-copy"><strong>最大上下文</strong><small>模型上下文预算；sshStar 不额外限制可填写的上限</small></span>
                     <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={1} step={1} value={value.contextWindow} onChange={(event) => setValue({ ...value, contextWindow: Number(event.target.value) })} /><em>tokens</em></span>
                   </label>
                   <label className="settings-config-row">
@@ -708,8 +708,8 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                     <input className="settings-input" value={value.serverImportExport.defaultImportGroup} onChange={(event) => setValue({ ...value, serverImportExport: { ...value.serverImportExport, defaultImportGroup: event.target.value } })} placeholder="例如：生产环境" />
                   </label>
                   <div className="settings-config-row">
-                    <span className="settings-row-copy"><strong>支持的格式</strong><small>兼容 Portico 导出的文件，也接受服务器数组或包含 servers/data 数组的 JSON</small></span>
-                    <span className="settings-static-value">JSON / Portico Server List</span>
+                    <span className="settings-row-copy"><strong>支持的格式</strong><small>兼容 sshStar 导出的文件，也接受服务器数组或包含 servers/data 数组的 JSON</small></span>
+                    <span className="settings-static-value">JSON / sshStar Server List</span>
                   </div>
                 </section>
                 <section className="settings-panel">
@@ -743,7 +743,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                   </label>
                 </section>
                 <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许 Agent 请求变更</strong><small>控制请求批准、替我审批模式中的变更操作；完全访问模式直接允许已启用工具的变更。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
-                <div className="settings-note"><ShieldCheck size={15} /><span>审核模型返回无法解析的结果或请求失败时，Portico 会退回人工审批，不会默认放行。</span></div>
+                <div className="settings-note"><ShieldCheck size={15} /><span>审核模型返回无法解析的结果或请求失败时，sshStar 会退回人工审批，不会默认放行。</span></div>
               </>
             )}
 
@@ -810,11 +810,11 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                       <div className="settings-action-row"><button className="secondary-button" type="button" disabled={syncBusy} onClick={() => void authenticateSync("login")}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <LogIn size={14} />}登录</button><button className="secondary-button" type="button" disabled={syncBusy} onClick={() => void authenticateSync("register")}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <UserPlus size={14} />}注册并登录</button></div>
                     </>
                   ) : (
-                    <div className="settings-config-row"><span className="settings-row-copy"><strong>当前账号</strong><small>令牌保存在系统凭据库；应用数据加密密钥保存在 {syncStatus.keyPath || "~/.porticossh/"}</small></span><button className="danger-button" type="button" disabled={syncBusy || keySyncBusy} onClick={() => void logoutSync()}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <LogOut size={14} />}退出登录</button></div>
+                    <div className="settings-config-row"><span className="settings-row-copy"><strong>当前账号</strong><small>令牌保存在系统凭据库；应用数据加密密钥保存在 {syncStatus.keyPath || "~/.sshStar/"}</small></span><button className="danger-button" type="button" disabled={syncBusy || keySyncBusy} onClick={() => void logoutSync()}>{syncBusy ? <RefreshCw className="spinning" size={14} /> : <LogOut size={14} />}退出登录</button></div>
                   )}
                 </section>
                 <section className="settings-panel">
-                  <header><strong>密钥文件备份</strong><small>包含 ~/.porticossh/*.key，以及服务器和跳板机配置中引用的私钥；文件名和内容都会被加密</small></header>
+                  <header><strong>密钥文件备份</strong><small>包含 ~/.sshStar/*.key，以及服务器和跳板机配置中引用的私钥；文件名和内容都会被加密</small></header>
                   <div className="settings-config-row">
                     <span className="settings-row-copy"><strong>本地密钥</strong><small>{keyFileSummary}</small></span>
                     <span className="settings-model-control">
@@ -839,7 +839,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                   </div>
                 </section>
                 {keySyncNotice && <div className="settings-note"><Check size={15} /><span>{keySyncNotice}</span></div>}
-                <div className="settings-note"><KeyRound size={15} /><span>服务器列表中的外部私钥会复制到 ~/.porticossh 并更新为可跨设备恢复的托管路径。密钥备份使用上方自定义口令独立加密；忘记口令时服务器无法帮助恢复。</span></div>
+                <div className="settings-note"><KeyRound size={15} /><span>服务器列表中的外部私钥会复制到 ~/.sshStar 并更新为可跨设备恢复的托管路径。密钥备份使用上方自定义口令独立加密；忘记口令时服务器无法帮助恢复。</span></div>
               </>
             )}
           </div>

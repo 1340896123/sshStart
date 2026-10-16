@@ -520,7 +520,7 @@ async fn execute_tool(
                 "start" => {
                     let command = required_ai_arg(arguments, "command")?;
                     let remote_command = format!(
-                        "log=/tmp/portico-ai-task-$$.log; nohup sh -lc {} >\"$log\" 2>&1 & pid=$!; mv \"$log\" /tmp/portico-ai-task-$pid.log; printf '{{\"pid\":%s,\"log\":\"/tmp/portico-ai-task-%s.log\"}}\\n' \"$pid\" \"$pid\"",
+                        "log=/tmp/sshstar-ai-task-$$.log; nohup sh -lc {} >\"$log\" 2>&1 & pid=$!; mv \"$log\" /tmp/sshstar-ai-task-$pid.log; printf '{{\"pid\":%s,\"log\":\"/tmp/sshstar-ai-task-%s.log\"}}\\n' \"$pid\" \"$pid\"",
                         shell_quote(command)
                     );
                     (format!("background_task start {command}"), remote_command)
@@ -547,7 +547,7 @@ async fn execute_tool(
                         .clamp(1, 1_000);
                     (
                         format!("background_task logs {pid}"),
-                        format!("tail -n {lines} -- /tmp/portico-ai-task-{pid}.log"),
+                        format!("tail -n {lines} -- /tmp/sshstar-ai-task-{pid}.log"),
                     )
                 }
                 "stop" => {

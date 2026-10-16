@@ -14,7 +14,7 @@ npm run test:e2e:files
 ```
 
 Selenium 自动定位或下载匹配 Microsoft Edge 的 WebDriver。测试使用独立的
-`com.portico.ssh.e2e` 应用标识和本地回环地址，结束时清理本次测试的主机密钥记录。
+`com.sshstar.app.e2e` 应用标识和本地回环地址，结束时清理本次测试的主机密钥记录。
 若本项目的 Vite 已在 1420 端口运行，则复用；否则启动并在结束后关闭。
 
 ```powershell

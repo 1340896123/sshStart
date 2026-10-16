@@ -5722,28 +5722,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "portico-ssh"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "futures",
- "keyring",
- "reqwest 0.12.28",
- "rig",
- "ring",
- "rusqlite",
- "serde",
- "serde_json",
- "ssh2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tokio",
- "uuid",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7398,6 +7376,28 @@ dependencies = [
  "libc",
  "libssh2-sys",
  "parking_lot",
+]
+
+[[package]]
+name = "sshstar"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "keyring",
+ "reqwest 0.12.28",
+ "rig",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "ssh2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tokio",
+ "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

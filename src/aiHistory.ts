@@ -11,7 +11,7 @@ export interface AiConversation {
   updatedAt: number;
 }
 
-export const AI_HISTORY_UPDATED_EVENT = "portico:ai-history-updated";
+export const AI_HISTORY_UPDATED_EVENT = "sshstar:ai-history-updated";
 
 const MAX_CONVERSATIONS_PER_SERVER = 30;
 const MAX_TITLE_LENGTH = 38;

@@ -77,7 +77,7 @@ const DEMO_INTERFACES: NetworkInterface[] = [
 ];
 
 const DEMO_SYSTEM_INFORMATION: SystemInformation = {
-  hostname: "portico-node",
+  hostname: "sshstar-node",
   operatingSystem: "Ubuntu 24.04.3 LTS",
   kernel: "6.14.0-27-generic",
   architecture: "x86_64",
@@ -98,9 +98,9 @@ const DEMO_SYSTEM_INFORMATION: SystemInformation = {
 };
 
 const DEMO_CONTAINERS: ContainerInfo[] = [
-  { id: "6d935e62c79f4fe8", name: "portico-api", image: "portico/api:latest", state: "running", status: "Up 2 hours", ports: "0.0.0.0:8080->8080/tcp", createdAt: "2026-08-12 10:10:00 +0800 CST", cpuPercent: 2.8, memoryUsageBytes: 486 * 1024 ** 2, memoryLimitBytes: 2 * 1024 ** 3, memoryPercent: 23.7, networkInputBytes: 18.6 * 1024 ** 2, networkOutputBytes: 7.4 * 1024 ** 2 },
-  { id: "1014a3972caf411e", name: "portico-db", image: "postgres:17-alpine", state: "running", status: "Up 2 hours (healthy)", ports: "5432/tcp", createdAt: "2026-08-12 10:09:00 +0800 CST", cpuPercent: 0.4, memoryUsageBytes: 238 * 1024 ** 2, memoryLimitBytes: 2 * 1024 ** 3, memoryPercent: 11.6, networkInputBytes: 4.2 * 1024 ** 2, networkOutputBytes: 5.1 * 1024 ** 2 },
-  { id: "da74d645adb142fb", name: "portico-worker", image: "portico/worker:latest", state: "exited", status: "Exited (0) 18 minutes ago", ports: "", createdAt: "2026-08-12 09:40:00 +0800 CST", cpuPercent: 0, memoryUsageBytes: 0, memoryLimitBytes: 0, memoryPercent: 0, networkInputBytes: 0, networkOutputBytes: 0 },
+  { id: "6d935e62c79f4fe8", name: "sshstar-api", image: "sshstar/api:latest", state: "running", status: "Up 2 hours", ports: "0.0.0.0:8080->8080/tcp", createdAt: "2026-08-12 10:10:00 +0800 CST", cpuPercent: 2.8, memoryUsageBytes: 486 * 1024 ** 2, memoryLimitBytes: 2 * 1024 ** 3, memoryPercent: 23.7, networkInputBytes: 18.6 * 1024 ** 2, networkOutputBytes: 7.4 * 1024 ** 2 },
+  { id: "1014a3972caf411e", name: "sshstar-db", image: "postgres:17-alpine", state: "running", status: "Up 2 hours (healthy)", ports: "5432/tcp", createdAt: "2026-08-12 10:09:00 +0800 CST", cpuPercent: 0.4, memoryUsageBytes: 238 * 1024 ** 2, memoryLimitBytes: 2 * 1024 ** 3, memoryPercent: 11.6, networkInputBytes: 4.2 * 1024 ** 2, networkOutputBytes: 5.1 * 1024 ** 2 },
+  { id: "da74d645adb142fb", name: "sshstar-worker", image: "sshstar/worker:latest", state: "exited", status: "Exited (0) 18 minutes ago", ports: "", createdAt: "2026-08-12 09:40:00 +0800 CST", cpuPercent: 0, memoryUsageBytes: 0, memoryLimitBytes: 0, memoryPercent: 0, networkInputBytes: 0, networkOutputBytes: 0 },
 ];
 
 function formatElapsed(seconds: number) {

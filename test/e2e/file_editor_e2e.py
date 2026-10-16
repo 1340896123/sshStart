@@ -135,7 +135,7 @@ class Handle(paramiko.SFTPHandle):
 
     def close(self):
         with self.fs.lock:
-            if self.fs.change_before_commit and ".portico-edit-" in self.path:
+            if self.fs.change_before_commit and ".sshstar-edit-" in self.path:
                 self.fs.files["/config.txt"]["content"][:] = b"external-change"
                 self.fs.change_before_commit = False
         return paramiko.SFTP_OK
@@ -274,7 +274,7 @@ class SaveE2E(unittest.TestCase):
         key = paramiko.RSAKey.generate(2048)
         cls.a, cls.b = SshFixture("A", key), SshFixture("B", key)
         options = webdriver.EdgeOptions()
-        options.set_capability("tauri:options", {"application": str(ROOT / "src-tauri/target/debug/portico-ssh.exe")})
+        options.set_capability("tauri:options", {"application": str(ROOT / "src-tauri/target/debug/sshStar.exe")})
         cls.driver = webdriver.Remote("http://127.0.0.1:4444", options=options)
         cls.driver.set_script_timeout(30)
         cls.wait = WebDriverWait(cls.driver, 20)
@@ -350,7 +350,7 @@ class SaveE2E(unittest.TestCase):
         self.wait.until(lambda _: self.elements(".file-editor.active .file-editor-save-status.error"))
 
     def assert_clean_temp(self):
-        self.assertFalse(any(".portico-edit-" in path for path in self.a.fs.files))
+        self.assertFalse(any(".sshstar-edit-" in path for path in self.a.fs.files))
 
     def test_button_shortcut_and_reopen(self):
         self.open(); self.edit("button-中文"); self.save(); self.saved()

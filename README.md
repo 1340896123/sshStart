@@ -1,6 +1,8 @@
-# Portico SSH
+# sshStar
 
-Portico SSH is a compact Tauri desktop workspace for managing SSH servers. Each server can have multiple isolated sessions with its own terminal buffer, remote file location, selection, and AI conversation.
+sshStar is a compact Tauri desktop workspace for managing SSH servers. Each server can have multiple isolated sessions with its own terminal buffer, remote file location, selection, and AI conversation.
+
+The desktop product, window title, and executable are named `sshStar` (`sshStar.exe` on Windows). Application data and credentials use the `com.sshstar.app` identifier. The Windows database is stored at `%APPDATA%/com.sshstar.app/sshStar.sqlite3`, and encryption keys and managed SSH private keys are stored at `~/.sshStar/`. The application starts with independent data and credentials under this identity.
 
 ## Included
 
@@ -31,11 +33,11 @@ npm run build
 npx tauri build
 ```
 
-AI settings accept endpoints implementing the OpenAI `chat/completions` schema and function tool calls. Providers that return `reasoning_content` are supported; otherwise Portico requests a concise reasoning summary without exposing hidden chain-of-thought.
+AI settings accept endpoints implementing the OpenAI `chat/completions` schema and function tool calls. Providers that return `reasoning_content` are supported; otherwise sshStar requests a concise reasoning summary without exposing hidden chain-of-thought.
 
 ## Cloud sync service contract
 
-Cloud sync is intentionally backend-agnostic. Configure the API root in Settings → Cloud Sync (or set `VITE_PORTICO_SYNC_API_URL` before building). The service must expose:
+Cloud sync is intentionally backend-agnostic. Configure the API root in Settings → Cloud Sync (or set `VITE_SSHSTAR_SYNC_API_URL` before building). The service must expose:
 
 - `POST /auth/register` and `POST /auth/login` with `{ "email": string, "password": string }`, returning `{ "token": string, "email": string }` (an `accessToken` field is also accepted).
 - `GET /sync/data` with a bearer token, returning `{ "ciphertext": string, "updatedAt": number }`; return `404` when the account has no snapshot yet.
@@ -46,7 +48,7 @@ Cloud sync is intentionally backend-agnostic. Configure the API root in Settings
 - `DELETE /sync/keys` with a bearer token to remove the encrypted key backup.
 - `DELETE /sync` with a bearer token to remove both snapshots.
 
-Application snapshot ciphertext uses a dedicated AES-256-GCM key stored at `~/.porticossh/cloud.key`; `~/.porticossh/sync.key` remains local to the device and encrypts its SQLite state. Key backups contain `cloud.key`, other managed `~/.porticossh/*.key` files, and private keys referenced by server and jump-host profiles, but never upload the device-local `sync.key`. Legacy backups that contain only `sync.key` migrate it to `cloud.key` during restore. Referenced keys are copied into the managed `~/.porticossh` directory, and synchronized profiles use portable key paths that resolve against each device's home directory. Key backups are independently encrypted with AES-256-GCM using a PBKDF2-SHA256 key derived from the user's custom passphrase. Neither encryption key nor passphrase is sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
+Application snapshot ciphertext uses a dedicated AES-256-GCM key stored at `~/.sshStar/cloud.key`; `~/.sshStar/sync.key` remains local to the device and encrypts its SQLite state. Key backups contain `cloud.key`, other managed `~/.sshStar/*.key` files, and private keys referenced by server and jump-host profiles, but never upload the device-local `sync.key`. Backups containing `sync.key` are rejected. Referenced keys are copied into the managed `~/.sshStar` directory, and synchronized profiles use portable key paths that resolve against each device's home directory. Key backups are independently encrypted with AES-256-GCM using a PBKDF2-SHA256 key derived from the user's custom passphrase. Neither encryption key nor passphrase is sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
 
 Desktop clients merge cloud snapshots before uploading them. Server profiles use per-record logical revisions, the server list order has its own revision, and groups, collapsed state, and settings use category revisions. Profiles that exist on only one device are retained, explicit server deletions are synchronized with tombstones, and conditional writes retry after concurrent updates instead of overwriting another device's snapshot.
 
@@ -55,7 +57,7 @@ Desktop clients merge cloud snapshots before uploading them. Server profiles use
 The repository includes a self-hosted implementation in `server/`. It uses Node.js 24's built-in HTTP, cryptography, and SQLite support, hashes passwords with scrypt, issues seven-day HMAC-SHA256 bearer tokens, rate-limits authentication attempts, and stores application snapshots and key backups per account without decrypting them.
 
 ```powershell
-$env:PORTICO_SYNC_TOKEN_SECRET = node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
+$env:SSHSTAR_SYNC_TOKEN_SECRET = node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
 npm run sync-server
 ```
 

@@ -27,7 +27,7 @@ impl AppDatabase {
             .map_err(|error| format!("获取应用数据目录失败: {error}"))?;
         fs::create_dir_all(&app_data_dir)
             .map_err(|error| format!("创建应用数据目录失败: {error}"))?;
-        let database_path = app_data_dir.join("portico.sqlite3");
+        let database_path = app_data_dir.join("sshStar.sqlite3");
         let connection = Connection::open(&database_path)
             .map_err(|error| format!("打开 SQLite 数据库失败: {error}"))?;
         connection
@@ -39,33 +39,6 @@ impl AppDatabase {
                  );",
             )
             .map_err(|error| format!("初始化 SQLite 数据库失败: {error}"))?;
-        let legacy_values = {
-            let mut statement = connection
-                .prepare("SELECT key, value FROM app_state")
-                .map_err(|error| format!("读取旧版 SQLite 状态失败: {error}"))?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|error| format!("扫描旧版 SQLite 状态失败: {error}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("读取旧版 SQLite 状态失败: {error}"))?
-        };
-        for (key, raw) in legacy_values {
-            if decrypt_json(&raw).is_ok() {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-                continue;
-            };
-            let encrypted = encrypt_json(&value)?;
-            connection
-                .execute(
-                    "UPDATE app_state SET value = ?1 WHERE key = ?2",
-                    params![encrypted, key],
-                )
-                .map_err(|error| format!("迁移 SQLite 状态失败: {error}"))?;
-        }
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -84,12 +57,7 @@ impl AppDatabase {
             )
             .optional()
             .map_err(|error| format!("读取 SQLite 状态失败: {error}"))?;
-        raw.map(|value| match decrypt_json(&value) {
-            Ok(value) => Ok(value),
-            Err(_) => serde_json::from_str(&value)
-                .map_err(|error| format!("解析 SQLite 状态失败: {error}")),
-        })
-        .transpose()
+        raw.map(|value| decrypt_json(&value)).transpose()
     }
 
     fn write_value(&self, key: &str, value: &Value) -> Result<(), String> {

@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const TOKEN_ISSUER = "portico-ssh-sync";
+const TOKEN_ISSUER = "sshstar-ssh-sync";
 const DEFAULT_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
 const DEFAULT_MAX_CIPHERTEXT_BYTES = 16 * 1024 * 1024;
 const PASSWORD_MIN_LENGTH = 8;
@@ -211,7 +211,7 @@ function assertSnapshotVersion(expected, snapshot) {
   const currentUpdatedAt = snapshot?.updated_at;
   if (currentUpdatedAt !== expected.value) {
     throw new HttpError(409, "云端数据已被其他设备更新，请重新拉取后合并", {
-      "x-portico-current-version": String(currentUpdatedAt ?? "none"),
+      "x-sshstar-current-version": String(currentUpdatedAt ?? "none"),
     });
   }
 }
@@ -276,7 +276,7 @@ function openDatabase(databasePath) {
 }
 
 export function createSyncServer({
-  databasePath = "./data/portico-sync.sqlite",
+  databasePath = "./data/sshstar-sync.sqlite",
   tokenSecret,
   tokenTtlSeconds = DEFAULT_TOKEN_TTL_SECONDS,
   maxCiphertextBytes = DEFAULT_MAX_CIPHERTEXT_BYTES,
@@ -286,7 +286,7 @@ export function createSyncServer({
   now = () => Date.now(),
 } = {}) {
   if (typeof tokenSecret !== "string" || Buffer.byteLength(tokenSecret) < 32) {
-    throw new Error("PORTICO_SYNC_TOKEN_SECRET 必须至少包含 32 字节");
+    throw new Error("SSHSTAR_SYNC_TOKEN_SECRET 必须至少包含 32 字节");
   }
   if (!Number.isInteger(tokenTtlSeconds) || tokenTtlSeconds <= 0) {
     throw new Error("tokenTtlSeconds 必须是正整数");
@@ -474,7 +474,7 @@ export function createSyncServer({
         sendJson(response, error.status, { message: error.message }, error.headers);
         return;
       }
-      console.error("[portico-sync] request failed", error);
+      console.error("[sshstar-sync] request failed", error);
       sendJson(response, 500, { message: "服务器内部错误" });
     });
   });

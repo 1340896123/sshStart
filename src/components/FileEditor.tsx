@@ -3,7 +3,7 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { invoke } from "@tauri-apps/api/core";
 import { CheckCircle2, CircleAlert, LoaderCircle, Save } from "lucide-react";
 import { isTauri } from "../lib";
-import { definePorticoEditorTheme } from "../monaco";
+import { defineSshStarEditorTheme } from "../monaco";
 import type { RemoteFile, RemoteFileContent, RemoteFileRevision, ServerProfile } from "../types";
 
 interface Props {
@@ -36,7 +36,7 @@ export function FileEditor({ server, sessionId, file, active, onDirtyChange, onS
   const connectionRef = useRef(server);
   const callbacksRef = useRef({ onDirtyChange, onSaved });
   callbacksRef.current = { onDirtyChange, onSaved };
-  const modelPath = `portico://remote/${encodeURIComponent(server.id)}/${encodeURIComponent(sessionId)}${file.path.split("/").map(encodeURIComponent).join("/")}`;
+  const modelPath = `sshstar://remote/${encodeURIComponent(server.id)}/${encodeURIComponent(sessionId)}${file.path.split("/").map(encodeURIComponent).join("/")}`;
   // onMount 只触发一次，addCommand 的闭包会随之固化；用 ref 转发最新的 save，确保 Ctrl+S 永远保存当前内容。
   const saveRef = useRef<() => Promise<void>>(async () => undefined);
 
@@ -158,8 +158,8 @@ export function FileEditor({ server, sessionId, file, active, onDirtyChange, onS
         ) : (
           <Editor
             path={modelPath}
-            theme="portico"
-            beforeMount={definePorticoEditorTheme}
+            theme="sshstar"
+            beforeMount={defineSshStarEditorTheme}
             value={content}
             onChange={handleChange}
             onMount={handleMount}

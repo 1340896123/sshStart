@@ -90,7 +90,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
         lastCols = terminal.cols;
         lastRows = terminal.rows;
         diagnosticLog("debug", "terminal.frontend.fitted", { sessionId: session.id, cols: lastCols, rows: lastRows });
-        terminal.writeln(`\x1b[90mPortico · ${server.username}@${server.host}\x1b[0m`);
+        terminal.writeln(`\x1b[90msshStar · ${server.username}@${server.host}\x1b[0m`);
       } catch (reason) {
         diagnosticError("terminal.frontend.setup_failed", reason, { sessionId: session.id });
         throw reason;

@@ -1,6 +1,6 @@
 use crate::crypto::{
     cloud_key_file_path, decrypt_cloud_json, decrypt_with_passphrase, encrypt_cloud_json,
-    encrypt_with_passphrase, ensure_cloud_key, portico_directory,
+    encrypt_with_passphrase, ensure_cloud_key, sshstar_directory,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::blocking::Client;
@@ -22,7 +22,7 @@ const EMAIL_ACCOUNT: &str = "sync:email";
 const MAX_KEY_FILES: usize = 128;
 const MAX_KEY_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_KEY_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
-const PORTABLE_KEY_PREFIX: &str = "portico-key://";
+const PORTABLE_KEY_PREFIX: &str = "sshstar-key://";
 const SYNC_STATE_FILE: &str = "sync-state.json";
 const LOCAL_STORAGE_KEY_FILE: &str = "sync.key";
 const CLOUD_SYNC_KEY_FILE: &str = "cloud.key";
@@ -302,7 +302,7 @@ fn response_error(response: reqwest::blocking::Response) -> String {
 
 fn request_client() -> Result<Client, String> {
     Client::builder()
-        .user_agent("Portico SSH cloud sync")
+        .user_agent("sshStar cloud sync")
         .build()
         .map_err(|error| format!("初始化同步网络连接失败: {error}"))
 }
@@ -315,7 +315,7 @@ fn unix_timestamp() -> u64 {
 }
 
 fn sync_state_path() -> Result<PathBuf, String> {
-    Ok(portico_directory()?.join(SYNC_STATE_FILE))
+    Ok(sshstar_directory()?.join(SYNC_STATE_FILE))
 }
 
 fn load_sync_state() -> Result<PersistedSyncState, String> {
@@ -332,7 +332,7 @@ fn load_sync_state() -> Result<PersistedSyncState, String> {
 }
 
 fn save_sync_state_unlocked(state: PersistedSyncState) -> Result<(), String> {
-    let directory = portico_directory()?;
+    let directory = sshstar_directory()?;
     fs::create_dir_all(&directory).map_err(|error| format!("创建同步状态目录失败: {error}"))?;
     let payload = serde_json::to_vec_pretty(&state)
         .map_err(|error| format!("序列化同步状态失败: {error}"))?;
@@ -468,7 +468,7 @@ fn is_key_file_name(name: &str) -> bool {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("key"))
 }
 
-fn list_portico_key_files(directory: &Path) -> Result<Vec<KeyFileInfo>, String> {
+fn list_sshstar_key_files(directory: &Path) -> Result<Vec<KeyFileInfo>, String> {
     if !directory.exists() {
         return Ok(Vec::new());
     }
@@ -626,7 +626,7 @@ fn collect_key_inventory(
     strict_references: bool,
 ) -> Result<KeyInventory, String> {
     ensure_cloud_key()?;
-    let directory = portico_directory()?;
+    let directory = sshstar_directory()?;
     collect_key_inventory_in(&directory, servers, strict_references)
 }
 
@@ -637,7 +637,7 @@ fn collect_key_inventory_in(
 ) -> Result<KeyInventory, String> {
     let mut used_names = HashSet::new();
     let mut files = Vec::new();
-    for info in list_portico_key_files(directory)? {
+    for info in list_sshstar_key_files(directory)? {
         if info.name.eq_ignore_ascii_case(LOCAL_STORAGE_KEY_FILE) {
             continue;
         }
@@ -734,7 +734,7 @@ fn build_key_bundle(servers: &[ServerKeyProfile]) -> Result<PreparedKeyBundle, S
     let inventory = collect_key_inventory(servers, true)?;
     if inventory.files.is_empty() {
         return Err(
-            "没有可同步的密钥；请添加 ~/.porticossh/*.key 或在服务器列表中配置私钥".to_string(),
+            "没有可同步的密钥；请添加 ~/.sshStar/*.key 或在服务器列表中配置私钥".to_string(),
         );
     }
     if inventory.files.len() > MAX_KEY_FILES {
@@ -777,7 +777,7 @@ fn persist_managed_key_copies(files: &[(String, Vec<u8>)]) -> Result<(), String>
     if files.is_empty() {
         return Ok(());
     }
-    let directory = portico_directory()?;
+    let directory = sshstar_directory()?;
     fs::create_dir_all(&directory).map_err(|error| format!("创建本地密钥目录失败: {error}"))?;
     for (name, _) in files {
         let destination = directory.join(name);
@@ -794,7 +794,7 @@ fn persist_managed_key_copies(files: &[(String, Vec<u8>)]) -> Result<(), String>
     for (index, (name, bytes)) in files.iter().enumerate() {
         let destination = directory.join(name);
         let temporary = directory.join(format!(
-            ".portico-key-import-{}-{index}.tmp",
+            ".sshstar-key-import-{}-{index}.tmp",
             uuid::Uuid::new_v4()
         ));
         if let Err(error) = fs::write(&temporary, bytes) {
@@ -829,10 +829,6 @@ fn decode_key_bundle(raw: &[u8]) -> Result<(KeyBundle, Vec<(String, Vec<u8>)>), 
     if bundle.files.is_empty() || bundle.files.len() > MAX_KEY_FILES {
         return Err("密钥备份中的文件数量无效".to_string());
     }
-    let has_cloud_key = bundle
-        .files
-        .iter()
-        .any(|file| file.name.eq_ignore_ascii_case(CLOUD_SYNC_KEY_FILE));
     let mut names = HashSet::new();
     let mut total_bytes = 0_u64;
     let mut decoded = Vec::with_capacity(bundle.files.len());
@@ -841,14 +837,10 @@ fn decode_key_bundle(raw: &[u8]) -> Result<(KeyBundle, Vec<(String, Vec<u8>)>), 
         if !is_key_file_name(&file.name) {
             return Err("密钥备份包含无效或重复的文件名".to_string());
         }
-        if has_cloud_key && file.name.eq_ignore_ascii_case(LOCAL_STORAGE_KEY_FILE) {
-            continue;
+        if file.name.eq_ignore_ascii_case(LOCAL_STORAGE_KEY_FILE) {
+            return Err("密钥备份不能包含设备本地存储密钥 sync.key".to_string());
         }
-        let name = if file.name.eq_ignore_ascii_case(LOCAL_STORAGE_KEY_FILE) {
-            CLOUD_SYNC_KEY_FILE.to_string()
-        } else {
-            file.name.clone()
-        };
+        let name = file.name.clone();
         if !names.insert(name.to_lowercase()) {
             return Err("密钥备份包含无效或重复的文件名".to_string());
         }
@@ -884,7 +876,7 @@ fn restore_key_bundle(
     files: Vec<(String, Vec<u8>)>,
     overwrite: bool,
 ) -> Result<KeySyncResult, String> {
-    let directory = portico_directory()?;
+    let directory = sshstar_directory()?;
     fs::create_dir_all(&directory).map_err(|error| format!("创建本地密钥目录失败: {error}"))?;
     let mut conflicts = Vec::new();
     for (name, _) in &files {
@@ -905,7 +897,7 @@ fn restore_key_bundle(
     let mut staged = Vec::with_capacity(files.len());
     for (index, (name, bytes)) in files.iter().enumerate() {
         let temporary = directory.join(format!(
-            ".portico-key-restore-{}-{index}.tmp",
+            ".sshstar-key-restore-{}-{index}.tmp",
             uuid::Uuid::new_v4()
         ));
         if let Err(error) = fs::write(&temporary, bytes) {
@@ -1515,7 +1507,7 @@ fn push_sync(
     let session = require_session(&endpoint)?;
     let client = request_client()?;
     let snapshot =
-        make_snapshot_key_paths_portable(hydrate_snapshot(snapshot), &portico_directory()?)?;
+        make_snapshot_key_paths_portable(hydrate_snapshot(snapshot), &sshstar_directory()?)?;
     let summary_without_size = summarize_snapshot(&snapshot, 0);
     emit_progress(
         &app,
@@ -1655,7 +1647,7 @@ fn pull_sync(
         "正在解密并校验快照",
     );
     let snapshot =
-        resolve_snapshot_key_paths(decrypt_cloud_json(ciphertext)?, &portico_directory()?)?;
+        resolve_snapshot_key_paths(decrypt_cloud_json(ciphertext)?, &sshstar_directory()?)?;
     let content = summarize_snapshot(&snapshot, ciphertext.len());
     emit_progress(
         &app,
@@ -2207,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn key_backup_names_stay_inside_portico_directory() {
+    fn key_backup_names_stay_inside_sshstar_directory() {
         assert!(super::is_key_file_name("sync.key"));
         assert!(super::is_key_file_name("production-ed25519.key"));
         for invalid in [
@@ -2277,17 +2269,24 @@ mod tests {
     }
 
     #[test]
-    fn legacy_backup_sync_key_migrates_to_cloud_key() {
+    fn key_backup_rejects_device_local_storage_keys() {
         let raw = serde_json::to_vec(&json!({
             "version": 1,
             "createdAt": 42,
             "files": [{ "name": "sync.key", "content": "bGVnYWN5" }]
         }))
-        .expect("serialize legacy bundle");
-        let (bundle, files) = super::decode_key_bundle(&raw).expect("decode legacy bundle");
-        assert_eq!(bundle.files[0].name, "cloud.key");
-        assert_eq!(files[0].0, "cloud.key");
-        assert_eq!(files[0].1, b"legacy");
+        .expect("serialize bundle");
+        assert!(super::decode_key_bundle(&raw).is_err());
+        let raw = serde_json::to_vec(&json!({
+            "version": 1,
+            "createdAt": 42,
+            "files": [
+                { "name": "cloud.key", "content": "Y2xvdWQ=" },
+                { "name": "SYNC.KEY", "content": "bG9jYWw=" }
+            ]
+        }))
+        .expect("serialize mixed bundle");
+        assert!(super::decode_key_bundle(&raw).is_err());
     }
 
     #[test]
@@ -2364,10 +2363,10 @@ mod tests {
     #[test]
     fn external_server_keys_join_the_managed_backup_inventory() {
         let root = std::env::temp_dir().join(format!(
-            "portico-key-inventory-test-{}",
+            "sshstar-key-inventory-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let managed = root.join(".porticossh");
+        let managed = root.join(".sshStar");
         let external = root.join("id_ed25519");
         std::fs::create_dir_all(&managed).expect("managed directory should be created");
         std::fs::write(&external, b"private-key").expect("external key should be written");
@@ -2396,7 +2395,7 @@ mod tests {
 
     #[test]
     fn portable_server_key_paths_round_trip_for_primary_and_jump_hosts() {
-        let directory = PathBuf::from("test-home").join(".porticossh");
+        let directory = PathBuf::from("test-home").join(".sshStar");
         let primary = directory.join("primary.key").to_string_lossy().to_string();
         let jump = directory.join("jump.key").to_string_lossy().to_string();
         let snapshot = json!({
@@ -2411,11 +2410,11 @@ mod tests {
             .expect("managed paths should become portable");
         assert_eq!(
             portable["servers"][0]["privateKeyPath"],
-            "portico-key://primary.key"
+            "sshstar-key://primary.key"
         );
         assert_eq!(
             portable["servers"][0]["jumpHost"]["privateKeyPath"],
-            "portico-key://jump.key"
+            "sshstar-key://jump.key"
         );
 
         let restored = super::resolve_snapshot_key_paths(portable, &directory)
@@ -2433,7 +2432,7 @@ mod tests {
     #[test]
     fn portable_server_key_paths_reject_traversal() {
         let snapshot = json!({
-            "servers": [{ "privateKeyPath": "portico-key://../escape.key" }]
+            "servers": [{ "privateKeyPath": "sshstar-key://../escape.key" }]
         });
         assert!(
             super::resolve_snapshot_key_paths(snapshot, PathBuf::from("keys").as_path()).is_err()

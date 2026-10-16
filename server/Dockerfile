@@ -5,9 +5,9 @@ COPY --chown=node:node package.json ./package.json
 COPY --chown=node:node src ./src
 RUN mkdir -p /data && chown node:node /data
 
-ENV PORTICO_SYNC_HOST=0.0.0.0
-ENV PORTICO_SYNC_PORT=8787
-ENV PORTICO_SYNC_DATABASE_PATH=/data/portico-sync.sqlite
+ENV SSHSTAR_SYNC_HOST=0.0.0.0
+ENV SSHSTAR_SYNC_PORT=8787
+ENV SSHSTAR_SYNC_DATABASE_PATH=/data/sshstar-sync.sqlite
 
 USER node
 EXPOSE 8787

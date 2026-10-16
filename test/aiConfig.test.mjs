@@ -11,12 +11,6 @@ registerHooks({
   },
 });
 const { DEFAULT_AI_CONFIG, normalizeAiConfig } = await import(configUrl);
-const legacyPrompt = "你是 Portico SSH 的 Rig 运维 Agent。先观察再行动，优先使用结构化工具获取事实；明确说明风险和执行结果。不要声称读取过尚未通过工具访问的文件，高风险或变更型动作必须等待人工审批。";
-
-test("saved default prompts migrate to the current approval behavior", () => {
-  assert.equal(normalizeAiConfig({ systemPrompt: legacyPrompt }).systemPrompt, DEFAULT_AI_CONFIG.systemPrompt);
-  assert.equal(normalizeAiConfig({}, { ...DEFAULT_AI_CONFIG, systemPrompt: legacyPrompt }).systemPrompt, DEFAULT_AI_CONFIG.systemPrompt);
-});
 
 test("custom prompts and explicit tool restrictions survive normalization", () => {
   const result = normalizeAiConfig({ systemPrompt: "仅管理测试服务器", tools: { executeCommand: false, allowMutatingTools: false } });

@@ -667,7 +667,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
             >
               <div className="message-meta">
                 {message.role === "user" ? <User size={12} /> : <Bot size={12} />}
-                <span>{message.role === "user" ? "你" : "Portico AI"}</span>
+                <span>{message.role === "user" ? "你" : "sshStar AI"}</span>
                 <span>{MESSAGE_TYPE_LABELS[message.messageType]}</span>
                 <span className={`message-status ${message.status}`}>
                   {ACTION_STATUS_LABELS[message.status]}

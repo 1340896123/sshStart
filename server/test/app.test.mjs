@@ -6,10 +6,10 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { createSyncServer } from "../src/app.mjs";
 
-const TEST_SECRET = "portico-sync-test-secret-that-is-long-enough";
+const TEST_SECRET = "sshstar-sync-test-secret-that-is-long-enough";
 
 async function startFixture(options = {}) {
-  const directory = await mkdtemp(join(tmpdir(), "portico-sync-"));
+  const directory = await mkdtemp(join(tmpdir(), "sshstar-sync-"));
   const databasePath = join(directory, "sync.sqlite");
   const app = createSyncServer({
     databasePath,

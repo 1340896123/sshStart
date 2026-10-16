@@ -284,7 +284,7 @@ impl TransferManager {
     }
 }
 
-const KEYRING_SERVICE: &str = "com.portico.ssh";
+const KEYRING_SERVICE: &str = "com.sshstar.app";
 const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 30;
 const SSH_KEEPALIVE_RETRY_SECS: u64 = 1;
 static KNOWN_HOSTS_LOCK: Mutex<()> = Mutex::new(());
@@ -300,7 +300,7 @@ fn diagnostic_log_path() -> PathBuf {
     }
     .map(PathBuf::from)
     .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    root.join("Portico SSH").join("logs").join("portico.log")
+    root.join("sshStar").join("logs").join("sshStar.log")
 }
 
 fn append_diagnostic_record(
@@ -356,7 +356,7 @@ fn append_diagnostic_record(
 
 fn log_backend_event(level: &str, event: &str, fields: serde_json::Value) {
     if let Err(error) = append_diagnostic_record("backend", level, event, fields) {
-        eprintln!("Portico diagnostic log failure: {error}");
+        eprintln!("sshStar diagnostic log failure: {error}");
     }
 }
 
@@ -524,7 +524,7 @@ fn verify_known_host(session: &Session, server: &ServerProfile) -> Result<(), St
                 format!("[{}]:{}", server.host, server.port)
             };
             known_hosts
-                .add(&host, key, "Portico SSH TOFU", key_type.into())
+                .add(&host, key, "sshStar TOFU", key_type.into())
                 .map_err(|error| format!("记录 SSH 主机密钥失败: {error}"))?;
             known_hosts
                 .write_file(&path, KnownHostFileKind::OpenSSH)
@@ -710,7 +710,7 @@ fn connect_ssh(server: &ServerProfile) -> Result<Session, String> {
         .set_write_timeout(Some(Duration::from_secs(30)))
         .ok();
     thread::Builder::new()
-        .name("portico-jump-relay".to_string())
+        .name("sshStar-jump-relay".to_string())
         .spawn(move || relay_jump_channel(local_proxy, channel, jump_session))
         .map_err(|error| format!("启动跳板回程线程失败: {error}"))?;
 
@@ -1187,7 +1187,7 @@ fn validate_container_id(container_id: &str) -> Result<&str, String> {
 // 远程脚本通过 base64 传输后由 Python 执行，避免在 SSH 命令字符串里嵌套引号
 // 导致的转义问题。脚本输出与原有解析器兼容的文本格式。
 const PYTHON_BOOTSTRAP: &str =
-    "import base64,sys;exec(compile(base64.b64decode(sys.argv[1]),\"portico\",\"exec\"))";
+    "import base64,sys;exec(compile(base64.b64decode(sys.argv[1]),\"sshstar\",\"exec\"))";
 
 const SYSTEM_INFO_SCRIPT: &str = r#"import os
 import socket
@@ -2197,15 +2197,15 @@ fn transfer_suffix(transfer_id: Option<&str>) -> String {
 
 fn remote_transfer_temp_path(remote_path: &str, suffix: &str) -> Result<String, String> {
     let (parent, name) = remote_parent_and_name(remote_path)?;
-    Ok(format!("{parent}/.{name}.portico-partial-{suffix}"))
+    Ok(format!("{parent}/.{name}.sshstar-partial-{suffix}"))
 }
 
 fn local_transfer_temp_path(local_path: &Path, suffix: &str) -> PathBuf {
-    PathBuf::from(format!("{}.portico-partial-{suffix}", local_path.display()))
+    PathBuf::from(format!("{}.sshstar-partial-{suffix}", local_path.display()))
 }
 
 fn replace_local_file(temp_path: &Path, destination: &Path, suffix: &str) -> Result<(), String> {
-    let backup_path = PathBuf::from(format!("{}.portico-backup-{suffix}", destination.display()));
+    let backup_path = PathBuf::from(format!("{}.sshstar-backup-{suffix}", destination.display()));
     let had_existing = destination.exists();
     if had_existing {
         fs::rename(destination, &backup_path)
@@ -2426,7 +2426,7 @@ fn sanitize_ai_attachment_name(name: &str) -> String {
 
 fn ai_attachment_temp_directory(username: &str) -> String {
     format!(
-        "/tmp/portico-ai-{}",
+        "/tmp/sshstar-ai-{}",
         sanitize_ai_attachment_component(username, "user", 48)
     )
 }
@@ -2706,7 +2706,7 @@ async fn read_remote_file(
 fn editor_remote_temp_path(remote_path: &str) -> Result<String, String> {
     let (parent, name) = remote_parent_and_name(remote_path)?;
     let nonce = uuid::Uuid::new_v4();
-    Ok(format!("{parent}/.{name}.portico-edit-{nonce}"))
+    Ok(format!("{parent}/.{name}.sshstar-edit-{nonce}"))
 }
 
 fn rename_overwrite(
@@ -3215,7 +3215,7 @@ pub fn run() {
             ai::import::parse_ai_server_import
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Portico SSH");
+        .expect("error while running sshStar");
 }
 
 #[cfg(test)]
@@ -3266,14 +3266,14 @@ mod tests {
     fn commits_transfers_from_sibling_temporary_files() {
         assert_eq!(
             remote_transfer_temp_path("/srv/app.txt", "run-1").unwrap(),
-            "/srv/.app.txt.portico-partial-run-1"
+            "/srv/.app.txt.sshstar-partial-run-1"
         );
 
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("portico-transfer-test-{nonce}"));
+        let root = std::env::temp_dir().join(format!("sshstar-transfer-test-{nonce}"));
         std::fs::create_dir_all(&root).unwrap();
         let destination = root.join("download.txt");
         std::fs::write(&destination, b"old").unwrap();
@@ -3293,7 +3293,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("portico-upload-manifest-{nonce}"));
+        let root = std::env::temp_dir().join(format!("sshstar-upload-manifest-{nonce}"));
         let payload = root.join("payload");
         let nested = payload.join("nested");
         let empty = payload.join("empty");
@@ -3336,7 +3336,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("portico-upload-dedupe-{nonce}"));
+        let root = std::env::temp_dir().join(format!("sshstar-upload-dedupe-{nonce}"));
         let payload = root.join("payload");
         let nested = payload.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
@@ -3429,33 +3429,33 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires PORTICO_TEST_* SSH credentials and network access"]
+    #[ignore = "requires SSHSTAR_TEST_* SSH credentials and network access"]
     fn connects_through_configured_jump_host() {
         let required = |name: &str| std::env::var(name).expect("missing jump-host test variable");
         let port = |name: &str| required(name).parse::<u16>().expect("invalid test port");
         let server = super::ServerProfile {
             id: "jump-host-integration-test".to_string(),
-            host: required("PORTICO_TEST_TARGET_HOST"),
-            port: port("PORTICO_TEST_TARGET_PORT"),
-            username: required("PORTICO_TEST_TARGET_USERNAME"),
+            host: required("SSHSTAR_TEST_TARGET_HOST"),
+            port: port("SSHSTAR_TEST_TARGET_PORT"),
+            username: required("SSHSTAR_TEST_TARGET_USERNAME"),
             auth_type: "password".to_string(),
-            password: Some(required("PORTICO_TEST_TARGET_PASSWORD")),
+            password: Some(required("SSHSTAR_TEST_TARGET_PASSWORD")),
             private_key_path: None,
             passphrase: None,
             jump_host: Some(super::JumpHostProfile {
                 enabled: true,
-                host: required("PORTICO_TEST_JUMP_HOST"),
-                port: port("PORTICO_TEST_JUMP_PORT"),
-                username: required("PORTICO_TEST_JUMP_USERNAME"),
+                host: required("SSHSTAR_TEST_JUMP_HOST"),
+                port: port("SSHSTAR_TEST_JUMP_PORT"),
+                username: required("SSHSTAR_TEST_JUMP_USERNAME"),
                 auth_type: "password".to_string(),
-                password: Some(required("PORTICO_TEST_JUMP_PASSWORD")),
+                password: Some(required("SSHSTAR_TEST_JUMP_PASSWORD")),
                 private_key_path: None,
                 passphrase: None,
             }),
         };
-        let result = super::run_command_sync(&server, "printf portico-jump-ok")
+        let result = super::run_command_sync(&server, "printf sshstar-jump-ok")
             .expect("jump-host SSH command failed");
-        assert_eq!(result.stdout, "portico-jump-ok");
+        assert_eq!(result.stdout, "sshstar-jump-ok");
         assert_eq!(result.exit_code, 0);
     }
 
@@ -3507,7 +3507,7 @@ mod tests {
     #[test]
     fn parses_system_information_sections() {
         let info = parse_system_information(
-            "--IDENTITY--\nHOSTNAME=portico\nKERNEL=6.8.0\nARCH=x86_64\nPRETTY_NAME=Ubuntu 24.04 LTS\n\
+            "--IDENTITY--\nHOSTNAME=sshstar\nKERNEL=6.8.0\nARCH=x86_64\nPRETTY_NAME=Ubuntu 24.04 LTS\n\
              --CPU--\nMODEL=AMD EPYC\nCORES=8\nUSAGE=12.5\n\
              --LOAD--\n0.25 0.50 0.75 1/100 1\n\
              --UPTIME--\n90061.42 100.0\n\
@@ -3515,7 +3515,7 @@ mod tests {
              --DISKS--\n/dev/sda1\t100000000\t40000000\t60000000\t40%\t/\n",
         )
         .unwrap();
-        assert_eq!(info.hostname, "portico");
+        assert_eq!(info.hostname, "sshstar");
         assert_eq!(info.cpu_cores, 8);
         assert_eq!(info.memory_used_bytes, 10_000_000 * 1024);
         assert_eq!(info.disks[0].mount_point, "/");
@@ -3525,7 +3525,7 @@ mod tests {
     fn parses_container_rows_and_binary_sizes() {
         assert_eq!(parse_size_bytes("1.5GiB"), 1_610_612_736);
         let rows = parse_containers(
-            "0123456789abcdef\tapi\tportico/api:latest\trunning\tUp 2 hours\t0.0.0.0:8080->80/tcp\t2026-08-12 10:00:00 +0800 CST\t512MiB / 2GiB\t3.5%\t1.2MB / 800kB\t25%\n",
+            "0123456789abcdef\tapi\tsshstar/api:latest\trunning\tUp 2 hours\t0.0.0.0:8080->80/tcp\t2026-08-12 10:00:00 +0800 CST\t512MiB / 2GiB\t3.5%\t1.2MB / 800kB\t25%\n",
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "api");

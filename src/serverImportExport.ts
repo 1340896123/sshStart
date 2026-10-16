@@ -2,7 +2,7 @@ import { normalizeGroupPath, isGroupWithin } from "./serverGroups";
 import { uid } from "./lib";
 import type { AuthType, JumpHostProfile, ServerProfile } from "./types";
 
-export const SERVER_EXPORT_FORMAT = "portico-server-list";
+export const SERVER_EXPORT_FORMAT = "sshstar-server-list";
 export const SERVER_EXPORT_VERSION = 1;
 export const AI_IMPORT_GROUP = "AI 导入";
 export const MAX_SERVER_IMPORT_RECORDS = 5_000;

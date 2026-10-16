@@ -28,6 +28,7 @@ import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalPane } from "./components/TerminalPane";
 import { TransferPanel } from "./components/TransferPanel";
 import { SystemDock } from "./components/SystemDock";
+import { WindowControls } from "./components/WindowControls";
 import { DEV_BOOTSTRAP } from "./devBootstrap";
 import { AI_HISTORY_UPDATED_EVENT, initializeAiConversations, readAiConversations } from "./aiHistory";
 import {
@@ -985,7 +986,7 @@ export default function App() {
     const exportGroups = scope === undefined ? savedGroups : selectGroupsInGroup(savedGroups, scope);
     const safeName = scope !== undefined
       ? (normalizeGroupPath(scope).replace(/[\\/:*?"<>|]+/g, "-") || "ungrouped")
-      : "portico-servers";
+      : "sshStar-servers";
     try {
       const includeSecrets = aiConfig.serverImportExport.includeSecretsInExport;
       const exportServers = includeSecrets && isTauri()
@@ -1134,10 +1135,10 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className="titlebar" data-tauri-drag-region>
+      <header className="titlebar" data-tauri-drag-region="deep">
         <div className="brand-lockup">
           <div className="brand-mark"><Command size={14} /></div>
-          <span>Portico SSH</span>
+          <span>sshStar</span>
         </div>
         <div className="titlebar-status">
           <span className={`connection-indicator ${activeSession?.connected ? "online" : ""}`} />
@@ -1159,8 +1160,9 @@ export default function App() {
             </span>
           )}
         </div>
-        <div className="titlebar-actions">
+        <div className="titlebar-actions" data-tauri-drag-region="false">
           <button className="icon-button quiet" aria-label="通知" title="通知"><Bell size={14} /></button>
+          <WindowControls />
         </div>
       </header>
 

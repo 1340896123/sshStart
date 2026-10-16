@@ -12,23 +12,23 @@ const SALT_BYTES: usize = 16;
 const PASSPHRASE_ITERATIONS: u32 = 600_000;
 const PASSPHRASE_MIN_ITERATIONS: u32 = 100_000;
 const PASSPHRASE_MAX_ITERATIONS: u32 = 2_000_000;
-const KEY_BACKUP_AAD: &[u8] = b"portico-key-backup-v1";
+const KEY_BACKUP_AAD: &[u8] = b"sshstar-key-backup-v1";
 const KEY_FILE: &str = "sync.key";
 const CLOUD_KEY_FILE: &str = "cloud.key";
 
-pub fn portico_directory() -> Result<PathBuf, String> {
+pub fn sshstar_directory() -> Result<PathBuf, String> {
     let home = env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
         .ok_or_else(|| "无法定位用户主目录，不能初始化同步密钥".to_string())?;
-    Ok(PathBuf::from(home).join(".porticossh"))
+    Ok(PathBuf::from(home).join(".sshStar"))
 }
 
 fn key_path() -> Result<PathBuf, String> {
-    Ok(portico_directory()?.join(KEY_FILE))
+    Ok(sshstar_directory()?.join(KEY_FILE))
 }
 
 fn cloud_key_path() -> Result<PathBuf, String> {
-    Ok(portico_directory()?.join(CLOUD_KEY_FILE))
+    Ok(sshstar_directory()?.join(CLOUD_KEY_FILE))
 }
 
 fn decode_key_file(path: &std::path::Path, label: &str) -> Result<Option<[u8; KEY_BYTES]>, String> {
@@ -304,7 +304,7 @@ pub fn decrypt_with_passphrase(raw: &str, passphrase: &str) -> Result<Vec<u8>, S
 mod tests {
     #[test]
     fn passphrase_encryption_round_trips_binary_data() {
-        let plaintext = b"portico\0private-key\xff";
+        let plaintext = b"sshstar\0private-key\xff";
         let encrypted = super::encrypt_with_passphrase(plaintext, "correct horse battery staple")
             .expect("encryption should succeed");
         assert!(!encrypted.contains("private-key"));

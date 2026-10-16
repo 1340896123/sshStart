@@ -18,7 +18,7 @@ registerHooks({
   },
 });
 globalThis.window = { __TAURI_INTERNALS__: {} };
-mock.module("../src/monaco.ts", { namedExports: { definePorticoEditorTheme() {} } });
+mock.module("../src/monaco.ts", { namedExports: { defineSshStarEditorTheme() {} } });
 mock.module("@monaco-editor/react", { defaultExport: (props) => React.createElement("test-editor", props) });
 let invokeHandler;
 mock.module("@tauri-apps/api/core", { namedExports: { invoke: (...args) => invokeHandler(...args) } });

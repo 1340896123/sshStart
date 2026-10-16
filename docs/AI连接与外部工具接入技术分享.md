@@ -1,21 +1,21 @@
-# Portico SSH 的 AI 连接与外部工具接入技术解析
+# sshStar 的 AI 连接与外部工具接入技术解析
 
 > 面向对象：AI 应用工程师、桌面端工程师、平台工程师、SRE、安全工程师<br>
 > 分析范围：模型 Provider 接入、流式响应、Function Calling、SSH/SFTP 工具执行、人工审批与上下文管理<br>
-> 项目版本：Portico SSH 0.1.0，基于 2026-08-03 当前工作区代码
+> 项目版本：sshStar 0.1.0，基于 2026-08-03 当前工作区代码
 
 ## 1. 分享目标
 
 本文回答四个核心问题：
 
-1. Portico SSH 如何连接 OpenAI 兼容模型，并兼容 Chat Completions 与 Responses 两种 API。
+1. sshStar 如何连接 OpenAI 兼容模型，并兼容 Chat Completions 与 Responses 两种 API。
 2. 模型如何获得 SSH、SFTP、系统诊断等外部能力，并形成多轮 Agent 工具调用闭环。
 3. 流式文本、推理摘要、工具状态和最终结果如何跨越 Provider、Rust 后端与 React 前端。
 4. 当前架构的安全边界、技术限制，以及演进到 MCP/动态工具生态所需的改造。
 
 ## 2. 结论先行
 
-Portico SSH 的 AI 子系统采用了典型的 **桌面端 Agent + 本地可信执行器** 架构：
+sshStar 的 AI 子系统采用了典型的 **桌面端 Agent + 本地可信执行器** 架构：
 
 - React 前端负责会话状态、流式渲染、工具卡片和人工审批交互。
 - Tauri/Rust 后端负责读取密钥、调用模型 API、解析 SSE、执行 Agent 循环和实施安全策略。
@@ -146,10 +146,10 @@ await saveAiConfigToStorage(serializeAiConfig(nextConfig));
 
 源码：[`src/App.tsx:34`](../src/App.tsx#L34)、[`src/App.tsx:283`](../src/App.tsx#L283)
 
-Rust 侧以 `com.portico.ssh` 为服务名写入操作系统凭据库，实际请求前再读取 `ai:api-key`：
+Rust 侧以 `com.sshstar.app` 为服务名写入操作系统凭据库，实际请求前再读取 `ai:api-key`：
 
 ```rust
-const KEYRING_SERVICE: &str = "com.portico.ssh";
+const KEYRING_SERVICE: &str = "com.sshstar.app";
 
 fn read_secret(account: &str) -> Option<String> {
     keyring_entry(account).ok()?.get_password().ok()
@@ -702,7 +702,7 @@ Rust 测试已覆盖若干核心风险点：
 
 ## 14. 分享总结
 
-Portico SSH 已经具备一个完整的本地 Agent 骨架：
+sshStar 已经具备一个完整的本地 Agent 骨架：
 
 ```text
 用户消息

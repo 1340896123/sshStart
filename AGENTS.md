@@ -12,4 +12,4 @@
   npm run tauri build
   ```
 
-- **Build artifacts:** `src-tauri/target/release/bundle/msi/Portico SSH_0.1.0_x64_en-US.msi` and `src-tauri/target/release/bundle/nsis/Portico SSH_0.1.0_x64-setup.exe`. The `target` directory is generated output and is not committed.
+- **Build artifacts:** `src-tauri/target/release/bundle/msi/sshStar_0.1.0_x64_en-US.msi` and `src-tauri/target/release/bundle/nsis/sshStar_0.1.0_x64-setup.exe`. The `target` directory is generated output and is not committed.

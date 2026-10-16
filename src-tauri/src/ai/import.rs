@@ -124,7 +124,7 @@ where
     M: CompletionModel + 'static,
 {
     AgentBuilder::new(model)
-        .name("portico-server-import-parser")
+        .name("sshStar-server-import-parser")
         .preamble("你是结构化数据提取器，只能输出符合要求的 JSON。")
         .temperature(0.0)
         .max_tokens(16_384)

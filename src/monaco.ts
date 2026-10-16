@@ -18,11 +18,11 @@ self.MonacoEnvironment = {
 };
 
 // Read the workspace tokens just before an editor mounts, after CSS has loaded.
-export function definePorticoEditorTheme() {
+export function defineSshStarEditorTheme() {
   const tokens = getComputedStyle(document.documentElement);
   const color = (name: string) => normalizeMonacoColor(tokens.getPropertyValue(name));
 
-  monaco.editor.defineTheme("portico", {
+  monaco.editor.defineTheme("sshstar", {
     base: "vs",
     inherit: true,
     rules: [],
