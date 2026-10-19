@@ -98,7 +98,7 @@ export function TransferPanel({ transfers, onActivateSession, onClearFinished, o
   };
 
   return (
-    <aside className="server-sidebar transfer-sidebar" aria-label="传输列表">
+    <aside id="transfer-sidebar" className="server-sidebar transfer-sidebar" aria-label="传输列表">
       <div className="sidebar-heading">
         <div>
           <span className="eyebrow">任务中心</span>

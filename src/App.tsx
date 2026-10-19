@@ -24,6 +24,7 @@ import { ColumnSplitter } from "./components/ColumnSplitter";
 import { FilePane } from "./components/FilePane";
 import { ServerDialog } from "./components/ServerDialog";
 import { ServerTree } from "./components/ServerTree";
+import { SnippetPane } from "./components/SnippetPane";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalPane } from "./components/TerminalPane";
 import { TransferPanel } from "./components/TransferPanel";
@@ -139,7 +140,8 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [sidebarView, setSidebarView] = useState<"servers" | "transfers">("servers");
+  const [sidebarView, setSidebarView] = useState<"servers" | "snippets" | "transfers">("servers");
+  const [snippetSearch, setSnippetSearch] = useState("");
   const [aiOpen, setAiOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [aiPaneWidth, setAiPaneWidth] = useState(initialAiPaneWidth);
@@ -853,8 +855,8 @@ export default function App() {
     await navigator.clipboard.writeText(task.destinationPath);
   };
 
-  const selectSidebar = (view: "servers" | "transfers") => {
-    if (view === "servers" && sidebarOpen && sidebarView === view) {
+  const selectSidebar = (view: typeof sidebarView) => {
+    if (sidebarOpen && sidebarView === view) {
       setSidebarOpen(false);
       return;
     }
@@ -1169,6 +1171,7 @@ export default function App() {
       <div
         ref={appBodyRef}
         className="app-body"
+        data-ai-open={aiOpen}
         style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
       >
         <nav className="activity-rail" aria-label="主导航">
@@ -1184,11 +1187,35 @@ export default function App() {
             >
               <SquareTerminal size={18} />
             </button>
-            <button className="activity-button" title="命令片段"><Braces size={18} /></button>
-            <button className={`activity-button ${aiOpen ? "active" : ""}`} title="AI 助手" aria-label="AI 助手" aria-pressed={aiOpen} onClick={() => setAiOpen((open) => !open)}><Sparkles size={18} /></button>
+            <button
+              className={`activity-button ${sidebarOpen && sidebarView === "snippets" ? "active" : ""}`}
+              type="button"
+              title={sidebarOpen && sidebarView === "snippets" ? "隐藏命令片段" : "显示命令片段"}
+              aria-label="命令片段"
+              aria-expanded={sidebarOpen && sidebarView === "snippets"}
+              aria-controls="snippet-sidebar"
+              onClick={() => selectSidebar("snippets")}
+            ><Braces size={18} /></button>
+            <button
+              className={`activity-button ${aiOpen ? "active" : ""}`}
+              type="button"
+              title="AI 助手"
+              aria-label="AI 助手"
+              aria-expanded={aiOpen}
+              aria-controls={activeSession ? `ai-pane-${activeSession.id}` : "ai-pane-empty"}
+              onClick={() => setAiOpen((open) => !open)}
+            ><Sparkles size={18} /></button>
           </div>
           <div className="activity-footer">
-            <button className={`activity-button transfer-activity ${sidebarView === "transfers" ? "active" : ""}`} title="文件传输" onClick={() => selectSidebar("transfers")}>
+            <button
+              className={`activity-button transfer-activity ${sidebarOpen && sidebarView === "transfers" ? "active" : ""}`}
+              type="button"
+              title="文件传输"
+              aria-label="文件传输"
+              aria-expanded={sidebarOpen && sidebarView === "transfers"}
+              aria-controls="transfer-sidebar"
+              onClick={() => selectSidebar("transfers")}
+            >
               <FolderSync size={18} />
               {activeTransferCount > 0 && <span className="activity-badge">{activeTransferCount > 9 ? "9+" : activeTransferCount}</span>}
             </button>
@@ -1232,6 +1259,9 @@ export default function App() {
             />
           </aside>
         )}
+        {sidebarOpen && sidebarView === "snippets" && (
+          <SnippetPane search={snippetSearch} onSearchChange={setSnippetSearch} />
+        )}
         {sidebarOpen && sidebarView === "transfers" && (
           <TransferPanel
             transfers={transfers}
@@ -1247,7 +1277,7 @@ export default function App() {
         )}
         {sidebarOpen && (
           <ColumnSplitter
-            label="调整服务器栏宽度"
+            label="调整侧边栏宽度"
             value={sidebarWidth}
             min={SIDEBAR_MIN_WIDTH}
             max={SIDEBAR_MAX_WIDTH}
@@ -1258,7 +1288,14 @@ export default function App() {
 
         <main className="workspace">
           <div className="session-strip">
-            <button className="icon-button quiet" title={sidebarOpen ? "收起侧边栏" : "展开侧边栏"} onClick={() => setSidebarOpen((open) => !open)}>
+            <button
+              className="icon-button quiet"
+              title={sidebarOpen ? "收起侧边栏" : "展开侧边栏"}
+              aria-label={sidebarOpen ? "收起侧边栏" : "展开侧边栏"}
+              aria-expanded={sidebarOpen}
+              aria-controls={sidebarView === "servers" ? "server-sidebar" : sidebarView === "snippets" ? "snippet-sidebar" : "transfer-sidebar"}
+              onClick={() => setSidebarOpen((open) => !open)}
+            >
               <PanelLeftClose className={sidebarOpen ? "" : "flipped"} size={15} />
             </button>
             <div className="session-tabs">
@@ -1291,11 +1328,37 @@ export default function App() {
           </div>
 
           {sessions.length === 0 ? (
-            <div className="empty-workspace">
-              <div className="empty-glyph"><Server size={24} /></div>
-              <h2>选择一台服务器开始</h2>
-              <p>在左侧选择连接，双击服务器或按 Enter 即可打开会话。</p>
-              <button className="primary-button" onClick={() => openServerDialog()}><Plus size={14} /> 添加第一台服务器</button>
+            <div className="workspace-session active" style={{ "--ai-pane-width": `${aiPaneWidth}px` } as CSSProperties}>
+              <div className="empty-workspace">
+                <div className="empty-glyph"><Server size={24} /></div>
+                <h2>选择一台服务器开始</h2>
+                <p>在左侧选择连接，双击服务器或按 Enter 即可打开会话。</p>
+                <button className="primary-button" onClick={() => openServerDialog()}><Plus size={14} /> 添加第一台服务器</button>
+              </div>
+              {aiOpen && (
+                <>
+                  <ColumnSplitter
+                    label="调整 AI 助手宽度"
+                    value={aiPaneWidth}
+                    min={AI_PANE_MIN_WIDTH}
+                    max={AI_PANE_MAX_WIDTH}
+                    pane="next"
+                    onChange={resizeAiPane}
+                  />
+                  <aside id="ai-pane-empty" className="ai-pane ai-empty-pane" aria-label="AI 助手">
+                    <div className="ai-header">
+                      <div className="pane-title"><Sparkles size={14} /><span>AI 助手</span></div>
+                      <button className="icon-button quiet" title="关闭助手" aria-label="关闭助手" onClick={() => setAiOpen(false)}><X size={14} /></button>
+                    </div>
+                    <div className="ai-empty-state">
+                      <Sparkles size={28} aria-hidden="true" />
+                      <h2>连接服务器后开始对话</h2>
+                      <p>选择并打开一台服务器，助手会结合当前会话分析问题。</p>
+                      <button className="secondary-button" onClick={() => { setSidebarView("servers"); setSidebarOpen(true); }}>选择服务器</button>
+                    </div>
+                  </aside>
+                </>
+              )}
             </div>
           ) : (
             <div className="workspace-sessions">
@@ -1323,18 +1386,24 @@ export default function App() {
                       />
                     </section>
                     {aiOpen && (
-                      <>
-                        <ColumnSplitter
-                          label="调整 AI 助手宽度"
-                          value={aiPaneWidth}
-                          min={AI_PANE_MIN_WIDTH}
-                          max={AI_PANE_MAX_WIDTH}
-                          pane="next"
-                          onChange={resizeAiPane}
-                        />
-                        <AiPane session={session} server={server} config={aiConfig} onUpdate={(patch) => updateSession(session.id, patch)} onOpenSettings={() => setSettingsOpen(true)} />
-                      </>
+                      <ColumnSplitter
+                        label="调整 AI 助手宽度"
+                        value={aiPaneWidth}
+                        min={AI_PANE_MIN_WIDTH}
+                        max={AI_PANE_MAX_WIDTH}
+                        pane="next"
+                        onChange={resizeAiPane}
+                      />
                     )}
+                    <AiPane
+                      session={session}
+                      server={server}
+                      config={aiConfig}
+                      hidden={!aiOpen}
+                      onUpdate={(patch) => updateSession(session.id, patch)}
+                      onOpenSettings={() => setSettingsOpen(true)}
+                      onClose={() => setAiOpen(false)}
+                    />
                     {!aiOpen && (
                       <button className="ai-reopen" title="打开 AI 助手" onClick={() => setAiOpen(true)}><Sparkles size={16} /></button>
                     )}

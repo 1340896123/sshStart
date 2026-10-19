@@ -66,8 +66,10 @@ interface Props {
   session: SessionState;
   server: ServerProfile;
   config: AiConfig;
+  hidden?: boolean;
   onUpdate: (patch: Partial<SessionState>) => void;
   onOpenSettings: () => void;
+  onClose: () => void;
 }
 
 interface DraftAiAttachment extends Omit<AiImageAttachment, "remotePath"> {
@@ -301,7 +303,7 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
   );
 }
 
-export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Props) {
+export function AiPane({ session, server, config, hidden = false, onUpdate, onOpenSettings, onClose }: Props) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<DraftAiAttachment[]>([]);
   const [pasteNotice, setPasteNotice] = useState<string>();
@@ -389,7 +391,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     const container = messagesContainerRef.current;
     if (!container || !shouldStickToBottomRef.current) return;
     container.scrollTop = container.scrollHeight;
-  }, [session.aiMessages]);
+  }, [session.aiMessages, hidden]);
 
   useLayoutEffect(() => {
     const textarea = inputRef.current;
@@ -397,7 +399,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
     textarea.style.height = "auto";
     textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
     textarea.style.overflowY = textarea.scrollHeight > 200 ? "auto" : "hidden";
-  }, [input]);
+  }, [input, hidden]);
 
   useEffect(() => {
     const syncHistory = (event: Event) => {
@@ -583,7 +585,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
   };
 
   return (
-    <aside className="ai-pane">
+    <aside id={`ai-pane-${session.id}`} className="ai-pane" hidden={hidden} aria-label="AI 助手">
       <div className="ai-header">
         <div className="pane-title">
           <Sparkles size={14} />
@@ -621,7 +623,7 @@ export function AiPane({ session, server, config, onUpdate, onOpenSettings }: Pr
           className="icon-button quiet"
           title="关闭助手"
           aria-label="关闭助手"
-          onClick={() => document.querySelector<HTMLButtonElement>('.activity-button[title="AI 助手"]')?.click()}
+          onClick={onClose}
         >
           <X size={14} />
         </button>

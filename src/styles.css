@@ -102,6 +102,7 @@
   --window-control-close-fg-hover: var(--surface-raised);
   --activity-rail-width: 48px;
   --session-strip-height: 40px;
+  --operations-min-width: 450px;
   --font-display: 'Inter', 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --font-body: var(--font-display);
   --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
@@ -329,6 +330,7 @@ button:disabled {
 }
 
 .app-body {
+  min-width: 0;
   min-height: 0;
   display: flex;
 }
@@ -478,6 +480,53 @@ body.is-resizing-columns * {
 .transfer-sidebar {
   grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   container-type: inline-size;
+}
+
+.snippet-sidebar {
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+}
+
+.snippet-hint,
+.snippet-copy-status {
+  margin: 10px 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.snippet-copy-status {
+  min-height: 17px;
+  margin-bottom: 0;
+}
+
+.snippet-list {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.snippet-card {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+
+.snippet-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.snippet-card code {
+  display: block;
+  padding-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  user-select: text;
 }
 
 .transfer-summary {
@@ -1421,11 +1470,15 @@ kbd {
 }
 
 .workspace {
-  min-width: 0;
+  min-width: calc(var(--operations-min-width) + 34px);
   min-height: 0;
   flex: 1;
   display: grid;
   grid-template-rows: var(--session-strip-height) minmax(0, 1fr);
+}
+
+.app-body[data-ai-open="true"] .workspace {
+  min-width: calc(var(--operations-min-width) + 307px);
 }
 
 .session-strip {
@@ -1519,7 +1572,10 @@ kbd {
 
 .empty-workspace {
   display: flex;
+  flex: 1;
+  min-width: 0;
   min-height: 0;
+  padding: 20px;
   align-items: center;
   justify-content: center;
   flex-direction: column;
@@ -1571,7 +1627,7 @@ kbd {
 
 .operations-column {
   position: relative;
-  min-width: 450px;
+  min-width: var(--operations-min-width);
   min-height: 0;
   flex: 1;
   display: grid;
@@ -3109,6 +3165,39 @@ body.is-resizing-rows .system-dock {
   display: grid;
   grid-template-rows: 34px 28px minmax(0, 1fr) auto;
   background: var(--surface-raised);
+}
+
+.ai-pane[hidden] {
+  display: none;
+}
+
+.ai-empty-pane {
+  grid-template-rows: 34px minmax(0, 1fr);
+}
+
+.ai-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  padding: 24px;
+  text-align: center;
+}
+
+.ai-empty-state > svg {
+  margin-bottom: 16px;
+  color: var(--accent);
+}
+
+.ai-empty-state h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.ai-empty-state p {
+  margin: 8px 0 18px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .ai-header .pane-title {
@@ -6463,8 +6552,8 @@ body.is-resizing-rows .system-dock {
 }
 
 @media (max-width: 1100px) {
-  .operations-column {
-    min-width: 380px;
+  :root {
+    --operations-min-width: 380px;
   }
 
   .server-copy span {

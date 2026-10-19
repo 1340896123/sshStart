@@ -1,5 +1,12 @@
 # 文件编辑保存 E2E
 
+侧边栏切换的独立浏览器回归运行 `npm run test:e2e:sidebar`。
+它自动启动生产前端预览，在 Windows 使用已安装的 Edge，覆盖服务器 / 命令片段 /
+文件传输的切换、收起与高亮，片段搜索和复制，无会话时的 AI 提示，AI 草稿与终端保留，
+以及窗口缩小到 960px 时的布局。测试不访问 SSH 或 AI 服务，截图保存在
+`output/sidebar-e2e/`。其他系统可先运行 `python -m playwright install chromium`，
+也可通过 `SSHSTAR_TEST_BROWSER_CHANNEL` 指定浏览器。
+
 Windows 下使用真实 WebView2、Tauri IPC、Rust SSH 客户端和本地 Paramiko SSH/SFTP 服务。
 测试页面挂载生产 `FilePane` / `FileEditor` / Monaco，不替换 `invoke`。
 本地服务提供确定的 Unix 权限、所有者、符号链接和故障注入；不访问生产服务器。
