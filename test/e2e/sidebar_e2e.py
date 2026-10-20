@@ -143,6 +143,120 @@ class SidebarTests(unittest.TestCase):
         expect(draft).to_have_value("draft one\nkeep this text")
         self.check_navigation()
 
+    def test_ai_model_and_effort_are_saved_and_sent(self):
+        self.open_session()
+        # Mock desktop IPC only; exercise the production React UI and agent hook.
+        self.page.evaluate("""() => {
+            window.aiCalls = [];
+            window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+            window.__TAURI_INTERNALS__ = {
+                metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+                transformCallback() { return 1; },
+                async invoke(command, args) {
+                    window.aiCalls.push({ command, args });
+                    if (command === 'list_rig_models') return ['test-fast', 'test-reasoning', 'test-fast'];
+                    if (command === 'plugin:event|listen') return 1;
+                    if (command === 'run_ai_agent') return new Promise(resolve => { window.finishAi = resolve; });
+                    return null;
+                }
+            };
+        }""")
+        pane = self.page.locator(".workspace-session.active .ai-pane")
+        expect(pane.get_by_role("button", name="允许使用工具", exact=True)).to_have_count(0)
+        permissions = pane.get_by_label("助手权限", exact=True)
+        expect(permissions).to_have_value("request")
+        permissions.select_option("chat-only")
+        model = pane.get_by_role("button", name="选择模型：")
+        model.click()
+        picker = pane.get_by_role("dialog", name="选择对话模型")
+        expect(picker.get_by_role("button", name="test-fast", exact=True)).to_have_count(1)
+        picker.get_by_role("button", name="test-reasoning", exact=True).click()
+        expect(model).to_have_attribute("aria-label", "选择模型：test-reasoning")
+        pane.get_by_label("思考强度", exact=True).select_option("xhigh")
+        self.page.wait_for_function("window.aiCalls.some(c => c.command === 'save_ai_config' && c.args.config.model === 'test-reasoning' && c.args.config.reasoningEffort === 'xhigh')")
+        draft = pane.get_by_role("textbox", name="给 AI 助手发送消息")
+        draft.fill("检查服务状态")
+        draft.press("Shift+Enter")
+        expect(draft).to_have_value("检查服务状态\n")
+        draft.press("Enter")
+        expect(pane.get_by_role("button", name="停止助手")).to_be_visible()
+        expect(model).to_be_disabled()
+        expect(pane.get_by_label("思考强度", exact=True)).to_be_disabled()
+        expect(permissions).to_be_disabled()
+        request = self.page.evaluate("window.aiCalls.find(c => c.command === 'run_ai_agent').args")
+        self.assertFalse(request["allowTools"])
+        self.assertEqual(request["config"]["model"], "test-reasoning")
+        self.assertEqual(request["config"]["reasoningEffort"], "xhigh")
+        self.assertEqual(request["messages"][-1]["content"], "检查服务状态")
+        self.page.evaluate("""window.finishAi({
+            content: '服务运行正常。\\n\\n- CPU 使用率：12%\\n- 内存使用率：38%\\n\\n可以继续查看日志，或检查最近一次部署。',
+            usage: { available: true, inputTokens: 500, outputTokens: 80, totalTokens: 580, cachedTokens: 100, reasoningTokens: 20, contextTokens: 500, requests: 1 }
+        })""")
+        expect(pane.locator(".markdown-body")).to_contain_text("服务运行正常")
+        expect(model).to_be_enabled()
+        pane.screenshot(path=str(OUTPUT / "ai-chat.png"))
+        model.click()
+        pane.get_by_role("textbox", name="搜索或输入模型 ID").fill("test-fast")
+        pane.get_by_role("button", name="test-fast", exact=True).click()
+        expect(pane.get_by_label("思考强度", exact=True)).to_have_value("xhigh")
+        for policy in ["request", "full-access"]:
+            permissions.select_option(policy)
+            draft.fill("继续检查")
+            draft.press("Enter")
+            self.page.wait_for_function("count => window.aiCalls.filter(c => c.command === 'run_ai_agent').length === count", arg=2 if policy == "request" else 3)
+            request = self.page.evaluate("window.aiCalls.filter(c => c.command === 'run_ai_agent').at(-1).args")
+            self.assertTrue(request["allowTools"])
+            self.assertEqual(request["approvalPolicy"], policy)
+            expect(permissions).to_be_enabled()
+            expect(permissions.locator('option[value="chat-only"]')).to_have_attribute("disabled", "")
+            self.page.evaluate("window.finishAi({ content: '检查完成', usage: { available: false } })")
+            expect(pane.get_by_role("button", name="发送", exact=True)).to_be_visible()
+
+    def test_ai_custom_model_fallback_and_keyboard_dismiss(self):
+        self.open_session()
+        pane = self.page.locator(".workspace-session.active .ai-pane")
+        model = pane.get_by_role("button", name="选择模型：")
+        model.click()
+        search = pane.get_by_role("textbox", name="搜索或输入模型 ID")
+        expect(search).to_be_focused()
+        expect(pane.get_by_role("status")).to_contain_text("可输入模型 ID")
+        search.fill("private/custom-reasoning-model")
+        search.press("Enter")
+        expect(model).to_have_attribute("aria-label", "选择模型：private/custom-reasoning-model")
+        effort = pane.get_by_label("思考强度", exact=True)
+        for value in ["none", "minimal", "low", "medium", "high", "xhigh", "auto"]:
+            effort.select_option(value)
+            expect(effort).to_have_value(value)
+        model.click()
+        search.press("Escape")
+        expect(pane.get_by_role("dialog", name="选择对话模型")).to_have_count(0)
+        expect(model).to_be_focused()
+        model.click()
+        pane.get_by_role("textbox", name="给 AI 助手发送消息").click()
+        expect(pane.get_by_role("dialog", name="选择对话模型")).to_have_count(0)
+        pane.get_by_role("button", name="助手设置", exact=True).click()
+        expect(self.page.locator(".settings-model-control input").first).to_have_value("private/custom-reasoning-model")
+
+    def test_ai_composer_controls_fit_narrow_pane(self):
+        self.open_session()
+        separator = self.page.get_by_role("separator", name="调整 AI 助手宽度")
+        for key in ["Home", "End"]:
+            separator.press(key)
+            pane = self.page.locator(".workspace-session.active .ai-pane")
+            bounds = pane.bounding_box()
+            for control in [".composer-add-button", ".approval-policy-control", ".composer-model-trigger", ".composer-effort-control", ".send-button"]:
+                box = pane.locator(control).bounding_box()
+                self.assertGreaterEqual(box["x"], bounds["x"])
+                self.assertLessEqual(box["x"] + box["width"], bounds["x"] + bounds["width"])
+            pane.get_by_role("button", name="选择模型：").click()
+            picker = pane.get_by_role("dialog", name="选择对话模型")
+            expect(picker).to_be_visible()
+            box = picker.bounding_box()
+            self.assertGreaterEqual(box["x"], bounds["x"])
+            self.assertLessEqual(box["x"] + box["width"], bounds["x"] + bounds["width"])
+            pane.screenshot(path=str(OUTPUT / f"ai-composer-{key.lower()}.png"))
+            self.page.keyboard.press("Escape")
+
     def test_narrow_window_keeps_panels_inside_workspace(self):
         self.open_session()
         self.page.get_by_role("separator", name="调整侧边栏宽度").press("End")

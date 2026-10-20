@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod cache_tests;
+mod compat;
 pub(crate) mod import;
 mod policy;
 mod runtime;
@@ -54,6 +57,31 @@ impl AiApiMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AiReasoningEffort {
+    #[default]
+    Auto,
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl AiReasoningEffort {
+    fn additional_params(self, mode: AiApiMode) -> Option<serde_json::Value> {
+        if self == Self::Auto {
+            return None;
+        }
+        Some(match mode {
+            AiApiMode::Responses => serde_json::json!({ "reasoning": { "effort": self } }),
+            AiApiMode::ChatCompletions => serde_json::json!({ "reasoning_effort": self }),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AiConfig {
@@ -62,6 +90,8 @@ pub(crate) struct AiConfig {
     endpoint: String,
     api_key: String,
     model: String,
+    #[serde(default)]
+    reasoning_effort: AiReasoningEffort,
     #[serde(default)]
     reviewer_model: String,
     #[serde(default = "default_max_output_tokens")]
@@ -90,6 +120,8 @@ pub(crate) struct AiInputMessage {
     content: String,
     #[serde(default)]
     attachments: Vec<AiAttachmentReference>,
+    #[serde(default)]
+    model_messages: Option<serde_json::Value>,
 }
 
 impl AiInputMessage {
@@ -138,7 +170,7 @@ pub(crate) struct AiTokenUsage {
 }
 
 impl AiTokenUsage {
-    fn from_rig(usage: Usage, requests: u32) -> Self {
+    fn from_rig(usage: Usage, requests: u32, context_tokens: u64) -> Self {
         Self {
             available: usage.has_values(),
             input_tokens: usage.input_tokens,
@@ -146,7 +178,7 @@ impl AiTokenUsage {
             total_tokens: usage.total_tokens,
             cached_tokens: usage.cached_input_tokens,
             reasoning_tokens: usage.reasoning_tokens,
-            context_tokens: usage.input_tokens,
+            context_tokens,
             requests,
         }
     }
@@ -158,6 +190,7 @@ pub(crate) struct AiRunResult {
     content: String,
     reasoning: Option<String>,
     usage: AiTokenUsage,
+    model_messages: Vec<Message>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -330,7 +363,7 @@ pub(crate) async fn run_ai_agent(
         }
         AiApiMode::ChatCompletions => {
             run_with_model(
-                client.completions_api().completion_model(&config.model),
+                compat::chat_model(client, &config.model),
                 runtime.clone(),
                 sink.clone(),
                 cancellation,
@@ -419,14 +452,17 @@ where
         server.port,
         approval_policy.borrow().instructions(),
     );
-    let agent = AgentBuilder::new(model)
+    let mut agent = AgentBuilder::new(model)
         .name("sshStar-agent")
         .preamble(&preamble)
         .temperature(config.temperature as f64)
         .max_tokens(config.max_output_tokens as u64)
         .default_max_turns(config.tools.max_tool_rounds.max(1) as usize)
-        .dynamic_tools(dynamic_tools)
-        .build();
+        .dynamic_tools(dynamic_tools);
+    if let Some(params) = config.reasoning_effort.additional_params(config.api_mode) {
+        agent = agent.additional_params(params);
+    }
+    let agent = agent.build();
     let hook = RunHook::new(
         runtime,
         sink.clone(),
@@ -448,7 +484,9 @@ where
     let mut reasoning = String::new();
     let mut usage = Usage::new();
     let mut requests = 0u32;
+    let mut context_tokens = 0;
     let mut final_content = None;
+    let mut model_messages = Vec::new();
 
     loop {
         let item = tokio::select! {
@@ -478,20 +516,32 @@ where
                 _ => {}
             },
             MultiTurnStreamItem::CompletionCall(call) => {
+                context_tokens = call.usage.input_tokens;
                 usage += call.usage;
                 requests = requests.saturating_add(1);
-                let snapshot = AiTokenUsage::from_rig(usage, requests);
+                let snapshot = AiTokenUsage::from_rig(usage, requests, context_tokens);
                 sink.emit(AiAgentEventKind::Usage {
+                    available: snapshot.available,
                     input_tokens: snapshot.input_tokens,
                     output_tokens: snapshot.output_tokens,
                     total_tokens: snapshot.total_tokens,
                     cached_tokens: snapshot.cached_tokens,
                     reasoning_tokens: snapshot.reasoning_tokens,
+                    context_tokens: snapshot.context_tokens,
                     requests: snapshot.requests,
                 });
             }
             MultiTurnStreamItem::FinalResponse(response) => {
                 usage = response.usage;
+                // Rig returns this run's transcript, starting with its user
+                // prompt. Store only the assistant/tool continuation so the
+                // next request can append it after that user's message.
+                model_messages = response
+                    .messages
+                    .unwrap_or_default()
+                    .into_iter()
+                    .skip(1)
+                    .collect();
                 final_content = Some(response.output);
             }
             _ => {}
@@ -505,7 +555,8 @@ where
     Ok(AiRunResult {
         content,
         reasoning: (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_string()),
-        usage: AiTokenUsage::from_rig(usage, requests),
+        usage: AiTokenUsage::from_rig(usage, requests, context_tokens),
+        model_messages,
     })
 }
 
@@ -529,13 +580,29 @@ fn split_messages(messages: Vec<AiInputMessage>) -> Result<(Message, Vec<Message
     let history = messages
         .into_iter()
         .take(last_user)
-        .filter_map(|message| match message.role.as_str() {
-            "user" => Some(Message::user(message.content())),
-            "assistant" => Some(Message::assistant(message.content())),
-            _ => None,
+        .flat_map(|message| match message.role.as_str() {
+            "user" => vec![Message::user(message.content())],
+            "assistant" => restored_model_messages(&message)
+                .unwrap_or_else(|| vec![Message::assistant(message.content())]),
+            _ => Vec::new(),
         })
         .collect();
     Ok((prompt, history))
+}
+
+fn restored_model_messages(message: &AiInputMessage) -> Option<Vec<Message>> {
+    let messages: Vec<Message> = serde_json::from_value(message.model_messages.clone()?).ok()?;
+    // Older conversations have no transcript. Ignore corrupt/stale data and
+    // never restore system instructions from saved assistant content.
+    if !matches!(messages.first(), Some(Message::Assistant { .. }))
+        || !matches!(messages.last(), Some(Message::Assistant { .. }))
+        || messages
+            .iter()
+            .any(|message| matches!(message, Message::System { .. }))
+    {
+        return None;
+    }
+    Some(messages)
 }
 
 fn openai_client(config: &AiConfig, api_key: &str) -> Result<openai::Client, String> {
@@ -590,7 +657,45 @@ fn default_temperature() -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_approval_review, parse_model_ids, provider_base_url};
+    use super::{
+        openai, parse_approval_review, parse_model_ids, provider_base_url, AiApiMode, AiConfig,
+        AiReasoningEffort,
+    };
+
+    #[test]
+    fn reasoning_effort_defaults_preserve_legacy_requests() {
+        let config: AiConfig = serde_json::from_value(serde_json::json!({
+            "endpoint": "https://example.test/v1", "apiKey": "", "model": "custom-model", "systemPrompt": ""
+        })).expect("legacy config should deserialize");
+        assert_eq!(config.reasoning_effort, AiReasoningEffort::Auto);
+        for mode in [AiApiMode::Responses, AiApiMode::ChatCompletions] {
+            assert_eq!(config.reasoning_effort.additional_params(mode), None);
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_uses_each_api_wire_format() {
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+            let selected: AiReasoningEffort =
+                serde_json::from_value(serde_json::json!(effort)).unwrap();
+            let responses = selected.additional_params(AiApiMode::Responses).unwrap();
+            assert_eq!(
+                responses,
+                serde_json::json!({ "reasoning": { "effort": effort } })
+            );
+            // Check that Rig's typed Responses parameters preserve every selectable value.
+            let typed: openai::responses_api::AdditionalParameters =
+                serde_json::from_value(responses).unwrap();
+            assert_eq!(
+                serde_json::to_value(typed).unwrap()["reasoning"]["effort"],
+                effort
+            );
+            assert_eq!(
+                selected.additional_params(AiApiMode::ChatCompletions),
+                Some(serde_json::json!({ "reasoning_effort": effort }))
+            );
+        }
+    }
 
     #[test]
     fn parses_model_lists_without_optional_openai_fields() {

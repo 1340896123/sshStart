@@ -11,7 +11,7 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  Bot,
+  ArrowUp,
   BrainCircuit,
   Check,
   ChevronDown,
@@ -24,13 +24,12 @@ import {
   ImageIcon,
   MessageSquarePlus,
   Play,
-  Send,
+  Plus,
   ShieldAlert,
   ShieldCheck,
   Settings2,
   Sparkles,
   TerminalSquare,
-  User,
   X,
 } from "lucide-react";
 import {
@@ -49,6 +48,7 @@ import type {
   AiImageAttachment,
   AiMessage,
   AiMessageType,
+  AiModelSettings,
   AiReasoning,
   AiTextSegment,
   AiTokenUsage,
@@ -57,6 +57,7 @@ import type {
   SessionState,
 } from "../types";
 import { AiHistoryPopover } from "./AiHistoryPopover";
+import { AiModelControls } from "./AiModelControls";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage").then((module) => ({
   default: module.MarkdownMessage,
@@ -68,6 +69,7 @@ interface Props {
   config: AiConfig;
   hidden?: boolean;
   onUpdate: (patch: Partial<SessionState>) => void;
+  onModelSettingsChange: (patch: Partial<AiModelSettings>) => void;
   onOpenSettings: () => void;
   onClose: () => void;
 }
@@ -128,7 +130,10 @@ const MESSAGE_TYPE_LABELS: Record<AiMessageType, string> = {
   approval: "审批",
   error: "错误消息",
 };
-const APPROVAL_POLICY_META: Record<AiApprovalPolicy, { label: string; description: string }> = {
+type AiPermissionMode = AiApprovalPolicy | "chat-only";
+
+const PERMISSION_META: Record<AiPermissionMode, { label: string; description: string }> = {
+  "chat-only": { label: "仅对话", description: "只回答问题，不调用服务器工具" },
   request: { label: "请求批准", description: "高风险或变更型工具调用等待你确认" },
   reviewer: { label: "替我审批", description: "由设置中的审核模型逐次批准或拒绝" },
   "full-access": { label: "完全访问", description: "直接执行已启用工具，无需审批，并允许任务所需变更" },
@@ -303,7 +308,7 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
   );
 }
 
-export function AiPane({ session, server, config, hidden = false, onUpdate, onOpenSettings, onClose }: Props) {
+export function AiPane({ session, server, config, hidden = false, onUpdate, onModelSettingsChange, onOpenSettings, onClose }: Props) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<DraftAiAttachment[]>([]);
   const [pasteNotice, setPasteNotice] = useState<string>();
@@ -316,6 +321,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
   const conversationsRef = useRef(conversations);
   const messagesRef = useRef(session.aiMessages);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
   const historyControlRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const shouldStickToBottomRef = useRef(true);
@@ -345,6 +351,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
   };
 
   const approvalPolicy = session.approvalPolicy ?? "request";
+  const permissionMode: AiPermissionMode = allowTools ? approvalPolicy : "chat-only";
   const agent = useAiAgent({
     config,
     server,
@@ -565,6 +572,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
 
   const send = async (starter?: string) => {
     if (agent.running) return;
+    if (attachments.some((attachment) => attachment.status !== "ready")) return;
     const content = (starter ?? input).trim();
     const readyAttachments = attachments
       .filter((attachment): attachment is DraftAiAttachment & { remotePath: string } =>
@@ -578,6 +586,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
         size,
       }));
     if (!content && readyAttachments.length === 0) return;
+    shouldStickToBottomRef.current = true;
     setInput("");
     setAttachments([]);
     setPasteNotice(undefined);
@@ -590,7 +599,6 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
         <div className="pane-title">
           <Sparkles size={14} />
           <span>AI 助手</span>
-          <small title={config.model}>{config.model}</small>
         </div>
         <span className="header-spacer" />
         <button className="icon-button quiet" title="新建会话" aria-label="新建会话" onClick={startNewConversation}>
@@ -643,9 +651,9 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
       >
         {session.aiMessages.length === 0 && (
           <div className="ai-welcome">
-            <div className="ai-mark"><Bot size={20} /></div>
-            <h3>从当前服务器开始</h3>
-            <p>分析运行状态、检查服务日志，或整理远程文件。</p>
+            <div className="ai-mark"><Sparkles size={24} /></div>
+            <h3>有什么可以帮你？</h3>
+            <p>一起排查问题，或完成服务器上的任务。</p>
             <div className="starter-list">
               {STARTERS.map((starter) => (
                 <button key={starter} onClick={() => void send(starter)}>
@@ -667,17 +675,12 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
               data-message-type={message.messageType}
               key={message.id}
             >
-              <div className="message-meta">
-                {message.role === "user" ? <User size={12} /> : <Bot size={12} />}
-                <span>{message.role === "user" ? "你" : "sshStar AI"}</span>
-                <span>{MESSAGE_TYPE_LABELS[message.messageType]}</span>
-                <span className={`message-status ${message.status}`}>
+              <div className="message-meta" title={`${MESSAGE_TYPE_LABELS[message.messageType]} · ${formatActionTime(message.updatedAt)}`}>
+                {message.role === "assistant" && <span className="message-avatar"><Sparkles size={13} aria-hidden="true" /></span>}
+                <span className="message-author">{message.role === "user" ? "你" : "sshStar"}</span>
+                {message.status !== "completed" && <span className={`message-status ${message.status}`}>
                   {ACTION_STATUS_LABELS[message.status]}
-                </span>
-                <time dateTime={new Date(message.updatedAt).toISOString()}>
-                  {formatActionTime(message.updatedAt)}
-                </time>
-                <code title={message.id}>{shortActionId(message.id)}</code>
+                </span>}
                 {message.content.trim() && (
                   <CopyAction className="message-copy-button" label="复制消息" text={message.content} />
                 )}
@@ -799,15 +802,8 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
       </div>
 
       <div className="ai-composer-wrap">
-        <div className="execution-policy">
-          <button
-            className={`toggle ${allowTools ? "on" : ""}`}
-            onClick={() => setAllowTools((value) => !value)}
-            aria-pressed={allowTools}
-          >
-            <span />
-          </button>
-          <span>允许使用工具</span>
+        <div className="composer-meta">
+          <p className="composer-hint" id={`ai-composer-hint-${session.id}`}>Enter 发送 · Shift + Enter 换行</p>
           <div className="token-usage-control">
             <button
               className={`token-usage-button ${tokenUsage.available ? "has-data" : ""}`}
@@ -847,7 +843,6 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
               )}
             </div>
           </div>
-          <small>{allowTools ? "自动分析与执行" : "仅对话"}</small>
         </div>
         <div className="ai-composer">
           {attachments.length > 0 && (
@@ -893,38 +888,69 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
             rows={2}
             value={input}
             disabled={agent.running}
+            aria-label="给 AI 助手发送消息"
+            aria-describedby={`ai-composer-hint-${session.id}`}
             onChange={(event) => {
               setInput(event.target.value);
               setPasteNotice(undefined);
             }}
             onPaste={handlePaste}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
                 event.preventDefault();
                 void send();
               }
             }}
-            placeholder="描述问题或任务，助手会结合当前会话分析"
+            placeholder="询问任何问题，或描述一个任务…"
           />
           <div className="composer-footer">
+            <input
+              className="sr-only"
+              type="file"
+              ref={attachmentInputRef}
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              multiple
+              tabIndex={-1}
+              aria-label="选择图片附件"
+              disabled={agent.running}
+              onChange={(event) => {
+                const files = Array.from(event.currentTarget.files ?? []).filter((file) => file.type.startsWith("image/"));
+                if (files.length) void addPastedAttachments(files);
+                event.currentTarget.value = "";
+              }}
+            />
+            <button
+              className="composer-add-button"
+              type="button"
+              title="添加图片"
+              aria-label="添加图片"
+              disabled={agent.running || attachments.length >= MAX_PASTED_ATTACHMENTS}
+              onClick={() => attachmentInputRef.current?.click()}
+            ><Plus size={18} aria-hidden="true" /></button>
             <label
               className="approval-policy-control"
-              data-policy={approvalPolicy}
-              title={APPROVAL_POLICY_META[approvalPolicy].description}
+              data-policy={permissionMode}
+              title={PERMISSION_META[permissionMode].description}
             >
               <ShieldCheck size={11} aria-hidden="true" />
               <select
-                aria-label="工具审批策略"
-                value={approvalPolicy}
-                onChange={(event) => onUpdate({ approvalPolicy: event.target.value as AiApprovalPolicy })}
+                aria-label="助手权限"
+                value={permissionMode}
+                disabled={agent.running && !allowTools}
+                onChange={(event) => {
+                  const mode = event.target.value as AiPermissionMode;
+                  setAllowTools(mode !== "chat-only");
+                  if (mode !== "chat-only") onUpdate({ approvalPolicy: mode });
+                }}
               >
+                <option value="chat-only" disabled={agent.running}>仅对话</option>
                 <option value="request">请求批准</option>
                 <option value="reviewer" disabled={!config.reviewerModel.trim()}>替我审批</option>
                 <option value="full-access">完全访问</option>
               </select>
               <ChevronDown size={10} aria-hidden="true" />
             </label>
-            {pasteNotice && <span className="composer-status">{pasteNotice}</span>}
+            <AiModelControls config={config} disabled={agent.running} onChange={onModelSettingsChange} />
             {agent.running ? (
               <button className="send-button stop" title="停止助手" aria-label="停止助手" onClick={() => void agent.cancel()}>
                 <CircleStop size={15} />
@@ -933,15 +959,17 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onOp
               <button
                 className="send-button"
                 title="发送"
+                aria-label="发送"
                 disabled={attachments.some((attachment) => attachment.status !== "ready")
                   || (!input.trim() && attachments.length === 0)}
                 onClick={() => void send()}
               >
-                <Send size={15} />
+                <ArrowUp size={18} />
               </button>
             )}
           </div>
         </div>
+        {pasteNotice && <p className="composer-notice" role="status">{pasteNotice}</p>}
       </div>
     </aside>
   );

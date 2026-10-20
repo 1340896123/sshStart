@@ -19,3 +19,12 @@ test("custom prompts and explicit tool restrictions survive normalization", () =
   assert.equal(result.tools.allowMutatingTools, false);
   assert.equal(normalizeAiConfig({ systemPrompt: "" }).systemPrompt, "");
 });
+
+test("reasoning effort preserves selections and defaults legacy or unknown values to auto", () => {
+  assert.equal(normalizeAiConfig({ model: "custom-model" }).reasoningEffort, "auto");
+  for (const reasoningEffort of ["auto", "none", "minimal", "low", "medium", "high", "xhigh"]) {
+    assert.equal(normalizeAiConfig({ reasoningEffort }).reasoningEffort, reasoningEffort);
+  }
+  assert.equal(normalizeAiConfig({ reasoningEffort: "unsupported" }).reasoningEffort, "auto");
+  assert.equal(normalizeAiConfig({}, { ...DEFAULT_AI_CONFIG, reasoningEffort: "high" }).reasoningEffort, "high");
+});

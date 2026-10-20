@@ -243,6 +243,8 @@ export interface AiMessage {
   approvalState?: "pending" | "approved" | "rejected";
   approvalNote?: string;
   usage?: AiTokenUsage;
+  /** Opaque Rig transcript for this reply, including tool calls and results. */
+  modelMessages?: unknown[];
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
@@ -337,11 +339,25 @@ export const DEFAULT_CLOUD_SYNC_SETTINGS: CloudSyncSettings = {
   endpoint: import.meta.env.VITE_SSHSTAR_SYNC_API_URL ?? OFFICIAL_CLOUD_SYNC_ENDPOINT,
 };
 
+export const AI_REASONING_EFFORT_OPTIONS = [
+  { value: "auto", label: "自动" },
+  { value: "none", label: "关闭" },
+  { value: "minimal", label: "极低" },
+  { value: "low", label: "低" },
+  { value: "medium", label: "中" },
+  { value: "high", label: "高" },
+  { value: "xhigh", label: "超高" },
+] as const;
+
+export type AiReasoningEffort = typeof AI_REASONING_EFFORT_OPTIONS[number]["value"];
+export type AiModelSettings = Pick<AiConfig, "model" | "reasoningEffort">;
+
 export interface AiConfig {
   apiMode: AiApiMode;
   endpoint: string;
   apiKey: string;
   model: string;
+  reasoningEffort: AiReasoningEffort;
   reviewerModel: string;
   contextWindow: number;
   maxOutputTokens: number;
@@ -363,6 +379,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   endpoint: "https://api.deepseek.com",
   apiKey: "",
   model: "gpt-4.1-mini",
+  reasoningEffort: "auto",
   reviewerModel: "",
   contextWindow: 1000000,
   maxOutputTokens: 384000,
@@ -381,6 +398,9 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
     endpoint: config.endpoint ?? fallback.endpoint,
     apiKey: config.apiKey ?? fallback.apiKey,
     model: config.model ?? fallback.model,
+    reasoningEffort: AI_REASONING_EFFORT_OPTIONS.some((option) => option.value === config.reasoningEffort)
+      ? config.reasoningEffort!
+      : fallback.reasoningEffort,
     reviewerModel: config.reviewerModel ?? fallback.reviewerModel,
     contextWindow: config.contextWindow ?? fallback.contextWindow,
     maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,
@@ -440,11 +460,13 @@ export type AiAgentEvent = AiAgentEventBase & (
     }
   | {
       type: "usage";
+      available: boolean;
       inputTokens: number;
       outputTokens: number;
       totalTokens: number;
       cachedTokens: number;
       reasoningTokens: number;
+      contextTokens: number;
       requests: number;
     }
   | { type: "run_completed" }
@@ -456,5 +478,6 @@ export interface AiRunResult {
   content: string;
   reasoning?: string;
   usage: AiTokenUsage;
+  modelMessages?: unknown[];
 }
 export type WorkspaceView = "terminal" | "files" | "split";

@@ -88,13 +88,13 @@ const appendTextSegment = (
 };
 
 const usageFromEvent = (event: Extract<AiAgentEvent, { type: "usage" }>): AiTokenUsage => ({
-  available: true,
+  available: event.available,
   inputTokens: event.inputTokens,
   outputTokens: event.outputTokens,
   totalTokens: event.totalTokens,
   cachedTokens: event.cachedTokens,
   reasoningTokens: event.reasoningTokens,
-  contextTokens: event.inputTokens,
+  contextTokens: event.contextTokens,
   requests: event.requests,
 });
 
@@ -462,6 +462,8 @@ export function useAiAgent({
           .filter((message) => message.status !== "error")
           .map((message) => ({
             role: message.role,
+            modelMessages: message.role === "assistant" && message.status === "completed"
+              ? message.modelMessages : undefined,
             content: message.role === "assistant" && message.status === "cancelled"
               ? `${message.content}\n\n[上一轮回复在此处被用户停止，请基于已有内容继续对话。]`
               : message.content,
@@ -496,6 +498,7 @@ export function useAiAgent({
           reasonings,
           messageType: message.toolCalls?.length ? "tool" : "text",
           usage: result.usage,
+          modelMessages: result.modelMessages,
           approval: undefined,
           approvalState: message.approvalState === "rejected" ? "rejected" : undefined,
           status: "completed",

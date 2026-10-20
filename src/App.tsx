@@ -1399,6 +1399,10 @@ export default function App() {
                       session={session}
                       server={server}
                       config={aiConfig}
+                      onModelSettingsChange={(patch) => {
+                        setAiConfig((current) => ({ ...current, ...patch }));
+                        markSyncChange({ aiConfig: true });
+                      }}
                       hidden={!aiOpen}
                       onUpdate={(patch) => updateSession(session.id, patch)}
                       onOpenSettings={() => setSettingsOpen(true)}

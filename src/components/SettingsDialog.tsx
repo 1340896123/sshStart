@@ -52,7 +52,7 @@ import {
   type ServerKeyPathUpdate,
 } from "../storage";
 import { useCloudSyncStatus } from "../useCloudSyncStatus";
-import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiToolKey, type ServerProfile } from "../types";
+import { AI_REASONING_EFFORT_OPTIONS, DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiReasoningEffort, type AiToolKey, type ServerProfile } from "../types";
 
 interface Props {
   config: AiConfig;
@@ -657,6 +657,12 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
               <>
                 <section className="settings-panel">
                   <header><strong>Agent 运行参数</strong><small>由 Rig 管理多轮调用、工具循环和 provider 差异</small></header>
+                  <label className="settings-config-row">
+                    <span className="settings-row-copy"><strong>思考强度</strong><small>也可在对话输入框中切换；自动使用模型默认值，各档位需模型支持</small></span>
+                    <select className="settings-input" value={value.reasoningEffort} onChange={(event) => setValue({ ...value, reasoningEffort: event.target.value as AiReasoningEffort })}>
+                      {AI_REASONING_EFFORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select>
+                  </label>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>最大上下文</strong><small>模型上下文预算；sshStar 不额外限制可填写的上限</small></span>
                     <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={1} step={1} value={value.contextWindow} onChange={(event) => setValue({ ...value, contextWindow: Number(event.target.value) })} /><em>tokens</em></span>

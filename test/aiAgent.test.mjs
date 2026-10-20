@@ -28,7 +28,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-async function setup(t, initialPolicy, onInvoke = () => undefined) {
+async function setup(t, initialPolicy, onInvoke = () => undefined, initialMessages = []) {
   const calls = [];
   const run = deferred();
   let agent, messages, root, runPromise, runId;
@@ -41,7 +41,7 @@ async function setup(t, initialPolicy, onInvoke = () => undefined) {
     return Promise.resolve(onInvoke(command, args));
   };
   function Harness({ policy }) {
-    const [history, setHistory] = React.useState([]);
+    const [history, setHistory] = React.useState(initialMessages);
     messages = history;
     agent = useAiAgent({ config, server: { id: "test" }, messages: history, onMessagesChange: setHistory, approvalPolicy: policy });
     return null;
@@ -60,6 +60,7 @@ async function setup(t, initialPolicy, onInvoke = () => undefined) {
     calls, config, run, emit,
     latest: () => messages.at(-1),
     agent: () => agent,
+    finish: (result) => act(async () => { run.resolve(result); await runPromise; }),
     setPolicy: (policy) => act(async () => { root.update(React.createElement(Harness, { policy })); }),
   };
 }
@@ -127,4 +128,50 @@ test("cancelling during review clears pending approval and ignores its later res
   assert.equal(harness.latest().status, "cancelled");
   assert.equal(harness.latest().approval, undefined);
   assert.ok(!harness.calls.some(({ command }) => command === "resolve_ai_approval"));
+});
+
+const usage = {
+  available: true, inputTokens: 4000, outputTokens: 200, totalTokens: 4200,
+  cachedTokens: 3600, reasoningTokens: 40, contextTokens: 2500, requests: 2,
+};
+
+test("usage snapshots retain cache hits and the latest context without double counting", async (t) => {
+  const harness = await setup(t, "request");
+  await harness.emit({ type: "usage", ...usage, inputTokens: 2000, cachedTokens: 1800, requests: 1 });
+  await harness.emit({ type: "usage", ...usage });
+  assert.deepEqual(harness.latest().usage, usage);
+  await harness.finish({ content: "完成", usage });
+  assert.deepEqual(harness.latest().usage, usage);
+});
+
+test("a provider without usage does not appear to have reported zero tokens", async (t) => {
+  const harness = await setup(t, "request");
+  const unavailable = Object.fromEntries(Object.keys(usage).map((key) => [key, key === "available" ? false : 0]));
+  await harness.emit({ type: "usage", ...unavailable, requests: 1 });
+  assert.equal(harness.latest().usage.available, false);
+});
+
+test("completed transcripts survive persistence and are sent on the next turn", async (t) => {
+  const harness = await setup(t, "request");
+  const modelMessages = [
+    { role: "assistant", content: [{ id: "call-1", function: { name: "read_file", arguments: { path: "/etc/app" } } }] },
+    { role: "user", content: [{ type: "toolresult", id: "call-1", content: [{ type: "text", text: "配置" }] }] },
+    { role: "assistant", content: [{ text: "完成" }] },
+  ];
+  await harness.finish({ content: "完成", usage, modelMessages });
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.latest())).modelMessages, modelMessages);
+  await act(async () => { await harness.agent().start({ content: "继续", attachments: [], allowTools: true }); });
+  const messages = harness.calls.filter(({ command }) => command === "run_ai_agent").at(-1).args.messages;
+  assert.deepEqual(messages[1].modelMessages, modelMessages);
+  assert.equal(messages.at(-1).content, "继续");
+});
+
+test("cancelled replies use their displayed partial text instead of a stale transcript", async (t) => {
+  const harness = await setup(t, "request", undefined, [{
+    id: "cancelled", role: "assistant", content: "部分回复", status: "cancelled",
+    modelMessages: [{ role: "assistant", content: [{ text: "过时内容" }] }],
+  }]);
+  const messages = harness.calls.find(({ command }) => command === "run_ai_agent").args.messages;
+  assert.equal(messages[0].modelMessages, undefined);
+  assert.match(messages[0].content, /部分回复/);
 });

@@ -289,11 +289,13 @@ pub(super) enum AiAgentEventKind {
         completed_at: u64,
     },
     Usage {
+        available: bool,
         input_tokens: u64,
         output_tokens: u64,
         total_tokens: u64,
         cached_tokens: u64,
         reasoning_tokens: u64,
+        context_tokens: u64,
         requests: u32,
     },
     RunCompleted,
