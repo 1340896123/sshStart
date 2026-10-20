@@ -88,7 +88,7 @@ const serializeAiConfigForStorage = (config: AiConfig) => {
 const SIDEBAR_MIN_WIDTH = 210;
 const SIDEBAR_MAX_WIDTH = 420;
 const AI_PANE_MIN_WIDTH = 300;
-const AI_PANE_MAX_WIDTH = 520;
+const AI_PANE_MAX_WIDTH_RATIO = 0.5;
 const COLUMN_SPLITTER_WIDTH = 7;
 const MAX_SERVER_IMPORT_BYTES = 10 * 1024 * 1024;
 const SECRET_STORE_CONCURRENCY = 8;
@@ -145,6 +145,9 @@ export default function App() {
   const [aiOpen, setAiOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [aiPaneWidth, setAiPaneWidth] = useState(initialAiPaneWidth);
+  const [aiPaneMaxWidth, setAiPaneMaxWidth] = useState(() =>
+    Math.max(AI_PANE_MIN_WIDTH, window.innerWidth * AI_PANE_MAX_WIDTH_RATIO),
+  );
   const [serverDialogOpen, setServerDialogOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ServerProfile>();
   const [serverDialogGroup, setServerDialogGroup] = useState<string>();
@@ -302,6 +305,18 @@ export default function App() {
       : cloudSyncActivity?.operation === "keys-download"
         ? "恢复密钥"
         : "上传同步";
+
+  useEffect(() => {
+    const workspace = appBodyRef.current?.querySelector<HTMLElement>(".workspace");
+    if (!workspace) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const maxWidth = Math.max(AI_PANE_MIN_WIDTH, entry.contentRect.width * AI_PANE_MAX_WIDTH_RATIO);
+      setAiPaneMaxWidth(maxWidth);
+      setAiPaneWidth((current) => Math.min(current, maxWidth));
+    });
+    observer.observe(workspace);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -1131,7 +1146,7 @@ export default function App() {
     const operations = session?.querySelector<HTMLElement>(".operations-column");
     const operationsMinWidth = operations ? Number.parseFloat(getComputedStyle(operations).minWidth) : 380;
     const availableWidth = session?.getBoundingClientRect().width ?? window.innerWidth - 48 - sidebarWidth - COLUMN_SPLITTER_WIDTH;
-    const maxWidth = Math.min(AI_PANE_MAX_WIDTH, availableWidth - operationsMinWidth - COLUMN_SPLITTER_WIDTH);
+    const maxWidth = Math.min(aiPaneMaxWidth, availableWidth - operationsMinWidth - COLUMN_SPLITTER_WIDTH);
     setAiPaneWidth(clampWidth(nextWidth, AI_PANE_MIN_WIDTH, Math.max(AI_PANE_MIN_WIDTH, maxWidth)));
   };
 
@@ -1341,7 +1356,7 @@ export default function App() {
                     label="调整 AI 助手宽度"
                     value={aiPaneWidth}
                     min={AI_PANE_MIN_WIDTH}
-                    max={AI_PANE_MAX_WIDTH}
+                    max={aiPaneMaxWidth}
                     pane="next"
                     onChange={resizeAiPane}
                   />
@@ -1390,7 +1405,7 @@ export default function App() {
                         label="调整 AI 助手宽度"
                         value={aiPaneWidth}
                         min={AI_PANE_MIN_WIDTH}
-                        max={AI_PANE_MAX_WIDTH}
+                        max={aiPaneMaxWidth}
                         pane="next"
                         onChange={resizeAiPane}
                       />

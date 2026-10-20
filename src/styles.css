@@ -3160,7 +3160,7 @@ body.is-resizing-rows .system-dock {
   position: relative;
   width: var(--ai-pane-width, clamp(330px, 29vw, 410px));
   min-width: 300px;
-  max-width: 520px;
+  max-width: 50%;
   flex: 0 1 var(--ai-pane-width, clamp(330px, 29vw, 410px));
   min-height: 0;
   display: grid;
