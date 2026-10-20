@@ -1,9 +1,5 @@
 use super::{api_key, openai_client, validate_config, AiApiMode, AiConfig};
-use rig::{
-    completion::CompletionModel,
-    prelude::{CompletionClient, Prompt},
-    AgentBuilder,
-};
+use rig::{operation::Completion, AgentBuilder, DynModel};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -106,14 +102,10 @@ pub(crate) async fn parse_ai_server_import(
     );
     let response = match config.api_mode {
         AiApiMode::Responses => {
-            parse_ai_server_with_model(client.completion_model(&config.model), prompt).await?
+            parse_ai_server_with_model(client.responses(&config.model), prompt).await?
         }
         AiApiMode::ChatCompletions => {
-            parse_ai_server_with_model(
-                client.completions_api().completion_model(&config.model),
-                prompt,
-            )
-            .await?
+            parse_ai_server_with_model(client.chat(&config.model), prompt).await?
         }
     };
     parse_ai_server_response(&response)
@@ -121,7 +113,7 @@ pub(crate) async fn parse_ai_server_import(
 
 async fn parse_ai_server_with_model<M>(model: M, prompt: String) -> Result<String, String>
 where
-    M: CompletionModel + 'static,
+    M: Into<DynModel<Completion>>,
 {
     AgentBuilder::new(model)
         .name("sshStar-server-import-parser")
@@ -131,6 +123,7 @@ where
         .build()
         .prompt(prompt)
         .await
+        .map(|response| response.output())
         .map_err(|error| format!("AI 服务器解析失败: {error}"))
 }
 

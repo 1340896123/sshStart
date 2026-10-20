@@ -5,6 +5,7 @@ version = "0.1.0"
 description = "A compact SSH workspace with terminal, SFTP, and AI assistance"
 authors = ["sshStar"]
 edition = "2021"
+rust-version = "1.97.1"
 
 [lib]
 name = "sshstar_lib"

@@ -4,6 +4,7 @@ use super::super::{
     signal_process, upload_file, CommandResult, ServerProfile,
 };
 use super::policy::AiApprovalPolicy;
+use rig::message::ToolName;
 use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -825,10 +826,10 @@ pub(super) fn build_dynamic_tools(
             let server = server.clone();
             let settings = settings.clone();
             Some(DynamicTool::new(
-                name,
+                ToolName::new(name).ok()?,
                 description,
                 parameters,
-                move |_context, arguments| {
+                move |arguments| {
                     let server = server.clone();
                     let settings = settings.clone();
                     let tool_name = callback_name.clone();

@@ -4,9 +4,10 @@ use super::{
     AI_RUN_CANCELLED,
 };
 use rig::agent::{
-    AgentHook, HookContext, StepEventKind, ToolCall, ToolCallAction, ToolResultAction,
-    ToolResultEvent,
+    AgentHook, DispatchAction, DispatchEvent, HookContext, OutcomeAction, OutcomeEvent,
+    StepEventKind,
 };
+use rig::tool::{ToolExecutionError, ToolResult};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -341,19 +342,21 @@ impl RunHook {
     }
 }
 
-impl AgentHook for RunHook {
-    async fn on_tool_call(&self, _context: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+impl RunHook {
+    async fn authorize_tool(&self, event: DispatchEvent<'_>, tool_name: &str) -> DispatchAction {
         if *self.cancellation.borrow() {
-            return ToolCallAction::stop(AI_RUN_CANCELLED);
+            return DispatchAction::stop(AI_RUN_CANCELLED);
         }
-        let arguments = serde_json::from_str::<Value>(event.args).unwrap_or(Value::Null);
-        let command = tools::display_command(event.tool_name, &arguments);
+        let arguments = serde_json::from_str::<Value>(event.tool_args().unwrap_or_default())
+            .unwrap_or(Value::Null);
+        let command = tools::display_command(tool_name, &arguments);
+        let action_id = event.id.to_string();
         let started_at = timestamp_ms();
         self.actions.lock().ok().map(|mut actions| {
             actions.insert(
-                event.internal_call_id.to_string(),
+                action_id.clone(),
                 ActionState {
-                    tool: event.tool_name.to_string(),
+                    tool: tool_name.to_string(),
                     command: command.clone(),
                     started_at,
                 },
@@ -363,11 +366,11 @@ impl AgentHook for RunHook {
         let permission = tools::tool_permission(
             &self.settings,
             *self.approval_policy.borrow(),
-            event.tool_name,
+            tool_name,
             &arguments,
         );
         if let ToolPermission::Deny(reason) = permission {
-            return ToolCallAction::skip(reason);
+            return DispatchAction::skip(reason);
         }
         if let ToolPermission::Ask(reason) = permission {
             let approval_id = format!("approval-{}", Uuid::new_v4());
@@ -380,8 +383,8 @@ impl AgentHook for RunHook {
                     || {
                         self.sink.emit(AiAgentEventKind::ApprovalRequired {
                             approval_id,
-                            action_id: event.internal_call_id.to_string(),
-                            tool: event.tool_name.to_string(),
+                            action_id: action_id.clone(),
+                            tool: tool_name.to_string(),
                             command: command.clone(),
                             arguments: arguments.clone(),
                             reason,
@@ -392,55 +395,51 @@ impl AgentHook for RunHook {
             {
                 Ok(ApprovalDecision::Approve(Some(arguments))) => {
                     self.sink.emit(AiAgentEventKind::ToolStarted {
-                        action_id: event.internal_call_id.to_string(),
-                        tool: event.tool_name.to_string(),
+                        action_id: action_id.clone(),
+                        tool: tool_name.to_string(),
                         command,
                         arguments: arguments.clone(),
                         started_at,
                     });
-                    ToolCallAction::rewrite(arguments)
+                    DispatchAction::rewrite_tool_args(event.kind, arguments)
                 }
                 Ok(ApprovalDecision::Approve(None)) => {
                     self.sink.emit(AiAgentEventKind::ToolStarted {
-                        action_id: event.internal_call_id.to_string(),
-                        tool: event.tool_name.to_string(),
+                        action_id: action_id.clone(),
+                        tool: tool_name.to_string(),
                         command,
                         arguments,
                         started_at,
                     });
-                    ToolCallAction::run()
+                    DispatchAction::proceed()
                 }
-                Ok(ApprovalDecision::Reject(reason)) => ToolCallAction::skip(reason),
-                Err(error) => ToolCallAction::stop(error),
+                Ok(ApprovalDecision::Reject(reason)) => DispatchAction::skip(reason),
+                Err(error) => DispatchAction::stop(error),
             };
         }
 
         self.sink.emit(AiAgentEventKind::ToolStarted {
-            action_id: event.internal_call_id.to_string(),
-            tool: event.tool_name.to_string(),
+            action_id,
+            tool: tool_name.to_string(),
             command,
             arguments,
             started_at,
         });
-        ToolCallAction::run()
+        DispatchAction::proceed()
     }
 
-    async fn on_tool_result(
-        &self,
-        _context: &HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
+    fn finish_tool(&self, action_id: &str, tool_name: &str, result: &ToolResult) {
         let state = self
             .actions
             .lock()
             .ok()
-            .and_then(|mut actions| actions.remove(event.internal_call_id))
+            .and_then(|mut actions| actions.remove(action_id))
             .unwrap_or_else(|| ActionState {
-                tool: event.tool_name.to_string(),
-                command: event.tool_name.to_string(),
+                tool: tool_name.to_string(),
+                command: tool_name.to_string(),
                 started_at: timestamp_ms(),
             });
-        let rendered = event.presentation.render();
+        let rendered = result.output().render();
         let structured = serde_json::from_str::<Value>(&rendered).unwrap_or(Value::Null);
         let command = structured
             .get("command")
@@ -456,16 +455,16 @@ impl AgentHook for RunHook {
             .get("exitCode")
             .and_then(Value::as_i64)
             .map(|value| value as i32)
-            .unwrap_or_else(|| if event.raw_result.is_error() { 1 } else { 0 });
-        let status = if event.raw_result.is_skipped() {
+            .unwrap_or_else(|| if result.is_error() { 1 } else { 0 });
+        let status = if result.is_skipped() {
             "rejected"
-        } else if event.raw_result.is_error() || event.raw_result.is_refused() || exit_code != 0 {
+        } else if result.is_error() || result.is_refused() || exit_code != 0 {
             "error"
         } else {
             "completed"
         };
         self.sink.emit(AiAgentEventKind::ToolFinished {
-            action_id: event.internal_call_id.to_string(),
+            action_id: action_id.to_string(),
             tool: state.tool,
             command,
             output,
@@ -474,11 +473,49 @@ impl AgentHook for RunHook {
             started_at: state.started_at,
             completed_at: timestamp_ms(),
         });
-        ToolResultAction::keep()
+    }
+}
+
+impl AgentHook for RunHook {
+    async fn on_dispatch(
+        &self,
+        _context: &HookContext,
+        event: DispatchEvent<'_>,
+    ) -> DispatchAction {
+        let Some(tool_name) = event.tool_name() else {
+            return DispatchAction::proceed();
+        };
+        let action = self.authorize_tool(event, tool_name).await;
+        // Denied dispatches do not receive an outcome callback in Rig 0.45.
+        if let DispatchAction::Deny(report) = &action {
+            self.finish_tool(
+                &event.id.to_string(),
+                tool_name,
+                &ToolResult::skipped(report.to_string()),
+            );
+        }
+        action
+    }
+
+    async fn on_outcome(&self, _context: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if let Some(tool_name) = event.tool_name() {
+            let result = event.tool_result().cloned().unwrap_or_else(|| {
+                ToolResult::failed(ToolExecutionError::provider(
+                    event
+                        .outcome
+                        .as_ref()
+                        .err()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                ))
+            });
+            self.finish_tool(&event.id.to_string(), tool_name, &result);
+        }
+        OutcomeAction::proceed()
     }
 
     fn observes(&self, kind: StepEventKind) -> bool {
-        matches!(kind, StepEventKind::ToolCall | StepEventKind::ToolResult)
+        matches!(kind, StepEventKind::ToolDispatch)
     }
 }
 

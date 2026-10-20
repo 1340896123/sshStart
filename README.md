@@ -28,9 +28,14 @@ The browser-only preview is available with `npm run dev`. It uses interactive de
 
 ## Build
 
+The AI runtime uses [Rig 0.45](https://github.com/0xPlaygrounds/rig/releases/tag/v0.45.0).
+Rust 1.97.1 is required and selected by `rust-toolchain.toml`.
+
 ```powershell
 npm run build
-npx tauri build
+$env:CARGO_INCREMENTAL = "0"
+$env:RUSTFLAGS = "-C lto=off -C embed-bitcode=no"
+npm run tauri build
 ```
 
 AI settings accept endpoints implementing the OpenAI `chat/completions` schema and function tool calls. Providers that return `reasoning_content` are supported; otherwise sshStar requests a concise reasoning summary without exposing hidden chain-of-thought.

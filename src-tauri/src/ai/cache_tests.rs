@@ -1,9 +1,7 @@
 use super::*;
 use rig::{
-    completion::GetTokenUsage,
-    message::AssistantContent,
+    message::{AssistantContent, AssistantMessage, CallId, ToolName},
     tool::{DynamicTool, ToolOutput},
-    OneOrMany,
 };
 use serde_json::{json, Value};
 use std::{
@@ -24,15 +22,19 @@ fn input(role: &str, content: &str, model_messages: Option<Value>) -> AiInputMes
 #[test]
 fn restores_tool_calls_results_and_reasoning_without_rewriting_the_prefix() {
     let transcript = vec![
-        Message::Assistant {
-            id: Some("provider-id".into()),
-            content: OneOrMany::many(vec![
-                AssistantContent::reasoning("check uptime"),
-                AssistantContent::tool_call("call-1", "read_file", json!({"path": "/proc/uptime"})),
-            ])
-            .unwrap(),
-        },
-        Message::tool_result("call-1", "123.45"),
+        Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::reasoning("check uptime"),
+            AssistantContent::tool_call(
+                "call-1",
+                ToolName::new("read_file").unwrap(),
+                json!({"path": "/proc/uptime"}),
+            ),
+        ])),
+        Message::tool_result(
+            CallId::from_wire("call-1"),
+            ToolName::new("read_file").unwrap(),
+            "123.45",
+        ),
         Message::assistant("running"),
     ];
     let (prompt, history) = split_messages(vec![
@@ -48,8 +50,6 @@ fn restores_tool_calls_results_and_reasoning_without_rewriting_the_prefix() {
     assert_eq!(prompt, Message::user("continue"));
     let mut expected = vec![Message::user("inspect")];
     expected.extend(transcript);
-    // Rig deserializes absent flattened text metadata as an empty map; its
-    // serialized representation (and therefore the provider prefix) is stable.
     assert_eq!(
         serde_json::to_value(history).unwrap(),
         serde_json::to_value(expected).unwrap()
@@ -69,7 +69,11 @@ fn old_or_invalid_transcripts_fall_back_to_visible_text() {
         Some(
             serde_json::to_value(vec![
                 Message::assistant("call"),
-                Message::tool_result("id", "result"),
+                Message::tool_result(
+                    CallId::from_wire("id"),
+                    ToolName::new("read_file").unwrap(),
+                    "result",
+                ),
             ])
             .unwrap(),
         ),
@@ -90,10 +94,10 @@ fn old_or_invalid_transcripts_fall_back_to_visible_text() {
 #[test]
 fn aggregate_cache_usage_and_latest_context_are_independent() {
     let mut usage = Usage::new();
-    usage.input_tokens = 4000;
-    usage.output_tokens = 200;
-    usage.total_tokens = 4200;
-    usage.cached_input_tokens = 3600;
+    usage.input_tokens = Some(4000);
+    usage.output_tokens = Some(200);
+    usage.total_tokens = Some(4200);
+    usage.cached_input_tokens = Some(3600);
     let snapshot = AiTokenUsage::from_rig(usage, 2, 2500);
     assert_eq!(snapshot.input_tokens, 4000);
     assert_eq!(snapshot.cached_tokens, 3600);
@@ -103,17 +107,18 @@ fn aggregate_cache_usage_and_latest_context_are_independent() {
 }
 
 #[test]
-fn responses_cache_details_are_preserved() {
-    let usage: openai::responses_api::ResponsesUsage = serde_json::from_value(json!({
-        "input_tokens": 2000, "output_tokens": 100, "total_tokens": 2100,
-        "input_tokens_details": {"cached_tokens": 1800},
-        "output_tokens_details": {"reasoning_tokens": 40}
-    }))
-    .unwrap();
-    let snapshot = AiTokenUsage::from_rig(usage.token_usage(), 1, 2000);
-    assert_eq!(snapshot.cached_tokens, 1800);
-    assert_eq!(snapshot.reasoning_tokens, 40);
-    assert_eq!(snapshot.total_tokens, 2100);
+fn reported_zero_usage_is_distinct_from_missing_usage() {
+    let zero = AiTokenUsage::from_rig(
+        Usage::new()
+            .input_tokens(0)
+            .output_tokens(0)
+            .total_tokens(0),
+        1,
+        0,
+    );
+    assert!(zero.available);
+    assert_eq!(zero.total_tokens, 0);
+    assert!(!AiTokenUsage::from_rig(Usage::new(), 1, 0).available);
 }
 
 // Exercise Rig's actual streaming transport, tool loop, and serialized requests.
@@ -141,6 +146,8 @@ fn mock_provider(
                     other => panic!("mock provider did not receive request: {other:?}"),
                 }
             };
+            // Windows can inherit the listener's nonblocking mode.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -280,63 +287,78 @@ async fn verify_cache_roundtrip<M>(
     model: M,
     server: std::thread::JoinHandle<Vec<Value>>,
     mode: AiApiMode,
+    effort: AiReasoningEffort,
 ) where
-    M: CompletionModel + Clone + 'static,
-    M::StreamingResponse: Send + Unpin,
+    M: Into<DynModel<Completion>>,
 {
+    let model: DynModel<Completion> = model.into();
     let make_agent = || {
-        AgentBuilder::new(model.clone())
+        let mut builder = AgentBuilder::new(model.clone())
             .preamble("stable instructions")
             .dynamic_tools(vec![DynamicTool::new(
-                "inspect",
+                ToolName::new("inspect").unwrap(),
                 "inspect",
                 json!({"type": "object", "properties": {}}),
-                |_, _| Box::pin(async { Ok(ToolOutput::text("123.45")) }),
-            )])
-            .build()
+                |_| Box::pin(async { Ok(ToolOutput::text("123.45")) }),
+            )]);
+        if let Some(params) = effort.additional_params(mode) {
+            builder = builder.additional_params(params);
+        }
+        builder.build()
     };
     let agent = make_agent();
-    let empty_history: &[Message] = &[];
-    let mut stream = agent
-        .stream_chat("inspect", empty_history)
-        .max_turns(2)
-        .await;
+    let mut stream = agent.prompt("inspect").max_turns(2).stream();
     let mut response = None;
     let mut calls = Vec::new();
+    let mut text = String::new();
+    let mut reasoning = String::new();
     while let Some(item) = futures::StreamExt::next(&mut stream).await {
         match item.unwrap() {
             MultiTurnStreamItem::FinalResponse(result) => response = Some(result),
             MultiTurnStreamItem::CompletionCall(call) => calls.push(call.usage),
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                text: delta,
+                ..
+            })) => text.push_str(&delta),
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Reasoning {
+                text: delta,
+                ..
+            })) => reasoning.push_str(&delta),
             _ => {}
         }
     }
     let response = response.unwrap();
-    assert_eq!(response.output, "running");
+    assert_eq!(response.output(), "running");
+    assert_eq!(text, "running");
+    if mode == AiApiMode::Responses {
+        assert!(reasoning.contains("check server"));
+    }
     assert_eq!(calls.len(), 2);
-    assert_eq!(response.usage.input_tokens, 4500);
-    assert_eq!(response.usage.output_tokens, 200);
-    assert_eq!(response.usage.total_tokens, 4700);
-    assert_eq!(response.usage.cached_input_tokens, 4100);
-    assert_eq!(response.usage.reasoning_tokens, 60);
+    assert_eq!(response.usage.input_tokens, Some(4500));
+    assert_eq!(response.usage.output_tokens, Some(200));
+    assert_eq!(response.usage.total_tokens, Some(4700));
+    assert_eq!(response.usage.cached_input_tokens, Some(4100));
+    assert_eq!(response.usage.reasoning_tokens, Some(60));
     let snapshot = AiTokenUsage::from_rig(
         response.usage,
         calls.len() as u32,
-        calls.last().unwrap().input_tokens,
+        calls.last().unwrap().input_tokens.unwrap_or(0),
     );
     assert_eq!(snapshot.context_tokens, 2500);
-    let transcript: Vec<_> = response.messages.unwrap().into_iter().skip(1).collect();
+    let output = response.output();
+    let transcript: Vec<_> = response.messages.into_iter().skip(1).collect();
     let (prompt, history) = split_messages(vec![
         input("user", "inspect", None),
         input(
             "assistant",
-            &response.output,
+            &output,
             Some(serde_json::to_value(transcript).unwrap()),
         ),
         input("user", "continue", None),
     ])
     .unwrap();
     let agent = make_agent();
-    let mut stream = agent.stream_chat(prompt, &history).await;
+    let mut stream = agent.prompt(prompt).history(history).stream();
     let mut second_response = None;
     while let Some(item) = futures::StreamExt::next(&mut stream).await {
         if let MultiTurnStreamItem::FinalResponse(response) = item.unwrap() {
@@ -344,8 +366,8 @@ async fn verify_cache_roundtrip<M>(
         }
     }
     let second_response = second_response.unwrap();
-    assert_eq!(second_response.usage.cached_input_tokens, 2500);
-    assert_eq!(second_response.usage.reasoning_tokens, 10);
+    assert_eq!(second_response.usage.cached_input_tokens, Some(2500));
+    assert_eq!(second_response.usage.reasoning_tokens, Some(10));
     let requests = server.join().unwrap();
     let field = match mode {
         AiApiMode::ChatCompletions => "messages",
@@ -360,6 +382,15 @@ async fn verify_cache_roundtrip<M>(
         .to_string()
         .contains("continue"));
     for request in &requests {
+        let actual_effort = match mode {
+            AiApiMode::ChatCompletions => &request["reasoning_effort"],
+            AiApiMode::Responses => &request["reasoning"]["effort"],
+        };
+        if effort == AiReasoningEffort::Auto {
+            assert!(actual_effort.is_null());
+        } else {
+            assert_eq!(*actual_effort, json!(effort));
+        }
         assert_eq!(request["stream"], true);
         assert_eq!(request["model"], "test-model");
         let tool = &request["tools"][0];
@@ -412,15 +443,14 @@ async fn verify_cache_roundtrip<M>(
 #[tokio::test]
 async fn openai_chat_stream_preserves_cache_usage_and_tool_history() {
     let (endpoint, server) = mock_provider(AiApiMode::ChatCompletions, true);
-    let client = openai::Client::builder()
-        .api_key("local-test")
-        .base_url(&endpoint)
-        .build()
-        .unwrap();
+    let client = openai::OpenAIConfig::new("local-test")
+        .with_base_url(&endpoint)
+        .client();
     verify_cache_roundtrip(
-        compat::chat_model(client, "test-model"),
+        client.chat("test-model"),
         server,
         AiApiMode::ChatCompletions,
+        AiReasoningEffort::Auto,
     )
     .await;
 }
@@ -428,15 +458,14 @@ async fn openai_chat_stream_preserves_cache_usage_and_tool_history() {
 #[tokio::test]
 async fn compatible_chat_stream_preserves_cache_usage_and_tool_history() {
     let (endpoint, server) = mock_provider(AiApiMode::ChatCompletions, false);
-    let client = openai::Client::builder()
-        .api_key("local-test")
-        .base_url(&endpoint)
-        .build()
-        .unwrap();
+    let client = openai::OpenAIConfig::new("local-test")
+        .with_base_url(&endpoint)
+        .client();
     verify_cache_roundtrip(
-        compat::chat_model(client, "test-model"),
+        client.chat("test-model"),
         server,
         AiApiMode::ChatCompletions,
+        AiReasoningEffort::Auto,
     )
     .await;
 }
@@ -444,15 +473,76 @@ async fn compatible_chat_stream_preserves_cache_usage_and_tool_history() {
 #[tokio::test]
 async fn openai_responses_stream_preserves_cache_usage_reasoning_and_tool_history() {
     let (endpoint, server) = mock_provider(AiApiMode::Responses, true);
-    let client = openai::Client::builder()
-        .api_key("local-test")
-        .base_url(&endpoint)
-        .build()
-        .unwrap();
+    let client = openai::OpenAIConfig::new("local-test")
+        .with_base_url(&endpoint)
+        .client();
     verify_cache_roundtrip(
-        client.completion_model("test-model"),
+        client.responses("test-model"),
         server,
         AiApiMode::Responses,
+        AiReasoningEffort::Auto,
     )
     .await;
+}
+
+#[tokio::test]
+async fn reasoning_effort_reaches_both_provider_wires() {
+    for mode in [AiApiMode::ChatCompletions, AiApiMode::Responses] {
+        for effort in [
+            AiReasoningEffort::None,
+            AiReasoningEffort::Minimal,
+            AiReasoningEffort::Low,
+            AiReasoningEffort::Medium,
+            AiReasoningEffort::High,
+            AiReasoningEffort::Xhigh,
+        ] {
+            let (endpoint, server) = mock_provider(mode, true);
+            let client = openai::OpenAIConfig::new("local-test")
+                .with_base_url(endpoint)
+                .client();
+            match mode {
+                AiApiMode::ChatCompletions => {
+                    verify_cache_roundtrip(client.chat("test-model"), server, mode, effort).await
+                }
+                AiApiMode::Responses => {
+                    verify_cache_roundtrip(client.responses("test-model"), server, mode, effort)
+                        .await
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn restores_041_tool_history_with_distinct_provider_call_ids() {
+    let legacy = json!([
+        {"role": "assistant", "id": "reply-1", "content": [
+            {"id": "rs-1", "content": [{"type": "text", "content": {"text": "inspect uptime"}}]},
+            {"id": "fc-1", "call_id": "call-1", "function": {"name": "read_file", "arguments": {"path": "/proc/uptime"}}}
+        ]},
+        {"role": "user", "content": [{"type": "toolresult", "id": "fc-1", "call_id": "call-1", "content": [{"type": "text", "text": "123.45"}]}]},
+        {"role": "assistant", "id": "reply-2", "content": [{"text": "running"}]}
+    ]);
+    let (_, history) = split_messages(vec![
+        input("user", "inspect", None),
+        input("assistant", "running", Some(legacy)),
+        input("user", "continue", None),
+    ])
+    .unwrap();
+    assert_eq!(history.len(), 4);
+    let Message::Assistant(turn) = &history[1] else {
+        panic!("assistant turn")
+    };
+    assert!(
+        matches!(&turn.content[0], AssistantContent::Reasoning(block) if block.text == "inspect uptime")
+    );
+    let call = turn.tool_calls().next().unwrap();
+    assert_eq!(call.id.wire(), "call-1");
+    let Message::User { content } = &history[2] else {
+        panic!("tool result")
+    };
+    assert!(
+        matches!(&content[0], rig::message::UserContent::ToolResult(result)
+        if result.call == call.id && result.name == "read_file")
+    );
 }

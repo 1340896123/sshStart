@@ -15,30 +15,19 @@ use self::{
 };
 use super::{read_secret, ServerProfile};
 use rig::{
-    completion::{CompletionModel, Usage},
-    http_client::{HttpClientExt, NoBody},
+    completion::Usage,
     message::Message,
-    prelude::{CompletionClient, MultiTurnStreamItem, Prompt, StreamingChat},
+    operation::Completion,
+    prelude::MultiTurnStreamItem,
     providers::openai,
-    streaming::StreamedAssistantContent,
-    AgentBuilder,
+    streaming::{Item, StreamEvent},
+    AgentBuilder, DynModel,
 };
 use serde::{Deserialize, Serialize};
-use std::future::IntoFuture;
 use tauri::AppHandle;
 use tokio::sync::watch;
 
 const AI_RUN_CANCELLED: &str = "AI 运行已取消";
-
-#[derive(Debug, Deserialize)]
-struct ModelListResponse {
-    data: Vec<ModelListEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelListEntry {
-    id: String,
-}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -172,12 +161,12 @@ pub(crate) struct AiTokenUsage {
 impl AiTokenUsage {
     fn from_rig(usage: Usage, requests: u32, context_tokens: u64) -> Self {
         Self {
-            available: usage.has_values(),
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage.total_tokens,
-            cached_tokens: usage.cached_input_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
+            available: usage.is_reported(),
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+            total_tokens: usage.total_tokens.unwrap_or(0),
+            cached_tokens: usage.cached_input_tokens.unwrap_or(0),
+            reasoning_tokens: usage.reasoning_tokens.unwrap_or(0),
             context_tokens,
             requests,
         }
@@ -204,19 +193,16 @@ pub(crate) struct AiApprovalReview {
 pub(crate) async fn list_rig_models(config: AiConfig) -> Result<Vec<String>, String> {
     let api_key = api_key(&config)?;
     let client = openai_client(&config, &api_key)?;
-    let request = client
-        .get("/models")
-        .map_err(|error| format!("构造模型列表请求失败: {error}"))?
-        .body(NoBody)
-        .map_err(|error| format!("构造模型列表请求失败: {error}"))?;
     let response = client
-        .send::<_, Vec<u8>>(request)
+        .list_models()
         .await
-        .map_err(|error| format!("获取模型列表失败: {error}"))?
-        .into_body()
-        .await
-        .map_err(|error| format!("读取模型列表失败: {error}"))?;
-    let mut models = parse_model_ids(&response)?;
+        .map_err(|error| format!("获取模型列表失败: {error}"))?;
+    let mut models: Vec<_> = response
+        .data
+        .into_iter()
+        .map(|model| model.id)
+        .filter(|id| !id.trim().is_empty())
+        .collect();
     models.sort_unstable();
     models.dedup();
     if models.is_empty() {
@@ -224,19 +210,6 @@ pub(crate) async fn list_rig_models(config: AiConfig) -> Result<Vec<String>, Str
     } else {
         Ok(models)
     }
-}
-
-fn parse_model_ids(body: &[u8]) -> Result<Vec<String>, String> {
-    serde_json::from_slice::<ModelListResponse>(body)
-        .map(|response| {
-            response
-                .data
-                .into_iter()
-                .map(|model| model.id)
-                .filter(|model| !model.trim().is_empty())
-                .collect()
-        })
-        .map_err(|error| format!("接口返回的模型列表格式无效: {error}"))
 }
 
 #[tauri::command]
@@ -271,22 +244,14 @@ pub(crate) async fn review_ai_approval(
     .map_err(|error| format!("构造审批审核请求失败: {error}"))?;
 
     match config.api_mode {
-        AiApiMode::Responses => {
-            review_with_model(client.completion_model(reviewer_model), payload).await
-        }
-        AiApiMode::ChatCompletions => {
-            review_with_model(
-                client.completions_api().completion_model(reviewer_model),
-                payload,
-            )
-            .await
-        }
+        AiApiMode::Responses => review_with_model(client.responses(reviewer_model), payload).await,
+        AiApiMode::ChatCompletions => review_with_model(client.chat(reviewer_model), payload).await,
     }
 }
 
 async fn review_with_model<M>(model: M, payload: String) -> Result<AiApprovalReview, String>
 where
-    M: CompletionModel + 'static,
+    M: Into<DynModel<Completion>>,
 {
     let reviewer = AgentBuilder::new(model)
         .name("sshStar-approval-reviewer")
@@ -300,7 +265,7 @@ where
         .prompt(format!("请审核以下工具调用：\n{payload}"))
         .await
         .map_err(|error| format!("审批审核模型调用失败: {error}"))?;
-    parse_approval_review(&response)
+    parse_approval_review(&response.output())
 }
 
 fn parse_approval_review(response: &str) -> Result<AiApprovalReview, String> {
@@ -349,7 +314,7 @@ pub(crate) async fn run_ai_agent(
     let result = match config.api_mode {
         AiApiMode::Responses => {
             run_with_model(
-                client.completion_model(&config.model),
+                client.responses(&config.model),
                 runtime.clone(),
                 sink.clone(),
                 cancellation.clone(),
@@ -363,7 +328,7 @@ pub(crate) async fn run_ai_agent(
         }
         AiApiMode::ChatCompletions => {
             run_with_model(
-                compat::chat_model(client, &config.model),
+                client.chat(&config.model),
                 runtime.clone(),
                 sink.clone(),
                 cancellation,
@@ -435,8 +400,7 @@ async fn run_with_model<M>(
     approval_policy: watch::Receiver<AiApprovalPolicy>,
 ) -> Result<AiRunResult, String>
 where
-    M: CompletionModel + Clone + 'static,
-    M::StreamingResponse: Send + Unpin,
+    M: Into<DynModel<Completion>>,
 {
     let (prompt, history) = split_messages(messages)?;
     let dynamic_tools = if allow_tools {
@@ -470,16 +434,12 @@ where
         config.tools.clone(),
         approval_policy,
     );
-    let stream_future = agent
-        .stream_chat(prompt, &history)
+    let mut stream = agent
+        .prompt(prompt)
+        .history(history)
         .max_turns(config.tools.max_tool_rounds.max(1) as usize)
         .add_hook(hook)
-        .into_future();
-    tokio::pin!(stream_future);
-    let mut stream = tokio::select! {
-        stream = &mut stream_future => stream,
-        _ = wait_for_cancellation(&mut cancellation) => return Err(AI_RUN_CANCELLED.to_string()),
-    };
+        .stream();
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut usage = Usage::new();
@@ -498,25 +458,18 @@ where
         };
         match item.map_err(|error| format!("Rig Agent 运行失败: {error}"))? {
             MultiTurnStreamItem::StreamAssistantItem(item) => match item {
-                StreamedAssistantContent::Text(text) => {
-                    content.push_str(&text.text);
-                    sink.emit(AiAgentEventKind::TextDelta { delta: text.text });
+                Item::Event(StreamEvent::Text { text, .. }) => {
+                    content.push_str(&text);
+                    sink.emit(AiAgentEventKind::TextDelta { delta: text });
                 }
-                StreamedAssistantContent::ReasoningDelta {
-                    reasoning: delta, ..
-                } => {
-                    reasoning.push_str(&delta);
-                    sink.emit(AiAgentEventKind::ReasoningDelta { delta });
-                }
-                StreamedAssistantContent::Reasoning(block) if reasoning.is_empty() => {
-                    let delta = block.display_text();
-                    reasoning.push_str(&delta);
-                    sink.emit(AiAgentEventKind::ReasoningDelta { delta });
+                Item::Event(StreamEvent::Reasoning { text, .. }) => {
+                    reasoning.push_str(&text);
+                    sink.emit(AiAgentEventKind::ReasoningDelta { delta: text });
                 }
                 _ => {}
             },
             MultiTurnStreamItem::CompletionCall(call) => {
-                context_tokens = call.usage.input_tokens;
+                context_tokens = call.usage.input_tokens.unwrap_or(0);
                 usage += call.usage;
                 requests = requests.saturating_add(1);
                 let snapshot = AiTokenUsage::from_rig(usage, requests, context_tokens);
@@ -533,16 +486,11 @@ where
             }
             MultiTurnStreamItem::FinalResponse(response) => {
                 usage = response.usage;
+                final_content = Some(response.output());
                 // Rig returns this run's transcript, starting with its user
                 // prompt. Store only the assistant/tool continuation so the
                 // next request can append it after that user's message.
-                model_messages = response
-                    .messages
-                    .unwrap_or_default()
-                    .into_iter()
-                    .skip(1)
-                    .collect();
-                final_content = Some(response.output);
+                model_messages = response.messages.into_iter().skip(1).collect();
             }
             _ => {}
         }
@@ -591,11 +539,11 @@ fn split_messages(messages: Vec<AiInputMessage>) -> Result<(Message, Vec<Message
 }
 
 fn restored_model_messages(message: &AiInputMessage) -> Option<Vec<Message>> {
-    let messages: Vec<Message> = serde_json::from_value(message.model_messages.clone()?).ok()?;
+    let messages = compat::restore_messages(message.model_messages.clone()?)?;
     // Older conversations have no transcript. Ignore corrupt/stale data and
     // never restore system instructions from saved assistant content.
-    if !matches!(messages.first(), Some(Message::Assistant { .. }))
-        || !matches!(messages.last(), Some(Message::Assistant { .. }))
+    if !matches!(messages.first(), Some(Message::Assistant(_)))
+        || !matches!(messages.last(), Some(Message::Assistant(_)))
         || messages
             .iter()
             .any(|message| matches!(message, Message::System { .. }))
@@ -605,12 +553,10 @@ fn restored_model_messages(message: &AiInputMessage) -> Option<Vec<Message>> {
     Some(messages)
 }
 
-fn openai_client(config: &AiConfig, api_key: &str) -> Result<openai::Client, String> {
-    openai::Client::builder()
-        .api_key(api_key)
-        .base_url(&provider_base_url(&config.endpoint))
-        .build()
-        .map_err(|error| format!("Rig Provider 初始化失败: {error}"))
+fn openai_client(config: &AiConfig, api_key: &str) -> Result<openai::OpenAI, String> {
+    Ok(openai::OpenAIConfig::new(api_key)
+        .with_base_url(provider_base_url(&config.endpoint))
+        .client())
 }
 
 fn provider_base_url(endpoint: &str) -> String {
@@ -658,8 +604,7 @@ fn default_temperature() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        openai, parse_approval_review, parse_model_ids, provider_base_url, AiApiMode, AiConfig,
-        AiReasoningEffort,
+        openai, parse_approval_review, provider_base_url, AiApiMode, AiConfig, AiReasoningEffort,
     };
 
     #[test]
@@ -683,13 +628,6 @@ mod tests {
                 responses,
                 serde_json::json!({ "reasoning": { "effort": effort } })
             );
-            // Check that Rig's typed Responses parameters preserve every selectable value.
-            let typed: openai::responses_api::AdditionalParameters =
-                serde_json::from_value(responses).unwrap();
-            assert_eq!(
-                serde_json::to_value(typed).unwrap()["reasoning"]["effort"],
-                effort
-            );
             assert_eq!(
                 selected.additional_params(AiApiMode::ChatCompletions),
                 Some(serde_json::json!({ "reasoning_effort": effort }))
@@ -699,11 +637,11 @@ mod tests {
 
     #[test]
     fn parses_model_lists_without_optional_openai_fields() {
-        let models = parse_model_ids(
+        let models: openai::wire::ModelsReply = serde_json::from_slice(
             br#"{"object":"list","data":[{"id":"deepseek-v4-flash","object":"model","owned_by":"deepseek"}]}"#,
         )
         .expect("model list should parse");
-        assert_eq!(models, vec!["deepseek-v4-flash"]);
+        assert_eq!(models.data[0].id, "deepseek-v4-flash");
     }
 
     #[test]
