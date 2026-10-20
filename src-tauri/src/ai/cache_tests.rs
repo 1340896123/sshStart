@@ -159,6 +159,14 @@ fn mock_provider(
     mode: AiApiMode,
     standard_cache_details: bool,
 ) -> (String, std::thread::JoinHandle<Vec<Value>>) {
+    mock_provider_with_tools(mode, standard_cache_details, true)
+}
+
+fn mock_provider_with_tools(
+    mode: AiApiMode,
+    standard_cache_details: bool,
+    with_tools: bool,
+) -> (String, std::thread::JoinHandle<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
@@ -232,7 +240,7 @@ fn mock_provider(
                     } else {
                         usage["prompt_cache_hit_tokens"] = json!(cached_tokens);
                     }
-                    chat_stream_body(turn, usage)
+                    chat_stream_body(if with_tools { turn } else { 1 }, usage)
                 }
                 AiApiMode::Responses => responses_stream_body(
                     turn,
@@ -320,28 +328,28 @@ async fn verify_cache_roundtrip<M>(
     server: std::thread::JoinHandle<Vec<Value>>,
     mode: AiApiMode,
     effort: AiReasoningEffort,
+    expected_temperature: Option<f64>,
 ) where
     M: Into<DynModel<Completion>>,
 {
     let model: DynModel<Completion> = model.into();
+    let model_id = model.id().unwrap().to_string();
     let make_agent = || {
-        let mut builder = AgentBuilder::new(model.clone())
-            .preamble("stable instructions")
-            .options(request_options(
-                mode,
-                "test-server",
-                Some("test-conversation"),
-            ))
-            .dynamic_tools(vec![DynamicTool::new(
-                ToolName::new("inspect").unwrap(),
-                "inspect",
-                json!({"type": "object", "properties": {}}),
-                |_| Box::pin(async { Ok(ToolOutput::text("123.45")) }),
-            )]);
-        if let Some(params) = effort.additional_params(mode) {
-            builder = builder.additional_params(params);
-        }
-        builder.build()
+        agent_builder(
+            model.clone(),
+            0.25,
+            effort,
+            request_options(mode, "test-server", Some("test-conversation")),
+        )
+        .preamble("stable instructions")
+        .max_tokens(4096)
+        .dynamic_tools(vec![DynamicTool::new(
+            ToolName::new("inspect").unwrap(),
+            "inspect",
+            json!({"type": "object", "properties": {}}),
+            |_| Box::pin(async { Ok(ToolOutput::text("123.45")) }),
+        )])
+        .build()
     };
     let agent = make_agent();
     let mut stream = agent.prompt("inspect").max_turns(2).stream();
@@ -429,7 +437,11 @@ async fn verify_cache_roundtrip<M>(
             assert_eq!(*actual_effort, json!(effort));
         }
         assert_eq!(request["stream"], true);
-        assert_eq!(request["model"], "test-model");
+        assert_eq!(request["model"], model_id);
+        assert_eq!(
+            request.get("temperature"),
+            expected_temperature.map(|value| json!(value)).as_ref()
+        );
         let cache_key = request_options(mode, "test-server", Some("test-conversation")).cache_key;
         assert_eq!(
             request.get("prompt_cache_key"),
@@ -442,8 +454,18 @@ async fn verify_cache_roundtrip<M>(
                 assert_eq!(tool["function"]["name"], "inspect");
                 assert_eq!(request["stream_options"]["include_usage"], true);
                 assert!(request.get("input").is_none());
+                assert!(request.get("instructions").is_none());
+                assert!(request.get("reasoning").is_none());
+                assert!(request.get("max_output_tokens").is_none());
+                let cap = if model_id == "gpt-6-sol" {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                };
+                assert_eq!(request[cap], 4096);
             }
             AiApiMode::Responses => {
+                assert_eq!(request["max_output_tokens"], 4096);
                 assert_eq!(tool["name"], "inspect");
                 assert!(tool.get("function").is_none());
                 assert!(request.get("messages").is_none());
@@ -483,6 +505,126 @@ async fn verify_cache_roundtrip<M>(
 }
 
 #[tokio::test]
+async fn sol_chat_without_tools_sends_chat_fields_and_preserves_history() {
+    for effort in [
+        AiReasoningEffort::Auto,
+        AiReasoningEffort::Low,
+        AiReasoningEffort::Medium,
+        AiReasoningEffort::High,
+        AiReasoningEffort::Xhigh,
+    ] {
+        let (endpoint, server) = mock_provider_with_tools(AiApiMode::ChatCompletions, true, false);
+        let client = openai::OpenAIConfig::new("local-test")
+            .with_base_url(endpoint)
+            .client();
+        let agent = agent_builder(
+            client.chat("gpt-6.1-sol"),
+            0.25,
+            effort,
+            GenerationOptions::default(),
+        )
+        .preamble("stable instructions")
+        .max_tokens(4096)
+        .build();
+        let mut history = Vec::new();
+        for prompt in ["hello", "continue", "again"] {
+            let mut stream = agent.prompt(prompt).history(history.clone()).stream();
+            let mut response = None;
+            while let Some(item) = futures::StreamExt::next(&mut stream).await {
+                if let MultiTurnStreamItem::FinalResponse(result) = item.unwrap() {
+                    response = Some(result);
+                }
+            }
+            let response = response.unwrap();
+            assert_eq!(response.output(), "running");
+            history.extend(response.messages);
+        }
+        let requests = server.join().unwrap();
+        for request in &requests {
+            assert_eq!(request["model"], "gpt-6.1-sol");
+            assert_eq!(request["max_completion_tokens"], 4096);
+            assert_eq!(request["stream"], true);
+            assert_eq!(request["stream_options"]["include_usage"], true);
+            assert_eq!(
+                request.get("reasoning_effort"),
+                (effort != AiReasoningEffort::Auto)
+                    .then(|| json!(effort))
+                    .as_ref()
+            );
+            assert!(request["messages"].as_array().unwrap().len() >= 2);
+            for field in [
+                "input",
+                "instructions",
+                "reasoning",
+                "max_output_tokens",
+                "max_tokens",
+                "temperature",
+                "top_p",
+                "logprobs",
+                "tools",
+                "tool_choice",
+            ] {
+                assert!(request.get(field).is_none(), "unexpected field: {field}");
+            }
+        }
+        let first = requests[0]["messages"].as_array().unwrap();
+        let next = requests[1]["messages"].as_array().unwrap();
+        assert_eq!(&next[..first.len()], first);
+        assert!(next.iter().any(|message| message["role"] == "assistant"));
+    }
+}
+
+#[test]
+fn chat_tool_compatibility_reports_actionable_configuration_errors() {
+    let client = openai::OpenAIConfig::new("local-test").client();
+    let sol: DynModel<Completion> = client.chat("gpt-6.1-sol").into();
+    let error = validate_tool_calling(
+        &sol,
+        AiApiMode::ChatCompletions,
+        AiReasoningEffort::Auto,
+        true,
+    )
+    .unwrap_err();
+    assert!(error.contains("Responses"));
+    assert!(error.contains("gpt-6.1-sol"));
+    assert!(validate_tool_calling(
+        &sol,
+        AiApiMode::ChatCompletions,
+        AiReasoningEffort::High,
+        false,
+    )
+    .is_ok());
+    assert!(
+        validate_tool_calling(&sol, AiApiMode::Responses, AiReasoningEffort::High, true,).is_ok()
+    );
+    for name in ["gpt-6-sol", "gpt-6-luna"] {
+        let model: DynModel<Completion> = client.chat(name).into();
+        for effort in [AiReasoningEffort::Auto, AiReasoningEffort::High] {
+            let error = validate_tool_calling(&model, AiApiMode::ChatCompletions, effort, true)
+                .unwrap_err();
+            assert!(error.contains("none"));
+            assert!(error.contains("Responses"));
+        }
+        assert!(validate_tool_calling(
+            &model,
+            AiApiMode::ChatCompletions,
+            AiReasoningEffort::None,
+            true,
+        )
+        .is_ok());
+    }
+    for name in ["gpt-4.1", "custom-model"] {
+        assert!(validate_tool_calling(
+            &client.chat(name).into(),
+            AiApiMode::ChatCompletions,
+            AiReasoningEffort::Auto,
+            true,
+        )
+        .is_ok());
+    }
+}
+
+#[tokio::test]
 async fn openai_chat_stream_preserves_cache_usage_and_tool_history() {
     let (endpoint, server) = mock_provider(AiApiMode::ChatCompletions, true);
     let client = openai::OpenAIConfig::new("local-test")
@@ -493,6 +635,7 @@ async fn openai_chat_stream_preserves_cache_usage_and_tool_history() {
         server,
         AiApiMode::ChatCompletions,
         AiReasoningEffort::Auto,
+        Some(0.25),
     )
     .await;
 }
@@ -508,6 +651,7 @@ async fn compatible_chat_stream_preserves_cache_usage_and_tool_history() {
         server,
         AiApiMode::ChatCompletions,
         AiReasoningEffort::Auto,
+        Some(0.25),
     )
     .await;
 }
@@ -523,6 +667,7 @@ async fn openai_responses_stream_preserves_cache_usage_reasoning_and_tool_histor
         server,
         AiApiMode::Responses,
         AiReasoningEffort::Auto,
+        Some(0.25),
     )
     .await;
 }
@@ -544,12 +689,57 @@ async fn reasoning_effort_reaches_both_provider_wires() {
                 .client();
             match mode {
                 AiApiMode::ChatCompletions => {
-                    verify_cache_roundtrip(client.chat("test-model"), server, mode, effort).await
+                    verify_cache_roundtrip(
+                        client.chat("test-model"),
+                        server,
+                        mode,
+                        effort,
+                        Some(0.25),
+                    )
+                    .await
                 }
                 AiApiMode::Responses => {
-                    verify_cache_roundtrip(client.responses("test-model"), server, mode, effort)
-                        .await
+                    verify_cache_roundtrip(
+                        client.responses("test-model"),
+                        server,
+                        mode,
+                        effort,
+                        Some(0.25),
+                    )
+                    .await
                 }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_models_omit_temperature_through_tool_calls_and_followups() {
+    use AiApiMode::{ChatCompletions, Responses};
+    use AiReasoningEffort::{Auto, High, Low, None as Off, Xhigh};
+
+    for (mode, model, effort, temperature) in [
+        (Responses, "gpt-6.1-sol", Auto, None),
+        (Responses, "gpt-6.1-sol", Low, None),
+        (Responses, "gpt-6.1-sol", Xhigh, None),
+        (Responses, "gpt-6-sol", Auto, None),
+        (Responses, "gpt-6-sol", High, None),
+        (Responses, "gpt-6-sol", Off, Some(0.25)),
+        (ChatCompletions, "gpt-6-sol", Off, Some(0.25)),
+        (Responses, "gpt-4.1", Auto, Some(0.25)),
+        (ChatCompletions, "gpt-4.1", Auto, Some(0.25)),
+    ] {
+        let (endpoint, server) = mock_provider(mode, true);
+        let client = openai::OpenAIConfig::new("local-test")
+            .with_base_url(endpoint)
+            .client();
+        match mode {
+            ChatCompletions => {
+                verify_cache_roundtrip(client.chat(model), server, mode, effort, temperature).await
+            }
+            Responses => {
+                verify_cache_roundtrip(client.responses(model), server, mode, effort, temperature)
+                    .await
             }
         }
     }

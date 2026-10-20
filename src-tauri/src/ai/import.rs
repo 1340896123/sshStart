@@ -1,5 +1,7 @@
-use super::{api_key, openai_client, validate_config, AiApiMode, AiConfig};
-use rig::{operation::Completion, AgentBuilder, DynModel};
+use super::{
+    agent_builder, api_key, openai_client, validate_config, AiApiMode, AiConfig, AiReasoningEffort,
+};
+use rig::{completion::GenerationOptions, operation::Completion, DynModel};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -115,16 +117,20 @@ async fn parse_ai_server_with_model<M>(model: M, prompt: String) -> Result<Strin
 where
     M: Into<DynModel<Completion>>,
 {
-    AgentBuilder::new(model)
-        .name("sshStar-server-import-parser")
-        .preamble("你是结构化数据提取器，只能输出符合要求的 JSON。")
-        .temperature(0.0)
-        .max_tokens(16_384)
-        .build()
-        .prompt(prompt)
-        .await
-        .map(|response| response.output())
-        .map_err(|error| format!("AI 服务器解析失败: {error}"))
+    agent_builder(
+        model,
+        0.0,
+        AiReasoningEffort::Auto,
+        GenerationOptions::default(),
+    )
+    .name("sshStar-server-import-parser")
+    .preamble("你是结构化数据提取器，只能输出符合要求的 JSON。")
+    .max_tokens(16_384)
+    .build()
+    .prompt(prompt)
+    .await
+    .map(|response| response.output())
+    .map_err(|error| format!("AI 服务器解析失败: {error}"))
 }
 
 fn parse_ai_server_response(response: &str) -> Result<Vec<AiImportedServer>, String> {
