@@ -477,6 +477,9 @@ export function useAiAgent({
           })),
         allowTools,
         runId,
+        // The first user message survives persistence and history reloads;
+        // runId changes on every turn and cannot identify a cache session.
+        conversationId: pendingMessages.find((message) => message.role === "user")?.id,
         approvalPolicy: approvalPolicyRef.current,
       });
       if (activeRunRef.current?.runId !== runId) return;

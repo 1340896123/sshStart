@@ -14,8 +14,9 @@ use self::{
     tools::AiToolSettings,
 };
 use super::{read_secret, ServerProfile};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rig::{
-    completion::Usage,
+    completion::{GenerationOptions, Usage},
     message::Message,
     operation::Completion,
     prelude::MultiTurnStreamItem,
@@ -298,6 +299,7 @@ pub(crate) async fn run_ai_agent(
     messages: Vec<AiInputMessage>,
     allow_tools: bool,
     run_id: String,
+    conversation_id: Option<String>,
     approval_policy: Option<AiApprovalPolicy>,
 ) -> Result<AiRunResult, String> {
     validate_config(&config)?;
@@ -322,6 +324,7 @@ pub(crate) async fn run_ai_agent(
                 &server,
                 messages,
                 allow_tools,
+                conversation_id.as_deref(),
                 approval_policy.clone(),
             )
             .await
@@ -336,6 +339,7 @@ pub(crate) async fn run_ai_agent(
                 &server,
                 messages,
                 allow_tools,
+                conversation_id.as_deref(),
                 approval_policy,
             )
             .await
@@ -397,6 +401,7 @@ async fn run_with_model<M>(
     server: &ServerProfile,
     messages: Vec<AiInputMessage>,
     allow_tools: bool,
+    conversation_id: Option<&str>,
     approval_policy: watch::Receiver<AiApprovalPolicy>,
 ) -> Result<AiRunResult, String>
 where
@@ -421,6 +426,11 @@ where
         .preamble(&preamble)
         .temperature(config.temperature as f64)
         .max_tokens(config.max_output_tokens as u64)
+        .options(request_options(
+            config.api_mode,
+            &server.id,
+            conversation_id,
+        ))
         .default_max_turns(config.tools.max_tool_rounds.max(1) as usize)
         .dynamic_tools(dynamic_tools);
     if let Some(params) = config.reasoning_effort.additional_params(config.api_mode) {
@@ -506,6 +516,27 @@ where
         usage: AiTokenUsage::from_rig(usage, requests, context_tokens),
         model_messages,
     })
+}
+
+fn request_options(
+    mode: AiApiMode,
+    server_id: &str,
+    conversation_id: Option<&str>,
+) -> GenerationOptions {
+    let mut options = GenerationOptions::default();
+    if mode == AiApiMode::Responses {
+        options.cache_key = conversation_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                // Keep this identity across user turns and tool calls. Gateways
+                // such as Sub2API also use it to keep requests on one account.
+                let identity = serde_json::json!([server_id, id]).to_string();
+                let digest = ring::digest::digest(&ring::digest::SHA256, identity.as_bytes());
+                format!("sshstar-{}", URL_SAFE_NO_PAD.encode(digest.as_ref()))
+            });
+    }
+    options
 }
 
 async fn wait_for_cancellation(receiver: &mut watch::Receiver<bool>) {

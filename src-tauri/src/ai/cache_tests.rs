@@ -121,6 +121,38 @@ fn reported_zero_usage_is_distinct_from_missing_usage() {
     assert!(!AiTokenUsage::from_rig(Usage::new(), 1, 0).available);
 }
 
+#[test]
+fn response_cache_identity_survives_turns_and_separates_conversations_and_servers() {
+    let key = |server, conversation| {
+        request_options(AiApiMode::Responses, server, Some(conversation))
+            .cache_key
+            .unwrap()
+    };
+    let first = key("server-1", "conversation-1");
+    assert_eq!(first, key("server-1", "conversation-1"));
+    assert_ne!(first, key("server-1", "conversation-2"));
+    assert_ne!(first, key("server-2", "conversation-1"));
+    assert!(first.starts_with("sshstar-"));
+    assert!(first.len() <= 64);
+    assert!(!first.contains("conversation-1"));
+}
+
+#[test]
+fn chat_and_legacy_clients_do_not_send_a_response_cache_identity() {
+    for conversation in [None, Some(""), Some("  ")] {
+        assert!(
+            request_options(AiApiMode::Responses, "server", conversation)
+                .cache_key
+                .is_none()
+        );
+    }
+    assert!(
+        request_options(AiApiMode::ChatCompletions, "server", Some("conversation"))
+            .cache_key
+            .is_none()
+    );
+}
+
 // Exercise Rig's actual streaming transport, tool loop, and serialized requests.
 // No API credentials or SSH server are needed.
 fn mock_provider(
@@ -295,6 +327,11 @@ async fn verify_cache_roundtrip<M>(
     let make_agent = || {
         let mut builder = AgentBuilder::new(model.clone())
             .preamble("stable instructions")
+            .options(request_options(
+                mode,
+                "test-server",
+                Some("test-conversation"),
+            ))
             .dynamic_tools(vec![DynamicTool::new(
                 ToolName::new("inspect").unwrap(),
                 "inspect",
@@ -393,6 +430,11 @@ async fn verify_cache_roundtrip<M>(
         }
         assert_eq!(request["stream"], true);
         assert_eq!(request["model"], "test-model");
+        let cache_key = request_options(mode, "test-server", Some("test-conversation")).cache_key;
+        assert_eq!(
+            request.get("prompt_cache_key"),
+            cache_key.as_ref().map(|key| json!(key)).as_ref()
+        );
         let tool = &request["tools"][0];
         assert_eq!(tool["type"], "function");
         match mode {

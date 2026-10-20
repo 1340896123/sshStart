@@ -164,6 +164,20 @@ test("completed transcripts survive persistence and are sent on the next turn", 
   const messages = harness.calls.filter(({ command }) => command === "run_ai_agent").at(-1).args.messages;
   assert.deepEqual(messages[1].modelMessages, modelMessages);
   assert.equal(messages.at(-1).content, "继续");
+  const runs = harness.calls.filter(({ command }) => command === "run_ai_agent");
+  assert.match(runs[0].args.conversationId, /^ai-user-/);
+  assert.equal(runs[0].args.conversationId, runs[1].args.conversationId);
+  assert.notEqual(runs[0].args.runId, runs[1].args.runId);
+});
+
+test("restored conversations retain their first user identity for cache routing", async (t) => {
+  const harness = await setup(t, "request", undefined, [
+    { id: "restored-first-user", role: "user", content: "原始任务", status: "completed" },
+    { id: "restored-assistant", role: "assistant", content: "完成", status: "completed" },
+  ]);
+  const run = harness.calls.find(({ command }) => command === "run_ai_agent");
+  assert.equal(run.args.conversationId, "restored-first-user");
+  assert.notEqual(run.args.conversationId, run.args.runId);
 });
 
 test("cancelled replies use their displayed partial text instead of a stale transcript", async (t) => {
