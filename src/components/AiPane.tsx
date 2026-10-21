@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
+  type SetStateAction,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -58,6 +59,7 @@ import type {
 } from "../types";
 import { AiHistoryPopover } from "./AiHistoryPopover";
 import { AiModelControls } from "./AiModelControls";
+import { AiRunStatus } from "./AiRunStatus";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage").then((module) => ({
   default: module.MarkdownMessage,
@@ -79,6 +81,15 @@ interface DraftAiAttachment extends Omit<AiImageAttachment, "remotePath"> {
   status: "uploading" | "ready" | "failed";
   error?: string;
 }
+
+interface AiComposerDraft {
+  input: string;
+  attachments: DraftAiAttachment[];
+  pasteNotice?: string;
+}
+
+const EMPTY_DRAFT: AiComposerDraft = { input: "", attachments: [] };
+const NEW_CONVERSATION_DRAFT = "new-conversation";
 
 interface AiUploadedAttachment {
   remotePath: string;
@@ -309,20 +320,34 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
 }
 
 export function AiPane({ session, server, config, hidden = false, onUpdate, onModelSettingsChange, onOpenSettings, onClose }: Props) {
-  const [input, setInput] = useState("");
-  const [attachments, setAttachments] = useState<DraftAiAttachment[]>([]);
-  const [pasteNotice, setPasteNotice] = useState<string>();
+  const [drafts, setDrafts] = useState<Record<string, AiComposerDraft>>({});
   const [allowTools, setAllowTools] = useState(true);
   const [thinkingOpen, setThinkingOpen] = useState<Record<string, boolean>>({});
   const [historyOpen, setHistoryOpen] = useState(false);
   const [conversations, setConversations] = useState<AiConversation[]>(readAiConversations);
   const [activeConversationId, setActiveConversationId] = useState<string>();
+  const draftKey = activeConversationId ?? NEW_CONVERSATION_DRAFT;
+  const { input, attachments, pasteNotice } = drafts[draftKey] ?? EMPTY_DRAFT;
+  // Each async upload keeps the draft key from the render that started it.
+  const updateDraft = <K extends keyof AiComposerDraft>(field: K, value: SetStateAction<AiComposerDraft[K]>) => {
+    setDrafts((current) => {
+      const previous = current[draftKey] ?? EMPTY_DRAFT;
+      return {
+        ...current,
+        [draftKey]: { ...previous, [field]: typeof value === "function" ? value(previous[field]) : value },
+      };
+    });
+  };
+  const setInput = (value: SetStateAction<string>) => updateDraft("input", value);
+  const setAttachments = (value: SetStateAction<DraftAiAttachment[]>) => updateDraft("attachments", value);
+  const setPasteNotice = (value: SetStateAction<string | undefined>) => updateDraft("pasteNotice", value);
   const activeConversationIdRef = useRef<string>();
   const conversationsRef = useRef(conversations);
   const messagesRef = useRef(session.aiMessages);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const historyControlRef = useRef<HTMLDivElement>(null);
+  const historyTriggerRef = useRef<HTMLButtonElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const shouldStickToBottomRef = useRef(true);
   messagesRef.current = session.aiMessages;
@@ -358,6 +383,13 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
     messages: session.aiMessages,
     onMessagesChange: commitMessages,
     approvalPolicy,
+  });
+  const latestMessage = session.aiMessages[session.aiMessages.length - 1];
+  const statusMessage = latestMessage?.role === "assistant" ? latestMessage : undefined;
+
+  const focusComposer = () => window.requestAnimationFrame(() => {
+    if (inputRef.current && !inputRef.current.disabled) inputRef.current.focus();
+    else historyTriggerRef.current?.focus();
   });
 
   const contextLabel = useMemo(
@@ -406,7 +438,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
     textarea.style.height = "auto";
     textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
     textarea.style.overflowY = textarea.scrollHeight > 200 ? "auto" : "hidden";
-  }, [input, hidden]);
+  }, [input, hidden, activeConversationId]);
 
   useEffect(() => {
     const syncHistory = (event: Event) => {
@@ -428,7 +460,10 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
       }
     };
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setHistoryOpen(false);
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setHistoryOpen(false);
+      historyTriggerRef.current?.focus();
     };
     document.addEventListener("pointerdown", handlePointerDown);
     document.addEventListener("keydown", handleKeyDown);
@@ -542,32 +577,62 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
     activeConversationIdRef.current = undefined;
     setActiveConversationId(undefined);
     setHistoryOpen(false);
-    setInput("");
-    setAttachments([]);
-    setPasteNotice(undefined);
     setThinkingOpen({});
+    shouldStickToBottomRef.current = true;
     messagesRef.current = [];
     onUpdate({ aiMessages: [] });
+    focusComposer();
   };
 
   const selectConversation = (conversation: AiConversation) => {
+    setHistoryOpen(false);
+    if (activeConversationIdRef.current === conversation.id) {
+      focusComposer();
+      return;
+    }
     if (agent.running) void agent.cancel();
     activeConversationIdRef.current = conversation.id;
     setActiveConversationId(conversation.id);
-    setHistoryOpen(false);
-    setInput("");
-    setAttachments([]);
-    setPasteNotice(undefined);
     setThinkingOpen({});
+    shouldStickToBottomRef.current = true;
     messagesRef.current = conversation.messages;
     onUpdate({ aiMessages: conversation.messages });
+    focusComposer();
   };
 
   const deleteConversation = (conversationId: string) => {
     replaceHistory(conversationsRef.current.filter(
       (conversation) => conversation.id !== conversationId,
     ));
-    if (activeConversationIdRef.current === conversationId) startNewConversation();
+    setDrafts((current) => {
+      const next = { ...current };
+      delete next[conversationId];
+      return next;
+    });
+    if (activeConversationIdRef.current === conversationId) {
+      if (agent.running) void agent.cancel();
+      activeConversationIdRef.current = undefined;
+      setActiveConversationId(undefined);
+      setThinkingOpen({});
+      shouldStickToBottomRef.current = true;
+      messagesRef.current = [];
+      onUpdate({ aiMessages: [] });
+    }
+    window.requestAnimationFrame(() => {
+      const next = historyControlRef.current?.querySelector<HTMLButtonElement>(".ai-history-select");
+      (next ?? historyTriggerRef.current)?.focus();
+    });
+  };
+
+  const editFailedRequest = (messageId: string) => {
+    if (agent.running || input.trim() || attachments.length) return;
+    const index = session.aiMessages.findIndex((message) => message.id === messageId);
+    const request = session.aiMessages.slice(0, index).reverse().find((message) => message.role === "user");
+    if (!request) return;
+    setInput(request.content);
+    setAttachments((request.attachments ?? []).map((attachment) => ({ ...attachment, status: "ready" })));
+    setPasteNotice("请核对任务中已完成的操作，再重新发送。");
+    focusComposer();
   };
 
   const send = async (starter?: string) => {
@@ -606,6 +671,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
         </button>
         <div className="ai-history-control" ref={historyControlRef}>
           <button
+            ref={historyTriggerRef}
             className={`icon-button quiet ${historyOpen ? "active" : ""}`}
             title="历史会话"
             aria-label="历史会话"
@@ -640,6 +706,13 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
         <span className="environment-dot" />
         <span>{contextLabel}</span>
       </div>
+      <AiRunStatus
+        message={statusMessage}
+        running={agent.running && agent.activeMessageId === statusMessage?.id}
+        stopping={agent.stopping}
+        resolvingApprovalId={agent.resolvingApprovalId}
+        hidden={hidden}
+      />
 
       <div
         className="ai-messages"
@@ -740,6 +813,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
               {message.role === "assistant"
                 && !message.content
                 && timeline.length === 0
+                && message.approvalState !== "pending"
                 && (message.status === "started" || message.status === "running") && (
                   <div className="thinking-progress">
                     <span className="thinking-pulse" />
@@ -796,6 +870,21 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
                   </Suspense>
                 )
                 : <div className="message-copy plain-text">{message.content}</div>}
+              {message.role === "assistant" && message.status === "error" && (
+                <div className="ai-error-feedback">
+                  <strong>请求失败</strong>
+                  <p>{message.error ?? "上次请求未完成，请检查模型配置或稍后重新发送。"}</p>
+                  <div className="ai-error-actions">
+                    <button
+                      type="button"
+                      disabled={agent.running || Boolean(input.trim()) || attachments.length > 0}
+                      title={input.trim() || attachments.length ? "请先处理输入框中已有的草稿" : "恢复原请求，编辑并核对后再发送"}
+                      onClick={() => editFailedRequest(message.id)}
+                    >重新编辑请求</button>
+                    <button type="button" onClick={onOpenSettings}>检查助手设置</button>
+                  </div>
+                </div>
+              )}
             </article>
           );
         })}
@@ -952,7 +1041,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
             </label>
             <AiModelControls config={config} disabled={agent.running} onChange={onModelSettingsChange} />
             {agent.running ? (
-              <button className="send-button stop" title="停止助手" aria-label="停止助手" onClick={() => void agent.cancel()}>
+              <button className="send-button stop" title={agent.stopping ? "正在停止助手" : "停止助手"} aria-label="停止助手" disabled={agent.stopping} onClick={() => void agent.cancel()}>
                 <CircleStop size={15} />
               </button>
             ) : (

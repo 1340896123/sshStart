@@ -1,3 +1,4 @@
+import { useEffect, useId, useRef, useState } from "react";
 import { History, Trash2 } from "lucide-react";
 import type { AiConversation } from "../aiHistory";
 
@@ -22,8 +23,25 @@ const conversationPreview = (conversation: AiConversation) => {
 };
 
 export function AiHistoryPopover({ conversations, activeConversationId, onSelect, onDelete }: Props) {
+  const [pendingDeleteId, setPendingDeleteId] = useState<string>();
+  const popoverRef = useRef<HTMLElement>(null);
+  const deleteTriggerRef = useRef<HTMLButtonElement>();
+  const confirmationId = useId();
+
+  useEffect(() => {
+    const popover = popoverRef.current;
+    const target = popover?.querySelector<HTMLButtonElement>(".ai-history-item.active .ai-history-select")
+      ?? popover?.querySelector<HTMLButtonElement>(".ai-history-select");
+    target?.focus();
+  }, []);
+
+  const cancelDelete = () => {
+    setPendingDeleteId(undefined);
+    deleteTriggerRef.current?.focus();
+  };
+
   return (
-    <section className="ai-history-popover" role="dialog" aria-label="AI 历史会话">
+    <section className="ai-history-popover" ref={popoverRef} role="dialog" aria-label="AI 历史会话">
       <header className="ai-history-heading">
         <span>历史会话</span>
         <small>{conversations.length}</small>
@@ -56,10 +74,38 @@ export function AiHistoryPopover({ conversations, activeConversationId, onSelect
                   className="ai-history-delete"
                   title={`删除会话：${conversation.title}`}
                   aria-label={`删除会话：${conversation.title}`}
-                  onClick={() => onDelete(conversation.id)}
+                  aria-expanded={pendingDeleteId === conversation.id}
+                  aria-controls={pendingDeleteId === conversation.id ? confirmationId : undefined}
+                  onClick={(event) => {
+                    deleteTriggerRef.current = event.currentTarget;
+                    setPendingDeleteId(conversation.id);
+                  }}
                 >
                   <Trash2 size={12} />
                 </button>
+                {pendingDeleteId === conversation.id && (
+                  <div
+                    className="ai-history-delete-confirm"
+                    id={confirmationId}
+                    role="group"
+                    aria-label="确认删除历史会话"
+                    onKeyDown={(event) => {
+                      if (event.key !== "Escape") return;
+                      event.preventDefault();
+                      event.stopPropagation();
+                      cancelDelete();
+                    }}
+                  >
+                    <p>删除此会话及其未发送草稿？此操作无法撤销。</p>
+                    <div>
+                      <button type="button" autoFocus onClick={cancelDelete}>取消删除</button>
+                      <button type="button" className="danger" onClick={() => {
+                        setPendingDeleteId(undefined);
+                        onDelete(conversation.id);
+                      }}>确认删除</button>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}

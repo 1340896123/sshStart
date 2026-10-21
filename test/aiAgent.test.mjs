@@ -189,3 +189,30 @@ test("cancelled replies use their displayed partial text instead of a stale tran
   assert.equal(messages[0].modelMessages, undefined);
   assert.match(messages[0].content, /部分回复/);
 });
+
+test("a failed request retains both the streamed reply and the IPC error", async (t) => {
+  const harness = await setup(t, "request");
+  await harness.emit({ type: "text_delta", delta: "磁盘检查完成，正在检查服务。" });
+  await act(async () => { harness.run.reject("HTTP 429: 请求过多，请稍后重试"); });
+  assert.equal(harness.latest().status, "error");
+  assert.equal(harness.latest().content, "磁盘检查完成，正在检查服务。");
+  assert.match(harness.latest().error, /HTTP 429/);
+  assert.equal(harness.agent().running, false);
+});
+
+test("the specific run failure survives a later IPC error", async (t) => {
+  const harness = await setup(t, "request");
+  await harness.emit({ type: "text_delta", delta: "部分回复" });
+  await harness.emit({ type: "run_failed", error: "API key 无效，请检查配置" });
+  await act(async () => { harness.run.reject("IPC channel closed"); });
+  assert.equal(harness.latest().content, "部分回复");
+  assert.equal(harness.latest().error, "API key 无效，请检查配置");
+});
+
+test("a terminal run failure cannot be replaced by a successful IPC result", async (t) => {
+  const harness = await setup(t, "request");
+  await harness.emit({ type: "run_failed", error: "连接中断" });
+  await harness.finish({ content: "" });
+  assert.equal(harness.latest().status, "error");
+  assert.equal(harness.latest().error, "连接中断");
+});

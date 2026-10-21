@@ -106,6 +106,7 @@ export function useAiAgent({
   approvalPolicy,
 }: UseAiAgentOptions) {
   const [running, setRunning] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [resolvingApprovalId, setResolvingApprovalId] = useState<string>();
   const messagesRef = useRef(messages);
   const lastPropMessagesRef = useRef(messages);
@@ -405,7 +406,7 @@ export function useAiAgent({
           ...message,
           approval: undefined,
           approvalState: undefined,
-          content: message.content || `请求失败：${event.error}`,
+          error: event.error,
           messageType: "error",
           status: "error",
           updatedAt: event.timestamp,
@@ -445,6 +446,7 @@ export function useAiAgent({
     activeRunRef.current = { runId, messageId: assistantMessage.id, cancelRequested: false };
     commit(() => pendingMessages, true);
     setRunning(true);
+    setStopping(false);
 
     let unlisten: UnlistenFn | undefined;
     try {
@@ -485,6 +487,7 @@ export function useAiAgent({
       if (activeRunRef.current?.runId !== runId) return;
       const completedAt = Date.now();
       updateAssistant(assistantMessage.id, (message) => {
+        if (message.status === "error") return message;
         const hasReasoning = message.reasonings?.some(
           (reasoning) => reasoning.content.trim() === result.reasoning?.trim(),
         );
@@ -528,7 +531,7 @@ export function useAiAgent({
         const completedAt = Date.now();
         updateAssistant(assistantMessage.id, (message) => ({
           ...message,
-          content: message.content || `请求失败：${error}`,
+          error: message.error ?? error,
           messageType: "error",
           status: "error",
           approval: undefined,
@@ -560,6 +563,7 @@ export function useAiAgent({
         activeRunRef.current = undefined;
         setResolvingApprovalId(undefined);
         setRunning(false);
+        setStopping(false);
       }
     }
   };
@@ -568,6 +572,7 @@ export function useAiAgent({
     const activeRun = activeRunRef.current;
     if (!activeRun) return;
     activeRun.cancelRequested = true;
+    setStopping(true);
     await invoke("cancel_ai_run", { runId: activeRun.runId }).catch(() => undefined);
   };
 
@@ -609,6 +614,7 @@ export function useAiAgent({
 
   return {
     running,
+    stopping,
     activeMessageId: activeRunRef.current?.messageId,
     resolvingApprovalId,
     start,

@@ -236,6 +236,8 @@ export interface AiMessage {
   messageType: AiMessageType;
   content: string;
   attachments?: AiImageAttachment[];
+  /** Failure details are separate from any reply already streamed to the user. */
+  error?: string;
   reasonings?: AiReasoning[];
   textSegments?: AiTextSegment[];
   toolCalls?: AiToolResult[];

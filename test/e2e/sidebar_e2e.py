@@ -62,6 +62,61 @@ class SidebarTests(unittest.TestCase):
         self.page.get_by_role("button", name="保存并连接").click()
         expect(self.page.locator(".workspace-session.active .terminal-status")).to_contain_text("已连接")
 
+    def mock_ai(self):
+        self.page.evaluate("""() => {
+            window.aiCalls = [];
+            window.aiCallbacks = {};
+            window.aiListeners = {};
+            window.aiSequence = 0;
+            window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+            window.__TAURI_INTERNALS__ = {
+                metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+                transformCallback(callback) {
+                    const id = ++window.aiSequence;
+                    window.aiCallbacks[id] = callback;
+                    return id;
+                },
+                async invoke(command, args) {
+                    window.aiCalls.push({ command, args });
+                    if (command === 'plugin:event|listen') { window.aiListeners[args.event] = args.handler; return 1; }
+                    if (command === 'list_rig_models') return Array.from({ length: 40 }, (_, i) => 'review-model-' + i);
+                    if (command === 'upload_ai_attachment') {
+                        if (window.aiDeferUpload) return new Promise(resolve => { window.finishUpload = resolve; });
+                        return { remotePath: '/tmp/review.png', size: 8 };
+                    }
+                    if (command === 'run_ai_agent') {
+                        window.aiRun = args;
+                        return new Promise((resolve, reject) => { window.finishAi = resolve; window.failAi = reject; });
+                    }
+                    if (command === 'resolve_ai_approval' && window.aiDeferApproval) return new Promise(resolve => { window.finishApproval = resolve; });
+                    if (command === 'cancel_ai_run') {
+                        if (window.aiDeferCancel) return new Promise(resolve => {
+                            window.finishCancel = () => { window.failAi('AI 运行已取消'); resolve(null); };
+                        });
+                        window.failAi('AI 运行已取消');
+                    }
+                    return null;
+                }
+            };
+            window.emitAi = event => {
+                const runId = window.aiRun.runId;
+                const callback = window.aiCallbacks[window.aiListeners['ai-agent:' + runId]];
+                callback({ event: 'ai-agent:' + runId, id: 1, payload: {
+                    runId, sequence: ++window.aiSequence, timestamp: Date.now(), ...event
+                }});
+            };
+        }""")
+
+    def send_ai(self, pane, text):
+        self.page.evaluate("window.aiRun = null")
+        pane.get_by_role("textbox", name="给 AI 助手发送消息").fill(text)
+        pane.get_by_role("button", name="发送", exact=True).click()
+        self.page.wait_for_function("!!window.aiRun")
+
+    def finish_ai(self, pane):
+        self.page.evaluate("window.finishAi({ content: '检查完成' })")
+        expect(pane.get_by_role("button", name="停止助手")).to_have_count(0)
+
     def test_left_panels_toggle_and_restore(self):
         self.check_navigation()
         for panel in ["server-sidebar", "snippet-sidebar", "transfer-sidebar"]:
@@ -219,7 +274,7 @@ class SidebarTests(unittest.TestCase):
         model.click()
         search = pane.get_by_role("textbox", name="搜索或输入模型 ID")
         expect(search).to_be_focused()
-        expect(pane.get_by_role("status")).to_contain_text("可输入模型 ID")
+        expect(pane.locator(".composer-model-note")).to_contain_text("可输入模型 ID")
         search.fill("private/custom-reasoning-model")
         search.press("Enter")
         expect(model).to_have_attribute("aria-label", "选择模型：private/custom-reasoning-model")
@@ -256,6 +311,203 @@ class SidebarTests(unittest.TestCase):
             self.assertLessEqual(box["x"] + box["width"], bounds["x"] + bounds["width"])
             pane.screenshot(path=str(OUTPUT / f"ai-composer-{key.lower()}.png"))
             self.page.keyboard.press("Escape")
+
+    def test_ai_model_picker_fits_minimum_window_with_multiline_draft(self):
+        self.open_session()
+        self.mock_ai()
+        self.page.set_viewport_size({"width": 960, "height": 620})
+        pane = self.page.locator(".workspace-session.active .ai-pane")
+        draft = pane.get_by_role("textbox", name="给 AI 助手发送消息")
+        draft.fill("\n".join(["等待发送的排查信息"] * 14))
+        pane.get_by_role("button", name="选择模型：").click()
+        search = pane.get_by_role("textbox", name="搜索或输入模型 ID")
+        expect(pane.get_by_role("button", name="review-model-39", exact=True)).to_be_attached()
+        for width, height in [(960, 620), (1440, 900), (960, 620)]:
+            self.page.set_viewport_size({"width": width, "height": height})
+            expect(search).to_be_in_viewport()
+            expect(search).to_be_focused()
+            self.page.wait_for_function("""() => {
+                const picker = document.querySelector('.composer-model-popover').getBoundingClientRect();
+                return picker.top >= 0 && picker.bottom <= innerHeight && picker.right <= innerWidth;
+            }""")
+        self.page.screenshot(path=str(OUTPUT / "ai-model-minimum-window.png"))
+        search.fill("custom/model")
+        search.press("Enter")
+        expect(draft).to_have_value("\n".join(["等待发送的排查信息"] * 14))
+        expect(pane.get_by_role("button", name="选择模型：custom/model")).to_be_focused()
+
+    def test_ai_history_preserves_drafts_and_confirms_deletion(self):
+        self.open_session()
+        self.mock_ai()
+        pane = self.page.locator(".workspace-session.active .ai-pane")
+        draft = pane.get_by_role("textbox", name="给 AI 助手发送消息")
+        history = pane.get_by_role("button", name="历史会话", exact=True)
+        new = pane.get_by_role("button", name="新建会话", exact=True)
+        draft.fill("新会话尚未发送的草稿")
+        new.click()
+        expect(draft).to_have_value("新会话尚未发送的草稿")
+        self.send_ai(pane, "第一轮排查")
+        self.finish_ai(pane)
+        draft.fill("第一轮未发送的补充信息")
+        history.click()
+        pane.locator(".ai-history-select").first.click()
+        expect(draft).to_have_value("第一轮未发送的补充信息")
+        expect(draft).to_be_focused()
+        new.click()
+        expect(draft).to_have_value("")
+        draft.fill("新会话的另一份草稿")
+        history.click()
+        pane.locator(".ai-history-select").first.click()
+        expect(draft).to_have_value("第一轮未发送的补充信息")
+        new.click()
+        expect(draft).to_have_value("新会话的另一份草稿")
+        self.send_ai(pane, "第二轮排查")
+        self.finish_ai(pane)
+        draft.fill("第二轮的草稿")
+        history.click()
+        pane.locator(".ai-history-select").filter(has_text="第一轮排查").click()
+        expect(draft).to_have_value("第一轮未发送的补充信息")
+        history.click()
+        pane.locator(".ai-history-select").first.focus()
+        self.page.keyboard.press("Escape")
+        expect(history).to_be_focused()
+        history.click()
+        item = pane.locator(".ai-history-item").filter(has_text="第一轮排查")
+        delete = item.get_by_role("button", name="删除会话：第一轮排查", exact=True)
+        delete.click()
+        expect(pane.locator(".ai-history-item")).to_have_count(2)
+        expect(pane.locator(".ai-message")).to_have_count(2)
+        expect(item.get_by_role("button", name="取消删除", exact=True)).to_be_focused()
+        pane.screenshot(path=str(OUTPUT / "ai-history-delete-confirm.png"))
+        self.page.keyboard.press("Escape")
+        expect(delete).to_be_focused()
+        expect(pane.get_by_role("dialog", name="AI 历史会话")).to_be_visible()
+        delete.click()
+        item.get_by_role("button", name="确认删除", exact=True).click()
+        expect(pane.locator(".ai-history-item")).to_have_count(1)
+        expect(pane.locator(".ai-history-select").first).to_be_focused()
+        expect(pane.locator(".ai-message")).to_have_count(0)
+        pane.locator(".ai-history-select").first.click()
+        expect(draft).to_have_value("第二轮的草稿")
+
+    def test_ai_attachment_upload_keeps_its_original_draft(self):
+        self.open_session()
+        self.mock_ai()
+        pane = self.page.locator(".workspace-session.active .ai-pane")
+        self.send_ai(pane, "带附件的排查")
+        self.finish_ai(pane)
+        draft = pane.get_by_role("textbox", name="给 AI 助手发送消息")
+        draft.fill("请查看附件")
+        self.page.evaluate("window.aiDeferUpload = true")
+        pane.locator('input[type="file"]').set_input_files({"name": "review.png", "mimeType": "image/png", "buffer": bytes.fromhex("89504e470d0a1a0a")})
+        expect(pane.locator(".attachment-reference.uploading")).to_be_visible()
+        pane.get_by_role("button", name="新建会话", exact=True).click()
+        expect(pane.locator(".attachment-reference")).to_have_count(0)
+        self.page.evaluate("window.finishUpload({ remotePath: '/tmp/review.png', size: 8 })")
+        expect(pane.locator(".attachment-reference")).to_have_count(0)
+        pane.get_by_role("button", name="历史会话", exact=True).click()
+        pane.locator(".ai-history-select").first.click()
+        expect(draft).to_have_value("请查看附件")
+        expect(pane.locator(".attachment-reference.ready")).to_contain_text("/tmp/review.png")
+        expect(pane.get_by_role("button", name="发送", exact=True)).to_be_enabled()
+
+    def test_ai_stream_failure_shows_cause_and_restores_request_for_editing(self):
+        self.open_session()
+        self.mock_ai()
+        pane = self.page.locator(".workspace-session.active .ai-pane")
+        self.send_ai(pane, "分析当前部署")
+        self.page.evaluate("window.emitAi({ type: 'text_delta', delta: '磁盘检查完成，正在检查服务。' })")
+        self.page.evaluate("window.failAi('HTTP 429: 请求过多，请稍后重试')")
+        error = pane.locator(".ai-error-feedback")
+        expect(error).to_contain_text("HTTP 429")
+        expect(pane.locator(".markdown-body")).to_contain_text("磁盘检查完成")
+        expect(pane.locator(".ai-status")).to_contain_text("请求过多")
+        draft = pane.get_by_role("textbox", name="给 AI 助手发送消息")
+        draft.fill("已有的新草稿")
+        edit = error.get_by_role("button", name="重新编辑请求", exact=True)
+        expect(edit).to_be_disabled()
+        draft.fill("")
+        edit.click()
+        expect(draft).to_have_value("分析当前部署")
+        expect(draft).to_be_focused()
+        self.assertEqual(self.page.evaluate("window.aiCalls.filter(c => c.command === 'run_ai_agent').length"), 1)
+        pane.screenshot(path=str(OUTPUT / "ai-stream-failure.png"))
+
+    def test_ai_approval_announces_pending_state_and_uses_readable_text(self):
+        self.open_session()
+        self.mock_ai()
+        self.page.set_viewport_size({"width": 960, "height": 620})
+        pane = self.page.locator(".workspace-session.active .ai-pane")
+        self.send_ai(pane, "检查服务状态")
+        focus = pane.get_by_role("button", name="历史会话", exact=True)
+        focus.focus()
+        self.page.evaluate("window.emitAi({ type: 'approval_required', approvalId: 'approval', actionId: 'tool', tool: 'execute_command', command: 'systemctl restart example-service', reason: '重启服务以应用新配置', arguments: {} })")
+        expect(pane.locator(".ai-status")).to_contain_text("需要你批准执行命令")
+        expect(pane.locator(".ai-run-status")).to_have_attribute("data-state", "approval")
+        expect(pane.locator(".ai-run-status-copy strong")).to_have_text("等待审批")
+        expect(pane.locator(".ai-status")).to_have_attribute("aria-live", "polite")
+        expect(focus).to_be_focused()
+        expect(pane.locator(".thinking-progress")).to_have_count(0)
+        sizes = pane.locator(".approval-call > code, .approval-call > p, .approval-call-actions button").evaluate_all("els => els.map(e => parseFloat(getComputedStyle(e).fontSize))")
+        self.assertTrue(all(size >= 12 for size in sizes), sizes)
+        self.assertFalse(pane.locator(".approval-call").evaluate("e => e.scrollWidth > e.clientWidth"))
+        pane.screenshot(path=str(OUTPUT / "ai-approval-readable.png"))
+        self.page.evaluate("window.aiDeferApproval = true")
+        pane.get_by_role("button", name="批准并继续", exact=True).click()
+        expect(pane.locator(".ai-run-status")).to_have_attribute("data-state", "reviewing")
+        self.page.evaluate("window.finishApproval(null)")
+        expect(pane.locator(".ai-status")).to_contain_text("正在执行任务")
+        self.finish_ai(pane)
+        expect(pane.locator(".ai-status")).to_contain_text("已完成回复")
+
+    def test_ai_run_status_tracks_activity_elapsed_time_and_terminal_states(self):
+        self.page.clock.install()
+        self.open_session()
+        self.mock_ai()
+        self.page.set_viewport_size({"width": 960, "height": 620})
+        pane = self.page.locator(".workspace-session.active .ai-pane")
+        status = pane.get_by_role("group", name="助手运行状态", exact=True)
+        expect(status).to_have_attribute("data-state", "idle")
+        expect(status.locator(".ai-run-elapsed")).to_have_count(0)
+        self.send_ai(pane, "查看服务运行状态")
+        expect(status).to_have_attribute("data-state", "starting")
+        self.page.evaluate("window.emitAi({ type: 'run_started' })")
+        expect(status).to_have_attribute("data-state", "thinking")
+        self.page.evaluate("window.emitAi({ type: 'reasoning_delta', delta: '先检查进程和服务状态。' })")
+        expect(status).to_have_attribute("data-state", "thinking")
+        self.page.evaluate("window.emitAi({ type: 'text_delta', delta: '开始检查服务。' })")
+        expect(status).to_have_attribute("data-state", "responding")
+        self.page.evaluate("window.emitAi({ type: 'tool_started', actionId: 'tool-1', tool: 'execute_command', command: 'systemctl status example-service', arguments: {}, startedAt: Date.now() })")
+        expect(status).to_have_attribute("data-state", "executing")
+        expect(status).to_contain_text("systemctl status example-service")
+        self.page.clock.fast_forward(65_000)
+        elapsed = status.locator(".ai-run-elapsed > span")
+        minutes, seconds = map(int, elapsed.inner_text().split(":"))
+        self.assertGreaterEqual(minutes * 60 + seconds, 65)
+        self.assertFalse(status.evaluate("e => e.scrollWidth > e.clientWidth"))
+        pane.screenshot(path=str(OUTPUT / "ai-run-status-executing.png"))
+        self.page.evaluate("window.emitAi({ type: 'tool_finished', actionId: 'tool-1', tool: 'execute_command', command: 'systemctl status example-service', output: 'active (running)', exitCode: 0, status: 'completed', startedAt: Date.now() - 65000, completedAt: Date.now() })")
+        expect(status).to_have_attribute("data-state", "thinking")
+        self.page.evaluate("window.emitAi({ type: 'text_delta', delta: '服务运行正常。' })")
+        expect(status).to_have_attribute("data-state", "responding")
+        self.finish_ai(pane)
+        expect(status).to_have_attribute("data-state", "completed")
+        finished_elapsed = elapsed.inner_text()
+        self.page.clock.fast_forward(3_000)
+        expect(elapsed).to_have_text(finished_elapsed)
+        self.send_ai(pane, "再次检查")
+        self.page.evaluate("window.failAi('HTTP 429: 请稍后重试')")
+        expect(status).to_have_attribute("data-state", "error")
+        expect(status).to_contain_text("HTTP 429")
+        self.send_ai(pane, "停止前的检查")
+        self.page.evaluate("window.aiDeferCancel = true")
+        stop = pane.get_by_role("button", name="停止助手", exact=True)
+        stop.click()
+        expect(status).to_have_attribute("data-state", "stopping")
+        expect(stop).to_be_disabled()
+        self.page.evaluate("window.finishCancel()")
+        expect(status).to_have_attribute("data-state", "cancelled")
+        pane.screenshot(path=str(OUTPUT / "ai-run-status-stopped.png"))
 
     def test_narrow_window_keeps_panels_inside_workspace(self):
         self.open_session()

@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Check, ChevronDown, LoaderCircle, RefreshCw, Search } from "lucide-react";
 import { isTauri } from "../lib";
@@ -19,7 +19,45 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
   const [refresh, setRefresh] = useState(0);
   const controlRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const [popoverPosition, setPopoverPosition] = useState<CSSProperties>({});
   const popoverId = useId();
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const control = controlRef.current;
+    const trigger = triggerRef.current;
+    const pane = control?.closest<HTMLElement>(".ai-pane");
+    const composer = control?.closest<HTMLElement>(".ai-composer");
+    if (!control || !trigger || !pane || !composer) return;
+    const reposition = () => {
+      const bounds = composer.getBoundingClientRect();
+      const topEdge = Math.max(8, pane.getBoundingClientRect().top + 8);
+      // Keep the input exposed when a usable picker fits above the composer.
+      const anchor = bounds.top - topEdge - 8 >= 180 ? bounds : trigger.getBoundingClientRect();
+      const above = Math.max(0, anchor.top - topEdge - 8);
+      const below = Math.max(0, window.innerHeight - anchor.bottom - 8);
+      const showAbove = above >= 180 || above >= below;
+      const width = Math.min(bounds.width, window.innerWidth - 16);
+      setPopoverPosition({
+        left: Math.max(8, Math.min(bounds.left, window.innerWidth - width - 8)),
+        width,
+        maxHeight: Math.min(380, showAbove ? above : below),
+        ...(showAbove ? { bottom: window.innerHeight - anchor.top + 8 } : { top: anchor.bottom + 8 }),
+      });
+    };
+    reposition();
+    const observer = new ResizeObserver(reposition);
+    observer.observe(control);
+    observer.observe(composer);
+    observer.observe(pane);
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open || disabled) { setOpen(false); return; }
@@ -104,7 +142,7 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
         <ChevronDown size={10} aria-hidden="true" />
       </label>
       {open && (
-        <section className="composer-model-popover" id={popoverId} role="dialog" aria-label="选择对话模型">
+        <section className="composer-model-popover" style={popoverPosition} id={popoverId} role="dialog" aria-label="选择对话模型">
           <header>
             <strong>选择模型</strong>
             <button type="button" className="icon-button quiet" title="刷新模型列表" aria-label="刷新模型列表" disabled={loading} onClick={() => setRefresh((value) => value + 1)}>
