@@ -1511,10 +1511,10 @@ kbd {
   max-width: 205px;
   height: 30px;
   display: grid;
-  grid-template-columns: auto minmax(0, auto) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 6px;
-  padding: 0 7px;
+  gap: 3px;
+  padding: 0 5px 0 0;
   border: 0;
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
   background: transparent;
@@ -1542,13 +1542,29 @@ kbd {
   content: "";
 }
 
-.session-tab > span:nth-child(2),
+.session-tab-select {
+  min-width: 0;
+  height: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding: 0 2px 0 7px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-tab-select > span:nth-child(2),
 .session-tab small {
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.session-tab > span:nth-child(2) {
+.session-tab-select > span:nth-child(2) {
   font-size: 12px;
   font-weight: 550;
 }
@@ -1561,13 +1577,28 @@ kbd {
 }
 
 .tab-close {
+  width: 18px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
   border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
   opacity: 0.55;
 }
 
 .tab-close:hover {
   background: var(--overlay);
   opacity: 1;
+}
+
+.session-context-menu {
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
 }
 
 .empty-workspace {
@@ -6833,6 +6864,7 @@ body.is-resizing-rows .system-dock {
   .dialog,
   .transfer-progress-track > span,
   .file-context-menu,
+  .session-context-menu,
   .ai-history-popover {
     animation: none;
     transition: none;

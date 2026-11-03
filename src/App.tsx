@@ -24,6 +24,7 @@ import { ColumnSplitter } from "./components/ColumnSplitter";
 import { FilePane } from "./components/FilePane";
 import { ServerDialog } from "./components/ServerDialog";
 import { ServerTree } from "./components/ServerTree";
+import { SessionTabs } from "./components/SessionTabs";
 import { SnippetPane } from "./components/SnippetPane";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalPane } from "./components/TerminalPane";
@@ -551,18 +552,19 @@ export default function App() {
     setActiveSessionId(session.id);
   };
 
-  const closeSession = async (id: string) => {
+  const closeSessions = (ids: string[]) => {
+    const closingIds = new Set(ids);
+    if (closingIds.size === 0) return;
+    const activeIndex = sessions.findIndex((session) => session.id === activeSessionId);
+    const fallback = sessions.slice(0, activeIndex).reverse().find((session) => !closingIds.has(session.id))
+      ?? sessions.find((session) => !closingIds.has(session.id));
+    setSessions((current) => current.filter((session) => !closingIds.has(session.id)));
+    setActiveSessionId((current) => current && closingIds.has(current) ? fallback?.id : current);
     if (isTauri()) {
-      await invoke("stop_terminal", { sessionId: id }).catch(() => undefined);
+      closingIds.forEach((sessionId) => {
+        void invoke("stop_terminal", { sessionId }).catch(() => undefined);
+      });
     }
-    setSessions((current) => {
-      const index = current.findIndex((session) => session.id === id);
-      const remaining = current.filter((session) => session.id !== id);
-      if (id === activeSessionId) {
-        setActiveSessionId(remaining[Math.max(0, index - 1)]?.id);
-      }
-      return remaining;
-    });
   };
 
   const saveServer = async (server: ServerProfile) => {
@@ -660,9 +662,7 @@ export default function App() {
     setServers((current) => current.filter((server) => !deletedIds.has(server.id)));
     markSyncChange({ serverIds: deletedIds, serverOrder: true });
     setSelectedServerId((current) => current && deletedIds.has(current) ? undefined : current);
-    sessions
-      .filter((session) => deletedIds.has(session.serverId))
-      .forEach((session) => void closeSession(session.id));
+    closeSessions(sessions.filter((session) => deletedIds.has(session.serverId)).map((session) => session.id));
   };
 
   const deleteServer = (serverId: string) => deleteServers([serverId]);
@@ -1313,27 +1313,14 @@ export default function App() {
             >
               <PanelLeftClose className={sidebarOpen ? "" : "flipped"} size={15} />
             </button>
-            <div className="session-tabs">
-              {sessions.map((session) => {
-                const server = servers.find((item) => item.id === session.serverId);
-                return (
-                  <button
-                    key={session.id}
-                    className={`session-tab ${session.id === activeSessionId ? "active" : ""}`}
-                    onClick={() => setActiveSessionId(session.id)}
-                  >
-                    <span className={`connection-indicator ${session.connected ? "online" : ""}`} />
-                    <span>{session.title}</span>
-                    <small>{server?.username}</small>
-                    <X
-                      size={12}
-                      className="tab-close"
-                      onClick={(event) => { event.stopPropagation(); void closeSession(session.id); }}
-                    />
-                  </button>
-                );
-              })}
-            </div>
+            <SessionTabs
+              sessions={sessions}
+              servers={servers}
+              activeSessionId={activeSessionId}
+              onActivate={setActiveSessionId}
+              onNewSession={(server) => openSession(server, true)}
+              onClose={closeSessions}
+            />
             <button
               className="icon-button quiet"
               title="为当前服务器新建会话"
@@ -1384,6 +1371,9 @@ export default function App() {
                   <div
                     className={`workspace-session ${session.id === activeSessionId ? "active" : ""}`}
                     key={session.id}
+                    id={`workspace-session-${session.id}`}
+                    role="tabpanel"
+                    aria-labelledby={`session-tab-${session.id}`}
                     style={{ "--ai-pane-width": `${aiPaneWidth}px` } as CSSProperties}
                   >
                     <section className="operations-column">
