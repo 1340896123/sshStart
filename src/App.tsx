@@ -75,16 +75,24 @@ import {
   type CloudSyncProgress,
   type ServerKeyPathUpdate,
 } from "./storage";
-import { DEFAULT_AI_CONFIG, normalizeAiConfig } from "./types";
+import { changeAiModelSettings, DEFAULT_AI_CONFIG, normalizeAiConfig, stripAiConfigSecrets } from "./types";
 import type { GroupMoveTarget, ServerDropPosition } from "./serverGroups";
 import type { AiConfig, ServerProfile, SessionState, TransferProgressEvent, TransferRequest, TransferTask } from "./types";
 import type { ServerImportDraft, ServerImportSummary } from "./serverImportExport";
 
 const serializeAiConfigForStorage = (config: AiConfig) => {
   if (!isTauri()) return config;
-  const { apiKey: _apiKey, ...persistedConfig } = config;
-  return persistedConfig;
+  return stripAiConfigSecrets(config);
 };
+
+const loadAiProviderKeys = async (config: AiConfig) => new Map(await Promise.all(config.providers.map(async (provider) =>
+  [provider.id, await invoke<string | null>("load_ai_key", { providerId: provider.id })] as const)));
+
+const applyAiProviderKeys = (config: AiConfig, keys: Map<string, string | null>, preserveExisting = false) => normalizeAiConfig({
+  ...config, providers: config.providers.map((provider) => ({ ...provider,
+    apiKey: preserveExisting && provider.apiKey ? provider.apiKey : keys.has(provider.id) ? keys.get(provider.id) ?? "" : provider.apiKey,
+  })),
+});
 
 const SIDEBAR_MIN_WIDTH = 210;
 const SIDEBAR_MAX_WIDTH = 420;
@@ -219,8 +227,8 @@ export default function App() {
     const merged = stampUnversionedSnapshot(mergeAppStorageSnapshots(snapshotRef.current, snapshot));
     replaceStorageSnapshot(merged);
     if (isTauri()) {
-      const apiKey = await invoke<string | null>("load_ai_key").catch(() => null);
-      setAiConfig((current) => keepCurrentWhenEqual(current, { ...current, apiKey: apiKey ?? "" }));
+      const keys = await loadAiProviderKeys(normalizeAiConfig(merged.aiConfig ?? {}));
+      setAiConfig((current) => keepCurrentWhenEqual(current, applyAiProviderKeys(current, keys)));
     }
     return merged;
   }, [replaceStorageSnapshot]);
@@ -473,19 +481,20 @@ export default function App() {
     };
   }, [storageReady]);
 
+  const aiProviderIds = aiConfig.providers.map((provider) => provider.id).join("\n");
   useEffect(() => {
     if (!isTauri()) return;
     let disposed = false;
-    void invoke<string | null>("load_ai_key")
-      .then((apiKey) => {
-        if (disposed || !apiKey) return;
-        setAiConfig((current) => current.apiKey.trim() ? current : { ...current, apiKey });
+    void loadAiProviderKeys(aiConfig)
+      .then((keys) => {
+        if (disposed) return;
+        setAiConfig((current) => keepCurrentWhenEqual(current, applyAiProviderKeys(current, keys, true)));
       })
       .catch((error) => console.error("Failed to load saved AI API key", error));
     return () => {
       disposed = true;
     };
-  }, [storageReady]);
+  }, [storageReady, aiProviderIds]);
 
   useEffect(() => {
     if (!DEV_BOOTSTRAP || !storageReady) return;
@@ -669,18 +678,26 @@ export default function App() {
 
   const saveAiConfig = async (next: AiConfig) => {
     const nextConfig = normalizeAiConfig(next);
-    if (isTauri() && nextConfig.apiKey.trim()) {
-      await invoke("store_ai_key", { apiKey: nextConfig.apiKey.trim() });
+    if (isTauri()) {
+      for (const provider of nextConfig.providers) {
+        await invoke(provider.apiKey.trim() ? "store_ai_key" : "delete_ai_key", {
+          providerId: provider.id, apiKey: provider.apiKey.trim(),
+        });
+      }
+      for (const provider of aiConfig.providers.filter((item) => !nextConfig.providers.some((nextProvider) => nextProvider.id === item.id))) {
+        await invoke("delete_ai_key", { providerId: provider.id });
+      }
     }
     setAiConfig(nextConfig);
     markSyncChange({ aiConfig: true });
   };
 
-  const removeSavedAiKey = async () => {
+  const removeSavedAiKey = async (providerId: string) => {
     if (isTauri()) {
-      await invoke("delete_ai_key");
+      await invoke("delete_ai_key", { providerId });
     }
-    setAiConfig((current) => ({ ...current, apiKey: "" }));
+    setAiConfig((current) => normalizeAiConfig({ ...current, providers: current.providers.map((provider) =>
+      provider.id === providerId ? { ...provider, apiKey: "" } : provider) }));
     markSyncChange({ aiConfig: true });
   };
 
@@ -1405,7 +1422,7 @@ export default function App() {
                       server={server}
                       config={aiConfig}
                       onModelSettingsChange={(patch) => {
-                        setAiConfig((current) => ({ ...current, ...patch }));
+                        setAiConfig((current) => changeAiModelSettings(current, patch));
                         markSyncChange({ aiConfig: true });
                       }}
                       hidden={!aiOpen}

@@ -30,18 +30,29 @@ For an internet-facing deployment, terminate TLS at a reverse proxy, keep the se
 
 ## API
 
-- `POST /auth/register` creates an account and returns `{ "token", "email" }`.
-- `POST /auth/login` verifies an account and returns `{ "token", "email" }`.
+- `POST /auth/register` creates an account and returns `{ "token", "refreshToken", "email", "expiresAt", "refreshExpiresAt" }`.
+- `POST /auth/login` verifies an account and returns the same token response, with a separate session per login.
+- `POST /auth/refresh` accepts `{ "accessToken", "refreshToken" }` and returns a renewed token response without a password. The signed access token may have expired, but both tokens must belong to the same login. Expiration values are Unix seconds.
 - `GET /sync/data` returns `{ "ciphertext", "updatedAt" }`, or `404` before the first upload.
-- `PUT /sync/data` stores `{ "ciphertext", "updatedAt" }` for the authenticated account.
+- `PUT /sync/data` stores `{ "ciphertext", "updatedAt", "expectedUpdatedAt"? }` for the authenticated account.
 - `DELETE /sync/data` removes the authenticated account's application snapshot.
 - `GET /sync/keys` returns the opaque passphrase-encrypted `*.key` backup, or `404` before the first upload.
-- `PUT /sync/keys` stores `{ "ciphertext", "updatedAt" }` for the authenticated account.
+- `PUT /sync/keys` stores `{ "ciphertext", "updatedAt", "expectedUpdatedAt"? }` for the authenticated account.
 - `DELETE /sync/keys` removes the authenticated account's encrypted key backup.
 - `DELETE /sync` removes both cloud snapshots for the authenticated account.
 - `GET /healthz` returns service readiness.
 
-Passwords are hashed with scrypt and a per-account random salt. Tokens use HMAC-SHA256 and expire after seven days. Authentication endpoints are rate-limited per client address. Application snapshots and key backups are never decrypted or parsed by the service.
+Passwords are hashed with scrypt and a per-account random salt. Access tokens use HMAC-SHA256 and expire after 15 minutes. Refresh tokens contain 32 random bytes, are stored only as SHA-256 hashes in the `refresh_sessions` table, and expire 30 days after issuance or the last successful refresh. The refresh token remains stable during renewal, allowing a client to recover from a lost response or a failed credential-vault write. Expired, deleted, or mismatched refresh sessions return `401`. All authentication endpoints, including refresh, are rate-limited per client address. Application snapshots and key backups are never decrypted or parsed by the service.
+
+Keep the database and signing secret across service restarts and upgrades so saved sessions continue working. The desktop automatically refreshes and retries once on `401`; temporary network errors, `429`, and server failures retain the login for a later retry.
+
+## Provider and model sync
+
+The provider/model tree is part of the encrypted `aiConfig` inside `/sync/data`. It includes all providers, their models and reasoning settings, the selected provider/model, and each provider's API key. The server stores the entire ciphertext unchanged; it needs no provider/model tables or SQL migration when an older single-provider snapshot becomes a provider list. Unknown client fields are preserved in the ciphertext as well.
+
+`expectedUpdatedAt: null` creates a snapshot only when none exists; an integer requires that exact current version. A mismatch returns `409` with `X-SSHStar-Current-Version`, and the client must download, merge, and retry. Omitting the field remains supported for older clients. The server assigns a monotonically increasing `updatedAt`; clients should read the accepted version from `GET /sync/data` after uploading.
+
+See [the encrypted snapshot contract](docs/sync-data-contract.md) for the provider/model fields, legacy compatibility, API-key handling, and the distinction between saved model selections and local tree navigation.
 
 ## Test
 

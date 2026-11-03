@@ -10,7 +10,6 @@ import {
   Download,
   Eye,
   EyeOff,
-  ExternalLink,
   FileCode2,
   FilePenLine,
   FolderTree,
@@ -52,7 +51,9 @@ import {
   type ServerKeyPathUpdate,
 } from "../storage";
 import { useCloudSyncStatus } from "../useCloudSyncStatus";
-import { AI_REASONING_EFFORT_OPTIONS, DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiReasoningEffort, type AiToolKey, type ServerProfile } from "../types";
+import { DEFAULT_AI_TOOL_SETTINGS, normalizeAiConfig, OFFICIAL_CLOUD_SYNC_ENDPOINT, type AiConfig, type AiToolKey, type ServerProfile } from "../types";
+
+import { AiProviderSettings } from "./AiProviderSettings";
 
 interface Props {
   config: AiConfig;
@@ -61,7 +62,7 @@ interface Props {
   cloudSyncActivity?: CloudSyncProgress;
   onSyncNow: (endpointOverride?: string) => void | Promise<void>;
   onSave: (config: AiConfig) => void | Promise<void>;
-  onRemoveSavedKey: () => void | Promise<void>;
+  onRemoveSavedKey: (providerId: string) => Promise<void>;
   onManageServerKeyPaths: (updates: ServerKeyPathUpdate[]) => void | Promise<void>;
   onClose: () => void;
 }
@@ -127,7 +128,7 @@ const SETTINGS_SECTIONS: Array<{
   description: string;
   icon: typeof Bot;
 }> = [
-  { id: "model", label: "模型", description: "接口、密钥与模型能力", icon: Bot },
+  { id: "model", label: "模型提供商", description: "提供商、密钥、模型与思考强度", icon: Bot },
   { id: "agent", label: "Agent", description: "运行参数与系统提示词", icon: SlidersHorizontal },
   { id: "tools", label: "工具能力", description: "终端、诊断与服务工具", icon: Wrench },
   { id: "transfer", label: "文件传输", description: "文件系统与 SFTP 权限", icon: Upload },
@@ -154,8 +155,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
   const [modelSearch, setModelSearch] = useState("");
   const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [removingKey, setRemovingKey] = useState(false);
-  const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [error, setError] = useState("");
   const { syncStatus, refreshSyncStatus } = useCloudSyncStatus(value.cloudSync.endpoint, cloudSyncActivity);
   const [syncEmail, setSyncEmail] = useState("");
@@ -252,6 +251,14 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
 
   const save = async () => {
     if (!isDirty) return;
+    const invalidProvider = value.providers.find((provider) => !provider.name.trim() || !provider.endpoint.trim()
+      || !provider.models.length || provider.models.some((model) => !model.id.trim())
+      || new Set(provider.models.map((model) => model.id.trim())).size !== provider.models.length);
+    if (invalidProvider) {
+      setError(`请完善「${invalidProvider.name || "未命名提供商"}」的名称、接口地址和模型 ID，模型 ID 不能重复`);
+      setActiveSection("model");
+      return;
+    }
     if (!value.endpoint.trim()) {
       setError("请填写接口地址");
       return;
@@ -297,9 +304,10 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     try {
       const nextValue = normalizeAiConfig({
         ...value,
-        endpoint: value.endpoint.trim(),
-        apiKey: value.apiKey.trim(),
-        model: value.model.trim(),
+        providers: value.providers.map((provider) => ({ ...provider,
+          name: provider.name.trim(), endpoint: provider.endpoint.trim(), apiKey: provider.apiKey.trim(),
+          selectedModelId: provider.selectedModelId.trim(), models: provider.models.map((model) => ({ ...model, id: model.id.trim() })),
+        })),
         reviewerModel: value.reviewerModel.trim(),
         tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...value.tools },
       });
@@ -310,20 +318,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSaving(false);
-    }
-  };
-
-  const removeSavedKey = async () => {
-    setRemovingKey(true);
-    setError("");
-    try {
-      await onRemoveSavedKey();
-      setValue((current) => ({ ...current, apiKey: "" }));
-      setSavedValue((current) => ({ ...current, apiKey: "" }));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setRemovingKey(false);
     }
   };
 
@@ -477,7 +471,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
   };
 
   const cloudClearBusy = Boolean(cloudClearTarget);
-  const busy = saving || removingKey || syncBusy || keySyncBusy || cloudClearBusy;
+  const busy = saving || syncBusy || keySyncBusy || cloudClearBusy;
   const visibleSections = SETTINGS_SECTIONS.filter((section) => {
     const query = navSearch.trim().toLocaleLowerCase();
     return !query || `${section.label} ${section.description}`.toLocaleLowerCase().includes(query);
@@ -584,7 +578,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
           </div>
         </aside>
 
-        <main className="settings-page">
+        <main className={`settings-page ${visibleActiveSection === "model" ? "settings-provider-page" : ""}`}>
           <header className="settings-page-header">
             {activeSectionMeta ? (
               <div>
@@ -601,68 +595,20 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
             )}
           </header>
 
-          <div className="settings-page-scroll">
+          <div className={`settings-page-scroll ${visibleActiveSection === "model" ? "provider-settings-scroll" : ""}`}>
             {visibleActiveSection === "model" && (
-              <>
-                <section className="settings-panel">
-                  <header><strong>模型服务</strong><small>配置 OpenAI 兼容的大语言模型接入；可选择 Chat Completions 或 Responses 接口</small></header>
-                  <div className="settings-config-row">
-                    <span className="settings-row-copy"><strong>Provider</strong><small>使用 Bearer API Key 的 OpenAI 兼容服务</small></span>
-                    <span className="settings-static-value">OpenAI 兼容</span>
-                  </div>
-                  <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>接口模式</strong><small>Responses 使用 /responses 与类型化 SSE 事件；旧配置默认保持 Chat Completions</small></span>
-                    <select className="settings-input settings-mono-input" value={value.apiMode} onChange={(event) => setValue({ ...value, apiMode: event.target.value as AiConfig["apiMode"] })}>
-                      <option value="chat-completions">Chat Completions</option>
-                      <option value="responses">Responses</option>
-                    </select>
-                  </label>
-                  <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>Base URL</strong><small>可填写 API 基础地址，也可填写当前模式的完整接口地址</small></span>
-                    <input className="settings-input settings-mono-input" value={value.endpoint} onChange={(event) => setValue({ ...value, endpoint: event.target.value })} />
-                  </label>
-                  <div className="settings-config-row">
-                    <label className="settings-row-copy" htmlFor="ai-api-key"><strong>API Key</strong><small>桌面端安全保存到系统凭据库，并在启动时自动恢复</small></label>
-                    <span className="settings-secret-control">
-                      <input id="ai-api-key" className="settings-input settings-mono-input" type={apiKeyVisible ? "text" : "password"} autoComplete="off" spellCheck={false} value={value.apiKey} onChange={(event) => setValue({ ...value, apiKey: event.target.value })} placeholder="sk-..." />
-                      <button className="settings-secret-toggle" type="button" onClick={() => setApiKeyVisible((visible) => !visible)} aria-label={apiKeyVisible ? "隐藏 API Key" : "显示 API Key"} aria-pressed={apiKeyVisible} title={apiKeyVisible ? "隐藏 API Key" : "显示 API Key"}>
-                        {apiKeyVisible ? <EyeOff size={15} /> : <Eye size={15} />}
-                      </button>
-                    </span>
-                  </div>
-                  <div className="settings-config-row">
-                    <span className="settings-row-copy"><strong>移除已保存密钥</strong><small>从系统凭据库永久删除当前密钥；此操作不能通过清空输入框完成</small></span>
-                    <button className="danger-button" type="button" disabled={busy} onClick={() => void removeSavedKey()}>
-                      {removingKey ? <RefreshCw className="spinning" size={14} /> : <Trash2 size={14} />}
-                      {removingKey ? "移除中…" : "移除已保存密钥"}
-                    </button>
-                  </div>
-                  <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>Model</strong><small>{models.length > 0 ? `已获取 ${models.length} 个模型` : "支持手动输入模型名称"}</small></span>
-                    <span className="settings-model-control">
-                      <input className="settings-input settings-mono-input" value={value.model} onChange={(event) => setValue({ ...value, model: event.target.value })} placeholder="输入模型 ID" />
-                      <button type="button" disabled={loadingModels} onClick={() => void openModelPicker("agent")}>
-                        <RefreshCw className={loadingModels ? "spinning" : ""} size={14} />
-                        {loadingModels ? "获取中" : "选择模型"}
-                      </button>
-                    </span>
-                  </label>
-                </section>
-
-                <a className="settings-page-link" href={value.apiMode === "responses" ? "https://developers.openai.com/api/reference/resources/responses/methods/create" : "https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create"} target="_blank" rel="noreferrer">查看当前接口格式 <ExternalLink size={13} /></a>
-              </>
+              <AiProviderSettings value={value} onChange={setValue} disabled={busy} onRemoveSavedKey={async (providerId) => {
+                await onRemoveSavedKey(providerId);
+                const clearKey = (current: AiConfig) => normalizeAiConfig({ ...current, providers: current.providers.map((provider) => provider.id === providerId ? { ...provider, apiKey: "" } : provider) });
+                setValue(clearKey);
+                setSavedValue(clearKey);
+              }} />
             )}
 
             {visibleActiveSection === "agent" && (
               <>
                 <section className="settings-panel">
                   <header><strong>Agent 运行参数</strong><small>由 Rig 管理多轮调用、工具循环和 provider 差异</small></header>
-                  <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>思考强度</strong><small>也可在对话输入框中切换；自动使用模型默认值，各档位需模型支持</small></span>
-                    <select className="settings-input" value={value.reasoningEffort} onChange={(event) => setValue({ ...value, reasoningEffort: event.target.value as AiReasoningEffort })}>
-                      {AI_REASONING_EFFORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                    </select>
-                  </label>
                   <label className="settings-config-row">
                     <span className="settings-row-copy"><strong>最大上下文</strong><small>模型上下文预算；sshStar 不额外限制可填写的上限</small></span>
                     <span className="settings-number-control"><input className="settings-input settings-mono-input" type="number" min={1} step={1} value={value.contextWindow} onChange={(event) => setValue({ ...value, contextWindow: Number(event.target.value) })} /><em>tokens</em></span>

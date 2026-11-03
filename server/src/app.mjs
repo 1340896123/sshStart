@@ -1,11 +1,12 @@
-import { createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 const TOKEN_ISSUER = "sshstar-ssh-sync";
-const DEFAULT_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
+const DEFAULT_TOKEN_TTL_SECONDS = 15 * 60;
+const DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_MAX_CIPHERTEXT_BYTES = 16 * 1024 * 1024;
 const PASSWORD_MIN_LENGTH = 8;
 const PASSWORD_MAX_LENGTH = 256;
@@ -91,11 +92,12 @@ async function verifyPassword(password, encodedHash) {
     && timingSafeEqual(expected, actual);
 }
 
-function createToken(user, secret, ttlSeconds, nowSeconds) {
+function createToken(user, sessionId, secret, ttlSeconds, nowSeconds) {
   const header = base64UrlJson({ alg: "HS256", typ: "JWT" });
   const payload = base64UrlJson({
     iss: TOKEN_ISSUER,
     sub: user.id,
+    sid: sessionId,
     email: user.email,
     iat: nowSeconds,
     exp: nowSeconds + ttlSeconds,
@@ -105,7 +107,8 @@ function createToken(user, secret, ttlSeconds, nowSeconds) {
   return `${unsigned}.${signature}`;
 }
 
-function verifyToken(token, secret, nowSeconds) {
+function verifyToken(token, secret, nowSeconds, { allowExpired = false } = {}) {
+  if (typeof token !== "string") throw new HttpError(401, "登录令牌无效或已过期");
   const parts = token.split(".");
   if (parts.length !== 3) throw new HttpError(401, "登录令牌无效或已过期");
 
@@ -125,8 +128,10 @@ function verifyToken(token, secret, nowSeconds) {
   }
   if (payload?.iss !== TOKEN_ISSUER
     || !Number.isInteger(payload.sub)
+    || typeof payload.sid !== "string"
+    || payload.sid.length === 0
     || !Number.isInteger(payload.exp)
-    || payload.exp <= nowSeconds) {
+    || (!allowExpired && payload.exp <= nowSeconds)) {
     throw new HttpError(401, "登录令牌无效或已过期");
   }
   return payload;
@@ -271,6 +276,15 @@ function openDatabase(databasePath) {
       stored_at INTEGER NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS refresh_sessions (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      token_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS refresh_sessions_expiry ON refresh_sessions(expires_at);
   `);
   return database;
 }
@@ -279,6 +293,7 @@ export function createSyncServer({
   databasePath = "./data/sshstar-sync.sqlite",
   tokenSecret,
   tokenTtlSeconds = DEFAULT_TOKEN_TTL_SECONDS,
+  refreshTokenTtlSeconds = DEFAULT_REFRESH_TOKEN_TTL_SECONDS,
   maxCiphertextBytes = DEFAULT_MAX_CIPHERTEXT_BYTES,
   authRateLimit = 10,
   authRateWindowMs = 15 * 60 * 1000,
@@ -291,11 +306,18 @@ export function createSyncServer({
   if (!Number.isInteger(tokenTtlSeconds) || tokenTtlSeconds <= 0) {
     throw new Error("tokenTtlSeconds 必须是正整数");
   }
+  if (!Number.isInteger(refreshTokenTtlSeconds) || refreshTokenTtlSeconds <= 0) {
+    throw new Error("refreshTokenTtlSeconds 必须是正整数");
+  }
 
   const database = openDatabase(databasePath);
   const findUserByEmail = database.prepare("SELECT id, email, password_hash FROM users WHERE email = ?");
   const findUserById = database.prepare("SELECT id, email FROM users WHERE id = ?");
   const insertUser = database.prepare("INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)");
+  const findRefreshSession = database.prepare("SELECT user_id, token_hash, expires_at FROM refresh_sessions WHERE id = ?");
+  const insertRefreshSession = database.prepare("INSERT INTO refresh_sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)");
+  const renewRefreshSession = database.prepare("UPDATE refresh_sessions SET expires_at = ? WHERE id = ?");
+  const deleteExpiredSessions = database.prepare("DELETE FROM refresh_sessions WHERE expires_at <= ?");
   const findSnapshot = database.prepare("SELECT ciphertext, updated_at FROM sync_snapshots WHERE user_id = ?");
   const deleteSnapshot = database.prepare("DELETE FROM sync_snapshots WHERE user_id = ?");
   const saveSnapshot = database.prepare(`
@@ -319,6 +341,22 @@ export function createSyncServer({
   const takeAuthAttempt = createRateLimiter(authRateLimit, authRateWindowMs);
   const maxBodyBytes = maxCiphertextBytes + 64 * 1024;
 
+  const hashRefreshToken = (token) => createHash("sha256").update(token).digest("hex");
+  const tokenResponse = (user, sessionId, refreshToken, nowSeconds) => ({
+    token: createToken(user, sessionId, tokenSecret, tokenTtlSeconds, nowSeconds),
+    refreshToken,
+    expiresAt: nowSeconds + tokenTtlSeconds,
+    refreshExpiresAt: nowSeconds + refreshTokenTtlSeconds,
+    email: user.email,
+  });
+  const createSession = (user, nowSeconds) => {
+    const sessionId = randomBytes(32).toString("base64url");
+    const refreshToken = randomBytes(32).toString("base64url");
+    deleteExpiredSessions.run(nowSeconds);
+    insertRefreshSession.run(sessionId, user.id, hashRefreshToken(refreshToken), nowSeconds + refreshTokenTtlSeconds);
+    return tokenResponse(user, sessionId, refreshToken, nowSeconds);
+  };
+
   const authenticate = (request) => {
     const authorization = request.headers.authorization ?? "";
     const match = /^Bearer\s+(.+)$/i.exec(authorization);
@@ -341,9 +379,26 @@ export function createSyncServer({
     }
 
     const body = await readJson(request, maxBodyBytes);
+    const nowSeconds = Math.floor(now() / 1000);
+    if (path === "/auth/refresh") {
+      // Only this endpoint accepts expired access tokens. Both tokens must belong
+      // to the same server-issued session, even for two logins to one account.
+      const payload = verifyToken(body.accessToken, tokenSecret, nowSeconds, { allowExpired: true });
+      const session = findRefreshSession.get(payload.sid);
+      const user = findUserById.get(payload.sub);
+      if (typeof body.refreshToken !== "string" || body.refreshToken.length !== 43
+        || !session || session.user_id !== payload.sub || session.expires_at <= nowSeconds || !user
+        || !timingSafeEqual(Buffer.from(session.token_hash, "hex"), Buffer.from(hashRefreshToken(body.refreshToken), "hex"))) {
+        throw new HttpError(401, "刷新令牌无效或已过期，请重新登录");
+      }
+      // Keep the refresh token stable so a lost response or failed local vault
+      // write cannot strand the client. Successful refreshes extend its lifetime.
+      renewRefreshSession.run(nowSeconds + refreshTokenTtlSeconds, payload.sid);
+      sendJson(response, 200, tokenResponse(user, payload.sid, body.refreshToken, nowSeconds));
+      return;
+    }
     const email = normalizeEmail(body.email);
     const password = validatePassword(body.password);
-    const nowSeconds = Math.floor(now() / 1000);
 
     if (path === "/auth/register") {
       if (findUserByEmail.get(email)) throw new HttpError(409, "该邮箱已注册");
@@ -358,20 +413,14 @@ export function createSyncServer({
         throw error;
       }
       const user = { id: Number(result.lastInsertRowid), email };
-      sendJson(response, 201, {
-        token: createToken(user, tokenSecret, tokenTtlSeconds, nowSeconds),
-        email,
-      });
+      sendJson(response, 201, createSession(user, nowSeconds));
       return;
     }
 
     const user = findUserByEmail.get(email);
     const passwordMatches = await verifyPassword(password, user?.password_hash);
     if (!user || !passwordMatches) throw new HttpError(401, "邮箱或密码错误");
-    sendJson(response, 200, {
-      token: createToken(user, tokenSecret, tokenTtlSeconds, nowSeconds),
-      email: user.email,
-    });
+    sendJson(response, 200, createSession(user, nowSeconds));
   };
 
   const handleRequest = async (request, response) => {
@@ -382,7 +431,7 @@ export function createSyncServer({
       sendJson(response, 200, { status: "ok" });
       return;
     }
-    if (request.method === "POST" && (path === "/auth/register" || path === "/auth/login")) {
+    if (request.method === "POST" && (path === "/auth/register" || path === "/auth/login" || path === "/auth/refresh")) {
       await handleAuth(request, response, path);
       return;
     }
@@ -458,7 +507,7 @@ export function createSyncServer({
       return;
     }
 
-    if (path === "/auth/register" || path === "/auth/login" || path === "/sync" || path === "/sync/data" || path === "/sync/keys") {
+    if (path === "/auth/register" || path === "/auth/login" || path === "/auth/refresh" || path === "/sync" || path === "/sync/data" || path === "/sync/keys") {
       throw new HttpError(405, "请求方法不受支持");
     }
     throw new HttpError(404, "接口不存在");

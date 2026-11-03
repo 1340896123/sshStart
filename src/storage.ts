@@ -1,13 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "./lib";
 import type { AiConversation } from "./aiHistory";
-import type { AiConfig, ServerProfile } from "./types";
+import type { AiConfigInput, ServerProfile } from "./types";
 
 export interface AppStorageSnapshot {
   servers: ServerProfile[];
   deletedServerIds?: string[];
   savedGroups: string[];
-  aiConfig: Partial<AiConfig> | null;
+  aiConfig: AiConfigInput | null;
   aiConversations: AiConversation[];
   collapsedGroups: string[];
   syncMeta?: CloudSyncMetadata;
@@ -153,7 +153,7 @@ export const saveDeletedServerIds = (serverIds: string[]) =>
 export const saveServerGroups = (groups: string[]) =>
   isTauri() ? invoke("save_server_groups", { groups }) : Promise.resolve();
 
-export const saveAiConfig = (config: Partial<AiConfig>) =>
+export const saveAiConfig = (config: AiConfigInput) =>
   isTauri() ? invoke("save_ai_config", { config }) : Promise.resolve();
 
 export const saveAiConversations = (conversations: AiConversation[]) =>

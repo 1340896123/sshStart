@@ -1,7 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { Check, ChevronDown, LoaderCircle, RefreshCw, Search } from "lucide-react";
-import { isTauri } from "../lib";
+import { Check, ChevronDown, Search } from "lucide-react";
 import { AI_REASONING_EFFORT_OPTIONS, type AiConfig, type AiModelSettings, type AiReasoningEffort } from "../types";
 
 interface Props {
@@ -13,10 +11,8 @@ interface Props {
 export function AiModelControls({ config, disabled, onChange }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [models, setModels] = useState<string[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [refresh, setRefresh] = useState(0);
+  const provider = config.providers.find((item) => item.id === config.selectedProviderId);
+  const modelConfig = provider?.models.find((item) => item.id === config.model);
   const controlRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [popoverPosition, setPopoverPosition] = useState<CSSProperties>({});
@@ -59,26 +55,7 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
     };
   }, [open]);
 
-  useEffect(() => {
-    if (!open || disabled) { setOpen(false); return; }
-    let cancelled = false;
-    setLoading(true);
-    setModels([]);
-    setError("");
-    const load = async () => {
-      try {
-        if (!isTauri()) throw new Error("请在桌面应用中获取模型列表，也可直接输入模型 ID。");
-        const result = await invoke<string[]>("list_rig_models", { config });
-        if (!cancelled) setModels([...new Set(result)]);
-      } catch (reason) {
-        if (!cancelled) setError(String(reason));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    void load();
-    return () => { cancelled = true; };
-  }, [open, disabled, config.endpoint, config.apiKey, refresh]);
+  useEffect(() => { setOpen(false); }, [disabled, config.selectedProviderId]);
 
   useEffect(() => {
     if (!open) return;
@@ -100,9 +77,8 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
     };
   }, [open]);
 
-  const available = [...new Set([config.model, ...models].filter(Boolean))];
+  const available = provider?.models.map((model) => model.id).filter(Boolean) ?? [];
   const filtered = available.filter((model) => model.toLowerCase().includes(query.trim().toLowerCase()));
-  const custom = query.trim();
   const choose = (model: string) => {
     if (disabled || !model.trim()) return;
     onChange({ model: model.trim() });
@@ -112,6 +88,14 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
 
   return (
     <div className="ai-model-controls" ref={controlRef}>
+      <label className="composer-effort-control composer-provider-control" title={provider?.name}>
+        <span className="sr-only">模型提供商</span>
+        <select aria-label="模型提供商" value={config.selectedProviderId} disabled={disabled}
+          onChange={(event) => onChange({ providerId: event.target.value })}>
+          {config.providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+        </select>
+        <ChevronDown size={10} aria-hidden="true" />
+      </label>
       <button
         className="composer-model-trigger"
         type="button"
@@ -135,7 +119,7 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
           disabled={disabled}
           onChange={(event) => onChange({ reasoningEffort: event.target.value as AiReasoningEffort })}
         >
-          {AI_REASONING_EFFORT_OPTIONS.map((option) => (
+          {AI_REASONING_EFFORT_OPTIONS.filter((option) => modelConfig?.reasoningEfforts.includes(option.value)).map((option) => (
             <option key={option.value} value={option.value}>{option.value === "auto" ? "思考 · 自动" : `思考 · ${option.label}`}</option>
           ))}
         </select>
@@ -145,13 +129,10 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
         <section className="composer-model-popover" style={popoverPosition} id={popoverId} role="dialog" aria-label="选择对话模型">
           <header>
             <strong>选择模型</strong>
-            <button type="button" className="icon-button quiet" title="刷新模型列表" aria-label="刷新模型列表" disabled={loading} onClick={() => setRefresh((value) => value + 1)}>
-              {loading ? <LoaderCircle size={14} className="ai-loading-icon" /> : <RefreshCw size={14} />}
-            </button>
           </header>
-          <form className="composer-model-search" onSubmit={(event) => { event.preventDefault(); choose(custom); }}>
+          <form className="composer-model-search" onSubmit={(event) => { event.preventDefault(); if (filtered.length === 1) choose(filtered[0]); }}>
             <Search size={14} aria-hidden="true" />
-            <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索或输入模型 ID" placeholder="搜索或输入模型 ID" />
+            <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索模型 ID" placeholder="搜索已配置的模型" />
           </form>
           <div className="composer-model-list" aria-label="可用模型">
             {filtered.map((model) => (
@@ -160,13 +141,8 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
                 {model === config.model && <Check size={14} aria-hidden="true" />}
               </button>
             ))}
-            {custom && !available.includes(custom) && (
-              <button className="composer-model-option custom" type="button" onClick={() => choose(custom)}><span>使用「{custom}」</span></button>
-            )}
           </div>
-          <p className={`composer-model-note ${error ? "error" : ""}`} role="status" title={error || undefined}>
-            {loading ? "正在获取模型列表…" : error ? "暂时无法获取列表，可输入模型 ID 后按 Enter 使用。" : "选择模型，或输入自定义模型 ID。"}
-          </p>
+          <p className="composer-model-note" role="status">{filtered.length ? `${provider?.name} · ${available.length} 个已配置模型` : "没有匹配的模型，可在设置中添加。"}</p>
         </section>
       )}
     </div>

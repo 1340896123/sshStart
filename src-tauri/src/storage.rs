@@ -124,6 +124,33 @@ fn strip_secret_fields(value: &mut Value) {
 fn strip_ai_secret(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.remove("apiKey");
+        if let Some(providers) = object.get_mut("providers").and_then(Value::as_array_mut) {
+            for provider in providers {
+                if let Some(provider) = provider.as_object_mut() {
+                    provider.remove("apiKey");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_secret_tests {
+    #[test]
+    fn persisted_provider_configs_exclude_all_api_keys() {
+        let mut config = serde_json::json!({
+            "apiKey": "active-key",
+            "providers": [
+                {"id": "first", "apiKey": "first-key", "models": [{"id": "model-a"}]},
+                {"id": "second", "apiKey": "second-key"}
+            ]
+        });
+        super::strip_ai_secret(&mut config);
+        assert!(config.get("apiKey").is_none());
+        for provider in config["providers"].as_array().unwrap() {
+            assert!(provider.get("apiKey").is_none());
+        }
+        assert_eq!(config["providers"][0]["models"][0]["id"], "model-a");
     }
 }
 

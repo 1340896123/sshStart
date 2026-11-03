@@ -29,15 +29,17 @@ const CLOUD_SYNC_KEY_FILE: &str = "cloud.key";
 
 static SYNC_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static SYNC_AUTH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SYNC_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-// Keep the token and its issuing server in a single credential write. Legacy
-// bare tokens have no trustworthy server binding and require a fresh login.
+// Persist both tokens and their issuing server in a single credential write.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SyncSession {
     id: String,
     endpoint: String,
     email: String,
     token: String,
+    #[serde(rename = "refreshToken")]
+    refresh_token: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -205,7 +207,9 @@ fn read_session(entry: &keyring::Entry) -> Option<SyncSession> {
     let value = entry.get_password().ok()?;
     serde_json::from_str::<SyncSession>(&value)
         .ok()
-        .filter(|session| !session.token.trim().is_empty())
+        .filter(|session| {
+            !session.token.trim().is_empty() && !session.refresh_token.trim().is_empty()
+        })
 }
 
 fn session_for_endpoint(session: Option<SyncSession>, endpoint: &str) -> Option<SyncSession> {
@@ -257,6 +261,11 @@ fn authenticated_response_error(
     let _guard = sync_auth_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    clear_rejected_session(entry, session)
+}
+
+// Caller holds SYNC_AUTH_LOCK, so a late failure cannot clear a newer login.
+fn clear_rejected_session(entry: &keyring::Entry, session: &SyncSession) -> String {
     // A response from an older request must not log out a newer session.
     let clear_result = if read_session(entry).as_ref() == Some(session) {
         match entry.delete_credential() {
@@ -271,6 +280,116 @@ fn authenticated_response_error(
         Ok(()) => message.to_string(),
         Err(error) => format!("{message}；清除过期登录状态失败: {error}"),
     }
+}
+
+fn session_from_payload(payload: &Value, mut session: SyncSession) -> Result<SyncSession, String> {
+    session.token = payload
+        .get("token")
+        .or_else(|| payload.get("accessToken"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "同步服务没有返回访问令牌".to_string())?
+        .to_string();
+    session.refresh_token = payload
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "同步服务没有返回刷新令牌".to_string())?
+        .to_string();
+    if let Some(email) = payload.get("email").and_then(Value::as_str) {
+        session.email = email.to_string();
+    }
+    Ok(session)
+}
+
+fn refresh_session(
+    client: &Client,
+    session: &mut SyncSession,
+    entry: &keyring::Entry,
+) -> Result<(), String> {
+    // Coalesce concurrent 401s. Do not hold the auth lock during network I/O:
+    // logout and a new login must remain able to replace the current session.
+    let _refresh_guard = SYNC_REFRESH_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "同步令牌刷新锁已损坏".to_string())?;
+    let current = read_session(entry)
+        .filter(|current| current.id == session.id && current.endpoint == session.endpoint)
+        .ok_or_else(|| "同步账号已变更或已退出，请重试".to_string())?;
+    if current != *session {
+        *session = current;
+        return Ok(());
+    }
+    let response = client
+        .post(format!("{}/auth/refresh", session.endpoint))
+        .json(&json!({
+            "accessToken": session.token,
+            "refreshToken": session.refresh_token,
+        }))
+        .send()
+        .map_err(|error| format!("刷新同步登录失败，已保留登录状态: {error}"))?;
+    if !response.status().is_success() {
+        return Err(authenticated_response_error(response, session, entry));
+    }
+    let payload = response
+        .json::<Value>()
+        .map_err(|error| format!("解析同步令牌刷新响应失败: {error}"))?;
+    let refreshed = session_from_payload(&payload, session.clone())?;
+    let credential = serde_json::to_string(&refreshed)
+        .map_err(|error| format!("序列化同步登录状态失败: {error}"))?;
+    let _auth_guard = sync_auth_lock()
+        .lock()
+        .map_err(|_| "同步登录状态锁已损坏".to_string())?;
+    if read_session(entry).as_ref() != Some(session) {
+        return Err("同步账号已变更或已退出，请重试".to_string());
+    }
+    entry
+        .set_password(&credential)
+        .map_err(|error| format!("保存刷新后的同步登录状态失败: {error}"))?;
+    *session = refreshed;
+    Ok(())
+}
+
+fn authenticated_request_with_entry<F>(
+    client: &Client,
+    session: &mut SyncSession,
+    entry: &keyring::Entry,
+    request: F,
+) -> Result<reqwest::blocking::Response, String>
+where
+    F: Fn(&str) -> reqwest::blocking::RequestBuilder,
+{
+    let response = request(&session.token)
+        .send()
+        .map_err(|error| format!("同步服务请求失败: {error}"))?;
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(response);
+    }
+    drop(response);
+    refresh_session(client, session, entry)?;
+    let response = request(&session.token)
+        .send()
+        .map_err(|error| format!("重试同步服务请求失败: {error}"))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(authenticated_response_error(response, session, entry));
+    }
+    Ok(response)
+}
+
+fn authenticated_request<F>(
+    client: &Client,
+    session: &mut SyncSession,
+    request: F,
+) -> Result<reqwest::blocking::Response, String>
+where
+    F: Fn(&str) -> reqwest::blocking::RequestBuilder,
+{
+    authenticated_request_with_entry(
+        client,
+        session,
+        &super::keyring_entry(TOKEN_ACCOUNT)?,
+        request,
+    )
 }
 
 fn sync_response_error(response: reqwest::blocking::Response, session: &SyncSession) -> String {
@@ -303,6 +422,8 @@ fn response_error(response: reqwest::blocking::Response) -> String {
 fn request_client() -> Result<Client, String> {
     Client::builder()
         .user_agent("sshStar cloud sync")
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|error| format!("初始化同步网络连接失败: {error}"))
 }
@@ -1020,23 +1141,17 @@ fn auth_request(
     let payload = response
         .json::<Value>()
         .map_err(|error| format!("解析同步服务响应失败: {error}"))?;
-    let access_token = payload
-        .get("token")
-        .or_else(|| payload.get("accessToken"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "同步服务没有返回登录令牌".to_string())?;
-    let email = payload
-        .get("email")
-        .and_then(Value::as_str)
-        .unwrap_or(&email)
-        .to_string();
-    let session = SyncSession {
-        id: uuid::Uuid::new_v4().to_string(),
-        endpoint,
-        email: email.clone(),
-        token: access_token.to_string(),
-    };
+    let session = session_from_payload(
+        &payload,
+        SyncSession {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint,
+            email,
+            token: String::new(),
+            refresh_token: String::new(),
+        },
+    )?;
+    let email = session.email.clone();
     let credential = serde_json::to_string(&session)
         .map_err(|error| format!("序列化同步登录状态失败: {error}"))?;
     let _guard = sync_auth_lock()
@@ -1208,7 +1323,16 @@ fn hydrate_snapshot(mut snapshot: Value) -> Value {
         }
     }
     if let Some(config) = snapshot.get_mut("aiConfig").and_then(Value::as_object_mut) {
-        if let Some(value) = super::read_secret("ai:api-key") {
+        if let Some(providers) = config.get_mut("providers").and_then(Value::as_array_mut) {
+            for provider in providers {
+                if let Some(provider) = provider.as_object_mut() {
+                    let account = super::ai_key_account(provider.get("id").and_then(Value::as_str));
+                    if let Some(value) = super::read_secret(&account) {
+                        provider.insert("apiKey".to_string(), Value::String(value));
+                    }
+                }
+            }
+        } else if let Some(value) = super::read_secret("ai:api-key") {
             config.insert("apiKey".to_string(), Value::String(value));
         }
     }
@@ -1341,6 +1465,23 @@ fn store_snapshot_secrets(snapshot: &Value, local_snapshot: &Value) -> Result<()
     if !remote_ai_wins {
         return Ok(());
     }
+    let config = snapshot.get("aiConfig").and_then(Value::as_object);
+    if let Some(providers) = config.and_then(|config| config.get("providers")).and_then(Value::as_array) {
+        for provider in providers {
+            let Some(id) = provider.get("id").and_then(Value::as_str) else { continue; };
+            set_or_delete(super::ai_key_account(Some(id)), provider.get("apiKey").and_then(Value::as_str))?;
+        }
+        if let Some(previous) = local_snapshot.get("aiConfig").and_then(|config| config.get("providers")).and_then(Value::as_array) {
+            for provider in previous {
+                if let Some(id) = provider.get("id").and_then(Value::as_str) {
+                    if !providers.iter().any(|item| item.get("id").and_then(Value::as_str) == Some(id)) {
+                        set_or_delete(super::ai_key_account(Some(id)), None)?;
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
     let api_key = snapshot
         .get("aiConfig")
         .and_then(Value::as_object)
@@ -1366,6 +1507,13 @@ fn strip_snapshot_secrets(mut snapshot: Value) -> Value {
     }
     if let Some(config) = snapshot.get_mut("aiConfig").and_then(Value::as_object_mut) {
         config.remove("apiKey");
+        if let Some(providers) = config.get_mut("providers").and_then(Value::as_array_mut) {
+            for provider in providers {
+                if let Some(provider) = provider.as_object_mut() {
+                    provider.remove("apiKey");
+                }
+            }
+        }
     }
     snapshot
 }
@@ -1396,15 +1544,15 @@ fn clear_snapshot_category(snapshot: &mut Value, scope: &str) -> Result<(), Stri
 
 fn rewrite_cloud_snapshot_without(
     endpoint: &str,
-    session: &SyncSession,
+    session: &mut SyncSession,
     scope: &str,
 ) -> Result<(), String> {
     let client = request_client()?;
-    let response = client
-        .get(format!("{endpoint}/sync/data"))
-        .bearer_auth(&session.token)
-        .send()
-        .map_err(|error| format!("读取云端应用快照失败: {error}"))?;
+    let response = authenticated_request(&client, session, |token| {
+        client
+            .get(format!("{endpoint}/sync/data"))
+            .bearer_auth(token)
+    })?;
     if response.status().as_u16() == 404 {
         return clear_sync_state(session, true, false);
     }
@@ -1429,16 +1577,16 @@ fn rewrite_cloud_snapshot_without(
         ..summary_without_size
     };
     let updated_at = unix_timestamp();
-    let response = client
-        .put(format!("{endpoint}/sync/data"))
-        .bearer_auth(&session.token)
-        .json(&json!({
-            "ciphertext": encrypted,
-            "updatedAt": updated_at,
-            "expectedUpdatedAt": expected_updated_at,
-        }))
-        .send()
-        .map_err(|error| format!("更新云端应用快照失败: {error}"))?;
+    let response = authenticated_request(&client, session, |token| {
+        client
+            .put(format!("{endpoint}/sync/data"))
+            .bearer_auth(token)
+            .json(&json!({
+                "ciphertext": encrypted,
+                "updatedAt": updated_at,
+                "expectedUpdatedAt": expected_updated_at,
+            }))
+    })?;
     if !response.status().is_success() {
         return Err(sync_response_error(response, &session));
     }
@@ -1454,23 +1602,24 @@ fn rewrite_cloud_snapshot_without(
 }
 
 fn clear_cloud_data(endpoint: String, scope: String) -> Result<(), String> {
-    let session = require_session(&endpoint)?;
+    let mut session = require_session(&endpoint)?;
     if matches!(
         scope.as_str(),
         "servers" | "groups" | "ai-config" | "conversations"
     ) {
-        return rewrite_cloud_snapshot_without(&endpoint, &session, &scope);
+        return rewrite_cloud_snapshot_without(&endpoint, &mut session, &scope);
     }
     let (path, clear_data, clear_keys) = match scope.as_str() {
         "keys" => ("/sync/keys", false, true),
         "all" => ("/sync", true, true),
         _ => return Err("不支持的云端数据清除范围".to_string()),
     };
-    let response = request_client()?
-        .delete(format!("{endpoint}{path}"))
-        .bearer_auth(&session.token)
-        .send()
-        .map_err(|error| format!("清除云端数据失败: {error}"))?;
+    let client = request_client()?;
+    let response = authenticated_request(&client, &mut session, |token| {
+        client
+            .delete(format!("{endpoint}{path}"))
+            .bearer_auth(token)
+    })?;
     if !response.status().is_success() {
         return Err(sync_response_error(response, &session));
     }
@@ -1504,7 +1653,7 @@ fn push_sync(
         12,
         "正在整理应用数据",
     );
-    let session = require_session(&endpoint)?;
+    let mut session = require_session(&endpoint)?;
     let client = request_client()?;
     let snapshot =
         make_snapshot_key_paths_portable(hydrate_snapshot(snapshot), &sshstar_directory()?)?;
@@ -1533,16 +1682,16 @@ fn push_sync(
         "正在上传加密快照",
     );
     let updated_at = unix_timestamp();
-    let response = client
-        .put(format!("{endpoint}/sync/data"))
-        .bearer_auth(&session.token)
-        .json(&json!({
-            "ciphertext": encrypted,
-            "updatedAt": updated_at,
-            "expectedUpdatedAt": expected_updated_at,
-        }))
-        .send()
-        .map_err(|error| format!("上传同步数据失败: {error}"))?;
+    let response = authenticated_request(&client, &mut session, |token| {
+        client
+            .put(format!("{endpoint}/sync/data"))
+            .bearer_auth(token)
+            .json(&json!({
+                "ciphertext": encrypted,
+                "updatedAt": updated_at,
+                "expectedUpdatedAt": expected_updated_at,
+            }))
+    })?;
     if response.status().as_u16() == 409 {
         emit_progress(
             &app,
@@ -1594,7 +1743,7 @@ fn pull_sync(
         12,
         "正在连接同步服务",
     );
-    let session = require_session(&endpoint)?;
+    let mut session = require_session(&endpoint)?;
     let client = request_client()?;
     emit_progress(
         &app,
@@ -1605,11 +1754,11 @@ fn pull_sync(
         38,
         "正在下载加密快照",
     );
-    let response = client
-        .get(format!("{endpoint}/sync/data"))
-        .bearer_auth(&session.token)
-        .send()
-        .map_err(|error| format!("下载同步数据失败: {error}"))?;
+    let response = authenticated_request(&client, &mut session, |token| {
+        client
+            .get(format!("{endpoint}/sync/data"))
+            .bearer_auth(token)
+    })?;
     if response.status().as_u16() == 404 {
         emit_progress(
             &app,
@@ -1758,7 +1907,7 @@ fn upload_keys(
         14,
         "正在整理本地密钥文件",
     );
-    let session = require_session(&endpoint)?;
+    let mut session = require_session(&endpoint)?;
     let prepared = build_key_bundle(&servers)?;
     persist_managed_key_copies(&prepared.managed_copies)?;
     let client = request_client()?;
@@ -1773,11 +1922,11 @@ fn upload_keys(
             28,
             "正在合并其他设备的密钥备份",
         );
-        let remote_response = client
-            .get(format!("{endpoint}/sync/keys"))
-            .bearer_auth(&session.token)
-            .send()
-            .map_err(|error| format!("读取云端密钥备份失败: {error}"))?;
+        let remote_response = authenticated_request(&client, &mut session, |token| {
+            client
+                .get(format!("{endpoint}/sync/keys"))
+                .bearer_auth(token)
+        })?;
         let (remote_bundle, expected_updated_at) = if remote_response.status().as_u16() == 404 {
             (None, None)
         } else if remote_response.status().is_success() {
@@ -1820,16 +1969,16 @@ fn upload_keys(
             72,
             "正在上传密钥备份",
         );
-        let response = client
-            .put(format!("{endpoint}/sync/keys"))
-            .bearer_auth(&session.token)
-            .json(&json!({
-                "ciphertext": ciphertext,
-                "updatedAt": bundle.created_at,
-                "expectedUpdatedAt": expected_updated_at,
-            }))
-            .send()
-            .map_err(|error| format!("上传密钥备份失败: {error}"))?;
+        let response = authenticated_request(&client, &mut session, |token| {
+            client
+                .put(format!("{endpoint}/sync/keys"))
+                .bearer_auth(token)
+                .json(&json!({
+                    "ciphertext": ciphertext,
+                    "updatedAt": bundle.created_at,
+                    "expectedUpdatedAt": expected_updated_at,
+                }))
+        })?;
         if response.status().as_u16() == 409 && attempt < 3 {
             continue;
         }
@@ -1921,13 +2070,13 @@ fn download_keys(
         24,
         "正在下载密钥备份",
     );
-    let session = require_session(&endpoint)?;
+    let mut session = require_session(&endpoint)?;
     let client = request_client()?;
-    let response = client
-        .get(format!("{endpoint}/sync/keys"))
-        .bearer_auth(&session.token)
-        .send()
-        .map_err(|error| format!("下载密钥备份失败: {error}"))?;
+    let response = authenticated_request(&client, &mut session, |token| {
+        client
+            .get(format!("{endpoint}/sync/keys"))
+            .bearer_auth(token)
+    })?;
     if response.status().as_u16() == 404 {
         return Err("当前账号还没有上传密钥备份".to_string());
     }
@@ -2027,6 +2176,47 @@ pub async fn sync_download_keys(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_keys_sync_independently_and_removed_provider_keys_are_deleted() {
+        let first = format!("provider-test-{}", uuid::Uuid::new_v4());
+        let second = format!("provider-test-{}", uuid::Uuid::new_v4());
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for account in &self.0 {
+                    if let Ok(entry) = crate::keyring_entry(account) {
+                        entry.delete_credential().ok();
+                    }
+                }
+            }
+        }
+        let accounts = vec![crate::ai_key_account(Some(&first)), crate::ai_key_account(Some(&second))];
+        let _cleanup = Cleanup(accounts.clone());
+        let snapshot = serde_json::json!({"aiConfig": {"providers": [
+            {"id": first, "apiKey": "first-key"}, {"id": second, "apiKey": "second-key"}
+        ]}});
+        super::store_snapshot_secrets(&snapshot, &serde_json::json!({})).unwrap();
+        let hydrated = super::hydrate_snapshot(super::strip_snapshot_secrets(snapshot.clone()));
+        assert_eq!(hydrated["aiConfig"]["providers"][0]["apiKey"], "first-key");
+        assert_eq!(hydrated["aiConfig"]["providers"][1]["apiKey"], "second-key");
+        let next = serde_json::json!({"aiConfig": {"providers": [{"id": second, "apiKey": "updated-key"}]}});
+        super::store_snapshot_secrets(&next, &snapshot).unwrap();
+        assert!(crate::read_secret(&accounts[0]).is_none());
+        assert_eq!(crate::read_secret(&accounts[1]).as_deref(), Some("updated-key"));
+    }
+
+    #[test]
+    fn downloaded_provider_keys_are_stripped_from_local_snapshots() {
+        let snapshot = super::strip_snapshot_secrets(serde_json::json!({"aiConfig": {
+            "apiKey": "active-key", "selectedProviderId": "first", "providers": [
+                {"id": "first", "apiKey": "first-key"}, {"id": "second", "apiKey": "second-key"}
+            ]
+        }}));
+        let config = &snapshot["aiConfig"];
+        assert!(config.get("apiKey").is_none());
+        assert_eq!(config["selectedProviderId"], "first");
+        assert!(config["providers"].as_array().unwrap().iter().all(|provider| provider.get("apiKey").is_none()));
+    }
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -2036,6 +2226,7 @@ mod tests {
             endpoint: super::normalize_endpoint(endpoint).unwrap(),
             email: "user@example.com".to_string(),
             token: "test-token".to_string(),
+            refresh_token: "test-refresh-token".to_string(),
         }
     }
 
@@ -2080,6 +2271,280 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         response
+    }
+
+    fn auth_server_with_hook(
+        responses: Vec<(u16, serde_json::Value)>,
+        mut on_request: impl FnMut(usize) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, (status, payload)) in responses.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let size = stream.read(&mut buffer).unwrap();
+                    assert!(size > 0);
+                    request.extend_from_slice(&buffer[..size]);
+                    if let Some(end) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                on_request(index);
+                let body = if status == 204 {
+                    String::new()
+                } else {
+                    payload.to_string()
+                };
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (endpoint, server)
+    }
+
+    fn auth_server(
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        auth_server_with_hook(responses, |_| {})
+    }
+
+    fn test_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    fn refreshed_payload() -> serde_json::Value {
+        json!({ "token": "new-access-token", "refreshToken": "test-refresh-token", "email": "user@example.com" })
+    }
+
+    #[test]
+    fn expired_access_is_refreshed_and_all_sync_requests_retry_with_the_same_body() {
+        for (method, path) in [
+            (reqwest::Method::GET, "/sync/data"),
+            (reqwest::Method::PUT, "/sync/data"),
+            (reqwest::Method::GET, "/sync/keys"),
+            (reqwest::Method::PUT, "/sync/keys"),
+            (reqwest::Method::DELETE, "/sync"),
+            (reqwest::Method::DELETE, "/sync/data"),
+            (reqwest::Method::DELETE, "/sync/keys"),
+        ] {
+            let (endpoint, server) = auth_server(vec![
+                (401, json!({})),
+                (200, refreshed_payload()),
+                (204, json!({})),
+            ]);
+            let mut session = test_session(&endpoint);
+            let entry = mock_entry(&session);
+            let client = test_client();
+            let body =
+                json!({ "ciphertext": "encrypted", "expectedUpdatedAt": 123, "updatedAt": 124 });
+            let response =
+                super::authenticated_request_with_entry(&client, &mut session, &entry, |token| {
+                    let request = client
+                        .request(method.clone(), format!("{endpoint}{path}"))
+                        .bearer_auth(token);
+                    if method == reqwest::Method::PUT {
+                        request.json(&body)
+                    } else {
+                        request
+                    }
+                })
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 204);
+            assert_eq!(session.token, "new-access-token");
+            assert!(super::read_session(&entry).as_ref() == Some(&session));
+            let requests = server.join().unwrap();
+            assert!(requests[0].starts_with(&format!("{method} {path} ")));
+            assert!(requests[0]
+                .to_lowercase()
+                .contains("authorization: bearer test-token\r\n"));
+            assert!(requests[1].starts_with("POST /auth/refresh "));
+            let refresh_body: serde_json::Value =
+                serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                refresh_body,
+                json!({ "accessToken": "test-token", "refreshToken": "test-refresh-token" })
+            );
+            assert!(requests[2]
+                .to_lowercase()
+                .contains("authorization: bearer new-access-token\r\n"));
+            assert_eq!(
+                requests[0].split_once("\r\n\r\n").unwrap().1,
+                requests[2].split_once("\r\n\r\n").unwrap().1
+            );
+        }
+    }
+
+    #[test]
+    fn transient_or_malformed_refresh_responses_preserve_both_tokens() {
+        for (status, payload) in [
+            (500, json!({})),
+            (429, json!({})),
+            (404, json!({})),
+            (200, json!({ "token": "incomplete" })),
+        ] {
+            let (endpoint, server) = auth_server(vec![(401, json!({})), (status, payload)]);
+            let mut session = test_session(&endpoint);
+            let original = session.clone();
+            let entry = mock_entry(&session);
+            let client = test_client();
+            assert!(super::authenticated_request_with_entry(
+                &client,
+                &mut session,
+                &entry,
+                |token| {
+                    client
+                        .get(format!("{endpoint}/sync/data"))
+                        .bearer_auth(token)
+                }
+            )
+            .is_err());
+            assert!(session == original);
+            assert!(super::read_session(&entry).as_ref() == Some(&original));
+            assert_eq!(server.join().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn refresh_network_failure_preserves_the_login() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let mut session = test_session(&endpoint);
+        let original = session.clone();
+        let entry = mock_entry(&session);
+        assert!(super::refresh_session(&test_client(), &mut session, &entry).is_err());
+        assert!(super::read_session(&entry).as_ref() == Some(&original));
+    }
+
+    #[test]
+    fn rejected_refresh_or_rejected_retry_clears_only_the_current_login() {
+        for responses in [
+            vec![(401, json!({})), (401, json!({}))],
+            vec![
+                (401, json!({})),
+                (200, refreshed_payload()),
+                (401, json!({})),
+            ],
+        ] {
+            let count = responses.len();
+            let (endpoint, server) = auth_server(responses);
+            let mut session = test_session(&endpoint);
+            let entry = mock_entry(&session);
+            let client = test_client();
+            let error =
+                super::authenticated_request_with_entry(&client, &mut session, &entry, |token| {
+                    client
+                        .get(format!("{endpoint}/sync/data"))
+                        .bearer_auth(token)
+                })
+                .err()
+                .unwrap();
+            assert!(error.contains("重新登录"));
+            assert!(super::read_session(&entry).is_none());
+            assert_eq!(server.join().unwrap().len(), count);
+        }
+    }
+
+    #[test]
+    fn another_requests_completed_refresh_is_reused_without_refreshing_again() {
+        let (endpoint, server) = auth_server(vec![(401, json!({})), (204, json!({}))]);
+        let mut session = test_session(&endpoint);
+        let mut refreshed = session.clone();
+        refreshed.token = "already-refreshed".to_string();
+        let entry = mock_entry(&refreshed);
+        let client = test_client();
+        let response =
+            super::authenticated_request_with_entry(&client, &mut session, &entry, |token| {
+                client
+                    .get(format!("{endpoint}/sync/data"))
+                    .bearer_auth(token)
+            })
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 204);
+        assert_eq!(session.token, "already-refreshed");
+        let requests = server.join().unwrap();
+        assert!(requests
+            .iter()
+            .all(|request| !request.starts_with("POST /auth/refresh ")));
+        assert!(requests[1]
+            .to_lowercase()
+            .contains("authorization: bearer already-refreshed\r\n"));
+    }
+
+    #[test]
+    fn refresh_in_flight_cannot_restore_a_logout_or_overwrite_a_new_login() {
+        for logout in [true, false] {
+            for status in [200, 401] {
+                let initial = test_session("http://placeholder.example");
+                let entry = std::sync::Arc::new(mock_entry(&initial));
+                let entry_for_server = entry.clone();
+                let replacement = test_session("https://new.example.com");
+                let replacement_for_server = replacement.clone();
+                let (endpoint, server) = auth_server_with_hook(
+                    vec![(401, json!({})), (status, refreshed_payload())],
+                    move |index| {
+                        if index == 1 {
+                            let _guard = super::sync_auth_lock().lock().unwrap();
+                            if logout {
+                                entry_for_server.delete_credential().unwrap();
+                            } else {
+                                entry_for_server
+                                    .set_password(
+                                        &serde_json::to_string(&replacement_for_server).unwrap(),
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                    },
+                );
+                let mut session = test_session(&endpoint);
+                entry
+                    .set_password(&serde_json::to_string(&session).unwrap())
+                    .unwrap();
+                let client = test_client();
+                assert!(super::authenticated_request_with_entry(
+                    &client,
+                    &mut session,
+                    &entry,
+                    |token| {
+                        client
+                            .get(format!("{endpoint}/sync/data"))
+                            .bearer_auth(token)
+                    }
+                )
+                .is_err());
+                if logout {
+                    assert!(super::read_session(&entry).is_none());
+                } else {
+                    assert!(super::read_session(&entry).as_ref() == Some(&replacement));
+                }
+                assert_eq!(server.join().unwrap().len(), 2);
+            }
+        }
     }
 
     #[test]

@@ -352,9 +352,39 @@ export const AI_REASONING_EFFORT_OPTIONS = [
 ] as const;
 
 export type AiReasoningEffort = typeof AI_REASONING_EFFORT_OPTIONS[number]["value"];
-export type AiModelSettings = Pick<AiConfig, "model" | "reasoningEffort">;
+export interface AiModelSettings {
+  providerId: string;
+  model: string;
+  reasoningEffort: AiReasoningEffort;
+}
+
+export interface AiProviderModel {
+  id: string;
+  reasoningEfforts: AiReasoningEffort[];
+  defaultReasoningEffort: AiReasoningEffort;
+  reasoningEffort: AiReasoningEffort;
+}
+
+export interface AiProvider {
+  id: string;
+  name: string;
+  apiMode: AiApiMode;
+  endpoint: string;
+  apiKey: string;
+  models: AiProviderModel[];
+  selectedModelId: string;
+}
+
+export const createAiProviderModel = (id: string, effort: AiReasoningEffort = "auto"): AiProviderModel => ({
+  id,
+  reasoningEfforts: AI_REASONING_EFFORT_OPTIONS.map((option) => option.value),
+  defaultReasoningEffort: effort,
+  reasoningEffort: effort,
+});
 
 export interface AiConfig {
+  providers: AiProvider[];
+  selectedProviderId: string;
   apiMode: AiApiMode;
   endpoint: string;
   apiKey: string;
@@ -370,13 +400,24 @@ export interface AiConfig {
   cloudSync: CloudSyncSettings;
 }
 
-type AiConfigInput = Omit<Partial<AiConfig>, "tools" | "serverImportExport" | "cloudSync"> & {
+export type AiConfigInput = Omit<Partial<AiConfig>, "providers" | "tools" | "serverImportExport" | "cloudSync"> & {
+  providers?: Array<Omit<AiProvider, "apiKey"> & { apiKey?: string }>;
   tools?: Partial<AiToolSettings>;
   serverImportExport?: Partial<ServerImportExportSettings>;
   cloudSync?: Partial<CloudSyncSettings>;
 };
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
+  providers: [{
+    id: "default",
+    name: "默认提供商",
+    apiMode: "responses",
+    endpoint: "https://api.deepseek.com",
+    apiKey: "",
+    models: [createAiProviderModel("gpt-4.1-mini")],
+    selectedModelId: "gpt-4.1-mini",
+  }],
+  selectedProviderId: "default",
   apiMode: "responses",
   endpoint: "https://api.deepseek.com",
   apiKey: "",
@@ -395,14 +436,44 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
 
 export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig = DEFAULT_AI_CONFIG): AiConfig {
   const systemPrompt = config.systemPrompt ?? fallback.systemPrompt;
-  return {
-    apiMode: config.apiMode ?? fallback.apiMode,
+  const validEffort = (effort: unknown): effort is AiReasoningEffort =>
+    AI_REASONING_EFFORT_OPTIONS.some((option) => option.value === effort);
+  const legacyEffort = validEffort(config.reasoningEffort) ? config.reasoningEffort : fallback.reasoningEffort;
+  const hasLegacySettings = [config.endpoint, config.apiKey, config.apiMode, config.model, config.reasoningEffort]
+    .some((field) => field !== undefined);
+  const inputProviders = config.providers ?? (hasLegacySettings ? [{
+    id: "default", name: "默认提供商",
+    apiMode: config.apiMode ?? "chat-completions",
     endpoint: config.endpoint ?? fallback.endpoint,
-    apiKey: config.apiKey ?? fallback.apiKey,
-    model: config.model ?? fallback.model,
-    reasoningEffort: AI_REASONING_EFFORT_OPTIONS.some((option) => option.value === config.reasoningEffort)
-      ? config.reasoningEffort!
-      : fallback.reasoningEffort,
+    apiKey: config.apiKey ?? fallback.providers.find((provider) => provider.id === "default")?.apiKey ?? "",
+    models: [createAiProviderModel(config.model ?? fallback.model, legacyEffort)],
+    selectedModelId: config.model ?? fallback.model,
+  }] : fallback.providers);
+  const providers = inputProviders.map((provider) => {
+    const previous = fallback.providers.find((item) => item.id === provider.id);
+    return {
+      ...provider,
+      apiKey: provider.apiKey ?? previous?.apiKey ?? "",
+      models: provider.models.map((model) => {
+        const efforts = [...new Set((model.reasoningEfforts ?? []).filter(validEffort))];
+        if (!efforts.length) efforts.push("auto");
+        const defaultEffort = efforts.includes(model.defaultReasoningEffort) ? model.defaultReasoningEffort : efforts[0];
+        return { ...model, reasoningEfforts: efforts, defaultReasoningEffort: defaultEffort,
+          reasoningEffort: efforts.includes(model.reasoningEffort) ? model.reasoningEffort : defaultEffort };
+      }),
+    };
+  });
+  const provider = providers.find((item) => item.id === (config.selectedProviderId ?? fallback.selectedProviderId)) ?? providers[0];
+  const model = provider?.models.find((item) => item.id === provider.selectedModelId) ?? provider?.models[0];
+  if (provider && model) provider.selectedModelId = model.id;
+  return {
+    providers,
+    selectedProviderId: provider?.id ?? "",
+    apiMode: provider?.apiMode ?? fallback.apiMode,
+    endpoint: provider?.endpoint ?? "",
+    apiKey: provider?.apiKey ?? "",
+    model: model?.id ?? "",
+    reasoningEffort: model?.reasoningEffort ?? "auto",
     reviewerModel: config.reviewerModel ?? fallback.reviewerModel,
     contextWindow: config.contextWindow ?? fallback.contextWindow,
     maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,
@@ -420,6 +491,22 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
       ...(config.cloudSync ?? {}),
     },
   };
+}
+
+export function changeAiModelSettings(config: AiConfig, patch: Partial<AiModelSettings>): AiConfig {
+  const providerId = patch.providerId ?? config.selectedProviderId;
+  return normalizeAiConfig({ ...config, selectedProviderId: providerId, providers: config.providers.map((provider) => {
+    if (provider.id !== providerId) return provider;
+    const modelId = patch.model ?? provider.selectedModelId;
+    return { ...provider, selectedModelId: modelId, models: provider.models.map((model) =>
+      model.id === modelId && patch.reasoningEffort !== undefined
+        ? { ...model, reasoningEffort: patch.reasoningEffort } : model) };
+  }) });
+}
+
+export function stripAiConfigSecrets(config: AiConfig): AiConfigInput {
+  const { apiKey: _apiKey, ...rest } = config;
+  return { ...rest, providers: config.providers.map(({ apiKey: _key, ...provider }) => provider) };
 }
 
 interface AiAgentEventBase {

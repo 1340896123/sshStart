@@ -142,6 +142,8 @@ fn validate_tool_calling(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AiConfig {
     #[serde(default)]
+    selected_provider_id: String,
+    #[serde(default)]
     api_mode: AiApiMode,
     endpoint: String,
     api_key: String,
@@ -675,7 +677,8 @@ fn provider_base_url(endpoint: &str) -> String {
 
 fn api_key(config: &AiConfig) -> Result<String, String> {
     if config.api_key.trim().is_empty() {
-        read_secret("ai:api-key").ok_or_else(|| "未配置 AI API Key，请先打开助手设置".to_string())
+        read_secret(&super::ai_key_account(Some(&config.selected_provider_id)))
+            .ok_or_else(|| "当前提供商未配置 AI API Key，请先打开助手设置".to_string())
     } else {
         Ok(config.api_key.clone())
     }

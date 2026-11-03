@@ -781,15 +781,15 @@ fn delete_server_secret(server_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn store_ai_key(api_key: String) -> Result<(), String> {
-    keyring_entry("ai:api-key")?
+fn store_ai_key(api_key: String, provider_id: Option<String>) -> Result<(), String> {
+    keyring_entry(&ai_key_account(provider_id.as_deref()))?
         .set_password(&api_key)
         .map_err(|error| format!("保存 AI API Key 失败: {error}"))
 }
 
 #[tauri::command]
-fn load_ai_key() -> Result<Option<String>, String> {
-    match keyring_entry("ai:api-key")?.get_password() {
+fn load_ai_key(provider_id: Option<String>) -> Result<Option<String>, String> {
+    match keyring_entry(&ai_key_account(provider_id.as_deref()))?.get_password() {
         Ok(api_key) => Ok(Some(api_key)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(format!("读取 AI API Key 失败: {error}")),
@@ -804,8 +804,15 @@ fn delete_ai_key_from_keyring(account: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn delete_ai_key() -> Result<(), String> {
-    delete_ai_key_from_keyring("ai:api-key")
+fn delete_ai_key(provider_id: Option<String>) -> Result<(), String> {
+    delete_ai_key_from_keyring(&ai_key_account(provider_id.as_deref()))
+}
+
+fn ai_key_account(provider_id: Option<&str>) -> String {
+    match provider_id.filter(|id| !id.is_empty() && *id != "default") {
+        Some(id) => format!("ai:provider:{id}:api-key"),
+        None => "ai:api-key".to_string(),
+    }
 }
 
 fn mode_string(mode: Option<u32>, is_dir: bool) -> String {
@@ -3220,6 +3227,13 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_key_accounts_preserve_legacy_and_isolate_other_providers() {
+        assert_eq!(super::ai_key_account(None), "ai:api-key");
+        assert_eq!(super::ai_key_account(Some("default")), "ai:api-key");
+        assert_eq!(super::ai_key_account(Some("first")), "ai:provider:first:api-key");
+        assert_ne!(super::ai_key_account(Some("first")), super::ai_key_account(Some("second")));
+    }
     use super::{
         collect_local_upload_manifest_sync, copy_transfer_bytes, ensure_remote_revision,
         local_transfer_temp_path, mode_string, parse_containers, parse_network_connections,

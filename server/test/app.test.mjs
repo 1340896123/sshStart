@@ -48,6 +48,11 @@ const register = (baseUrl, email, password = "correct-horse-battery-staple") =>
     body: JSON.stringify({ email, password }),
   });
 
+const refresh = (baseUrl, tokens, overrides = {}) => requestJson(baseUrl, "/auth/refresh", {
+  method: "POST",
+  body: JSON.stringify({ accessToken: tokens.token, refreshToken: tokens.refreshToken, ...overrides }),
+});
+
 test("health endpoint reports readiness", async (context) => {
   const fixture = await startFixture();
   context.after(() => fixture.close());
@@ -64,6 +69,10 @@ test("registration and login issue compatible bearer tokens", async (context) =>
   assert.equal(created.response.status, 201);
   assert.equal(created.body.email, "user@example.com");
   assert.match(created.body.token, /^[^.]+\.[^.]+\.[^.]+$/);
+  assert.equal(created.body.refreshToken.length, 43);
+  const issuedAt = JSON.parse(Buffer.from(created.body.token.split(".")[1], "base64url")).iat;
+  assert.equal(created.body.expiresAt - issuedAt, 15 * 60);
+  assert.equal(created.body.refreshExpiresAt - issuedAt, 30 * 24 * 60 * 60);
 
   const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
   const storedUser = database.prepare("SELECT password_hash FROM users WHERE email = ?").get("user@example.com");
@@ -87,6 +96,7 @@ test("registration and login issue compatible bearer tokens", async (context) =>
   assert.equal(loggedIn.response.status, 200);
   assert.equal(loggedIn.body.email, "user@example.com");
   assert.ok(loggedIn.body.token);
+  assert.notEqual(loggedIn.body.refreshToken, created.body.refreshToken);
 });
 
 test("sync snapshots are opaque and isolated by account", async (context) => {
@@ -267,4 +277,117 @@ test("expired bearer tokens are rejected", async (context) => {
     headers: { authorization: `Bearer ${registered.body.token}` },
   });
   assert.equal(expired.response.status, 401);
+});
+
+test("an expired access token and its refresh token renew access without a password", async (context) => {
+  let currentTime = Date.UTC(2026, 9, 30);
+  const fixture = await startFixture({ tokenTtlSeconds: 1, now: () => currentTime });
+  context.after(() => fixture.close());
+  const created = await register(fixture.baseUrl, "refresh@example.com");
+  const headers = { authorization: `Bearer ${created.body.token}` };
+  await requestJson(fixture.baseUrl, "/sync/data", {
+    method: "PUT", headers, body: JSON.stringify({ ciphertext: "retained-snapshot", updatedAt: 1 }),
+  });
+  currentTime += 2000;
+  assert.equal((await requestJson(fixture.baseUrl, "/sync/data", { headers })).response.status, 401);
+  const renewed = await refresh(fixture.baseUrl, created.body);
+  assert.equal(renewed.response.status, 200);
+  assert.notEqual(renewed.body.token, created.body.token);
+  assert.equal(renewed.body.refreshToken, created.body.refreshToken);
+  assert.equal(renewed.body.email, created.body.email);
+  const restored = await requestJson(fixture.baseUrl, "/sync/data", {
+    headers: { authorization: `Bearer ${renewed.body.token}` },
+  });
+  assert.equal(restored.response.status, 200);
+  assert.equal(restored.body.ciphertext, "retained-snapshot");
+  // Retrying after a lost refresh response or a failed credential write is safe.
+  assert.equal((await refresh(fixture.baseUrl, created.body)).response.status, 200);
+});
+
+test("refresh tokens must be paired with an access token from the same login", async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.close());
+  const first = await register(fixture.baseUrl, "pairing@example.com");
+  const second = await requestJson(fixture.baseUrl, "/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email: "pairing@example.com", password: "correct-horse-battery-staple" }),
+  });
+  const other = await register(fixture.baseUrl, "other@example.com");
+  for (const tokens of [second.body, other.body]) {
+    assert.equal((await refresh(fixture.baseUrl, first.body, { refreshToken: tokens.refreshToken })).response.status, 401);
+  }
+  const parts = first.body.token.split(".");
+  parts[1] = Buffer.from(JSON.stringify({ sub: 1, sid: "forged", exp: 0 })).toString("base64url");
+  assert.equal((await refresh(fixture.baseUrl, first.body, { accessToken: parts.join(".") })).response.status, 401);
+  for (const overrides of [
+    { refreshToken: "" }, { refreshToken: null }, { refreshToken: "x".repeat(43) },
+    { accessToken: null }, { accessToken: "not-a-token" },
+  ]) {
+    assert.equal((await refresh(fixture.baseUrl, first.body, overrides)).response.status, 401);
+  }
+  assert.equal((await refresh(fixture.baseUrl, first.body)).response.status, 200);
+});
+
+test("successful refreshes extend the refresh lifetime, which expires at the exact boundary", async (context) => {
+  let currentTime = Date.UTC(2026, 9, 30);
+  const fixture = await startFixture({ tokenTtlSeconds: 1, refreshTokenTtlSeconds: 10, now: () => currentTime });
+  context.after(() => fixture.close());
+  const active = await register(fixture.baseUrl, "active@example.com");
+  const idle = await register(fixture.baseUrl, "idle@example.com");
+  currentTime += 9000;
+  const renewed = await refresh(fixture.baseUrl, active.body);
+  assert.equal(renewed.response.status, 200);
+  assert.equal(renewed.body.refreshExpiresAt, Math.floor(currentTime / 1000) + 10);
+  currentTime += 1000;
+  assert.equal((await refresh(fixture.baseUrl, idle.body)).response.status, 401);
+  assert.equal((await refresh(fixture.baseUrl, renewed.body)).response.status, 200);
+  currentTime += 10000;
+  assert.equal((await refresh(fixture.baseUrl, renewed.body)).response.status, 401);
+});
+
+test("refresh tokens are stored as hashes and rejected after session or account deletion", async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.close());
+  const first = await register(fixture.baseUrl, "revoked@example.com");
+  const second = await register(fixture.baseUrl, "deleted@example.com");
+  const database = new DatabaseSync(fixture.databasePath);
+  try {
+    const sessions = database.prepare("SELECT token_hash FROM refresh_sessions").all();
+    assert.equal(sessions.length, 2);
+    for (const session of sessions) {
+      assert.match(session.token_hash, /^[a-f0-9]{64}$/);
+      assert.notEqual(session.token_hash, first.body.refreshToken);
+      assert.notEqual(session.token_hash, second.body.refreshToken);
+    }
+    database.prepare("DELETE FROM refresh_sessions WHERE user_id = (SELECT id FROM users WHERE email = ?)").run(first.body.email);
+    database.prepare("DELETE FROM users WHERE email = ?").run(second.body.email);
+  } finally {
+    database.close();
+  }
+  assert.equal((await refresh(fixture.baseUrl, first.body)).response.status, 401);
+  assert.equal((await refresh(fixture.baseUrl, second.body)).response.status, 401);
+});
+
+test("another server instance reuses persisted refresh sessions with the same signing secret", async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.close());
+  const created = await register(fixture.baseUrl, "persisted@example.com");
+  const app = createSyncServer({ databasePath: fixture.databasePath, tokenSecret: TEST_SECRET });
+  try {
+    await new Promise((resolvePromise) => app.server.listen(0, "127.0.0.1", resolvePromise));
+    const renewed = await refresh(`http://127.0.0.1:${app.server.address().port}`, created.body);
+    assert.equal(renewed.response.status, 200);
+    assert.equal(renewed.body.email, created.body.email);
+  } finally {
+    await app.close();
+  }
+});
+
+test("refresh requests are rate limited and only accept POST", async (context) => {
+  const fixture = await startFixture({ authRateLimit: 1 });
+  context.after(() => fixture.close());
+  const created = await register(fixture.baseUrl, "limited@example.com");
+  assert.equal((await requestJson(fixture.baseUrl, "/auth/refresh")).response.status, 405);
+  assert.equal((await refresh(fixture.baseUrl, created.body)).response.status, 200);
+  assert.equal((await refresh(fixture.baseUrl, created.body)).response.status, 429);
 });

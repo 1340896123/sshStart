@@ -40,11 +40,14 @@ npm run tauri build
 
 AI settings accept endpoints implementing the OpenAI `chat/completions` schema and function tool calls. Providers that return `reasoning_content` are supported; otherwise sshStar requests a concise reasoning summary without exposing hidden chain-of-thought.
 
+In **Settings → 模型提供商**, the left tree groups models under their providers. Select a provider to edit its Base URL, API mode (Chat Completions or Responses), and API key on the right; select a model to edit its ID, available reasoning levels, and default level. Add models manually or from the provider's model list. The tree supports collapsing providers and arrow-key navigation. The AI assistant composer switches between configured providers, models, and reasoning levels, remembering the last selection for each model. Existing single-provider settings migrate automatically; provider keys remain in the system credential store and are included only in encrypted cloud sync.
+
 ## Cloud sync service contract
 
 Cloud sync is intentionally backend-agnostic. Configure the API root in Settings → Cloud Sync (or set `VITE_SSHSTAR_SYNC_API_URL` before building). The service must expose:
 
-- `POST /auth/register` and `POST /auth/login` with `{ "email": string, "password": string }`, returning `{ "token": string, "email": string }` (an `accessToken` field is also accepted).
+- `POST /auth/register` and `POST /auth/login` with `{ "email": string, "password": string }`, returning `{ "token": string, "refreshToken": string, "email": string, "expiresAt": number, "refreshExpiresAt": number }`. Expiration values are Unix seconds; an `accessToken` field is also accepted in place of `token`.
+- `POST /auth/refresh` with `{ "accessToken": string, "refreshToken": string }`, returning the same token response. The access token may be expired, but its signature and session must match the valid refresh token. Return `401` only when the token pair cannot renew the session.
 - `GET /sync/data` with a bearer token, returning `{ "ciphertext": string, "updatedAt": number }`; return `404` when the account has no snapshot yet.
 - `PUT /sync/data` with a bearer token and `{ "ciphertext": string, "updatedAt": number, "expectedUpdatedAt"?: number | null }`. When `expectedUpdatedAt` is supplied, return `409` if the current version differs.
 - `DELETE /sync/data` with a bearer token to remove the application snapshot.
@@ -55,11 +58,13 @@ Cloud sync is intentionally backend-agnostic. Configure the API root in Settings
 
 Application snapshot ciphertext uses a dedicated AES-256-GCM key stored at `~/.sshStar/cloud.key`; `~/.sshStar/sync.key` remains local to the device and encrypts its SQLite state. Key backups contain `cloud.key`, other managed `~/.sshStar/*.key` files, and private keys referenced by server and jump-host profiles, but never upload the device-local `sync.key`. Backups containing `sync.key` are rejected. Referenced keys are copied into the managed `~/.sshStar` directory, and synchronized profiles use portable key paths that resolve against each device's home directory. Key backups are independently encrypted with AES-256-GCM using a PBKDF2-SHA256 key derived from the user's custom passphrase. Neither encryption key nor passphrase is sent to the service. Authentication passwords should be hashed by the service and must not be stored as plaintext.
 
+The desktop stores both authentication tokens together in the operating-system credential vault, bound to the issuing API root. When a sync request returns `401`, it refreshes the access token and retries the original request once, including the original upload body and expected version. Concurrent failures reuse a completed refresh. Temporary network/server failures preserve the saved session; a rejected refresh or a second `401` requires login. App restarts and upgrades reuse the saved session.
+
 Desktop clients merge cloud snapshots before uploading them. Server profiles use per-record logical revisions, the server list order has its own revision, and groups, collapsed state, and settings use category revisions. Profiles that exist on only one device are retained, explicit server deletions are synchronized with tombstones, and conditional writes retry after concurrent updates instead of overwriting another device's snapshot.
 
 ## Included cloud sync backend
 
-The repository includes a self-hosted implementation in `server/`. It uses Node.js 24's built-in HTTP, cryptography, and SQLite support, hashes passwords with scrypt, issues seven-day HMAC-SHA256 bearer tokens, rate-limits authentication attempts, and stores application snapshots and key backups per account without decrypting them.
+The repository includes a self-hosted implementation in `server/`. It uses Node.js 24's built-in HTTP, cryptography, and SQLite support, hashes passwords with scrypt, issues 15-minute HMAC-SHA256 access tokens and 30-day refresh tokens, rate-limits authentication attempts, and stores application snapshots and key backups per account without decrypting them. Successful refreshes extend the refresh lifetime by 30 days; refresh tokens are stored only as SHA-256 hashes in SQLite.
 
 ```powershell
 $env:SSHSTAR_SYNC_TOKEN_SECRET = node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
