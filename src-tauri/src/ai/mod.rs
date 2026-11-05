@@ -5,6 +5,7 @@ pub(crate) mod import;
 mod policy;
 mod runtime;
 mod tools;
+mod transport;
 
 pub(crate) use runtime::AiRuntimeState;
 
@@ -541,7 +542,7 @@ where
         let Some(item) = item else {
             break;
         };
-        match item.map_err(|error| format!("Rig Agent 运行失败: {error}"))? {
+        match item.map_err(|error| format!("Rig Agent 运行失败: {}", error_details(&error)))? {
             MultiTurnStreamItem::StreamAssistantItem(item) => match item {
                 Item::Event(StreamEvent::Text { text, .. }) => {
                     content.push_str(&text);
@@ -591,6 +592,35 @@ where
         usage: AiTokenUsage::from_rig(usage, requests, context_tokens),
         model_messages,
     })
+}
+
+fn error_details(error: &rig::completion::PromptError) -> String {
+    use std::error::Error;
+    let mut details = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !details.ends_with(&message) {
+            details.push('\n');
+            details.push_str(&message);
+        }
+        source = cause.source();
+    }
+    if let Some(body) = error.provider_response_body() {
+        if !details.contains(body) {
+            details.push('\n');
+            details.push_str(body);
+        }
+    }
+    if let rig::completion::PromptError::Report(report) = error {
+        for cause in &report.source_chain {
+            if !details.contains(cause.as_str()) {
+                details.push('\n');
+                details.push_str(cause);
+            }
+        }
+    }
+    details
 }
 
 fn request_options(
@@ -662,7 +692,7 @@ fn restored_model_messages(message: &AiInputMessage) -> Option<Vec<Message>> {
 fn openai_client(config: &AiConfig, api_key: &str) -> Result<openai::OpenAI, String> {
     Ok(openai::OpenAIConfig::new(api_key)
         .with_base_url(provider_base_url(&config.endpoint))
-        .client())
+        .connect(transport::DetailedHttpClient::default()))
 }
 
 fn provider_base_url(endpoint: &str) -> String {
@@ -711,9 +741,34 @@ fn default_temperature() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        openai, parse_approval_review, provider_base_url, AiConfig, AiReasoningEffort, Effort,
+        error_details, openai, parse_approval_review, provider_base_url, AiConfig, AiReasoningEffort, Effort,
         Reasoning,
     };
+
+    #[tokio::test]
+    async fn original_transport_cause_survives_rig_error_wrapping() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        drop(listener);
+        let client = openai::OpenAIConfig::new("unused-test-key")
+            .with_base_url(endpoint)
+            .connect(super::transport::DetailedHttpClient::default());
+        let agent = super::AgentBuilder::new(client.responses("test-model")).build();
+        let mut stream = agent.prompt("test").stream();
+        let error = loop {
+            match futures::StreamExt::next(&mut stream).await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => continue,
+                None => panic!("closed port should produce an error"),
+            }
+        };
+        let summary = error.to_string();
+        let details = error_details(&error);
+        assert!(details.starts_with(&summary));
+        assert!(details.lines().count() >= 3, "missing transport cause: {details}");
+        assert!(details.contains("127.0.0.1"));
+        assert!(!details.contains("unused-test-key"));
+    }
 
     #[test]
     fn reasoning_effort_defaults_preserve_legacy_requests() {

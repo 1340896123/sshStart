@@ -629,7 +629,7 @@ async fn openai_chat_stream_preserves_cache_usage_and_tool_history() {
     let (endpoint, server) = mock_provider(AiApiMode::ChatCompletions, true);
     let client = openai::OpenAIConfig::new("local-test")
         .with_base_url(&endpoint)
-        .client();
+        .connect(transport::DetailedHttpClient::default());
     verify_cache_roundtrip(
         client.chat("test-model"),
         server,
@@ -661,7 +661,7 @@ async fn openai_responses_stream_preserves_cache_usage_reasoning_and_tool_histor
     let (endpoint, server) = mock_provider(AiApiMode::Responses, true);
     let client = openai::OpenAIConfig::new("local-test")
         .with_base_url(&endpoint)
-        .client();
+        .connect(transport::DetailedHttpClient::default());
     verify_cache_roundtrip(
         client.responses("test-model"),
         server,

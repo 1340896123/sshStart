@@ -573,6 +573,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
   };
 
   const startNewConversation = () => {
+    agent.cancelRetry();
     if (agent.running) void agent.cancel();
     activeConversationIdRef.current = undefined;
     setActiveConversationId(undefined);
@@ -590,6 +591,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
       focusComposer();
       return;
     }
+    agent.cancelRetry();
     if (agent.running) void agent.cancel();
     activeConversationIdRef.current = conversation.id;
     setActiveConversationId(conversation.id);
@@ -610,6 +612,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
       return next;
     });
     if (activeConversationIdRef.current === conversationId) {
+      agent.cancelRetry();
       if (agent.running) void agent.cancel();
       activeConversationIdRef.current = undefined;
       setActiveConversationId(undefined);
@@ -626,6 +629,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
 
   const editFailedRequest = (messageId: string) => {
     if (agent.running || input.trim() || attachments.length) return;
+    agent.cancelRetry();
     const index = session.aiMessages.findIndex((message) => message.id === messageId);
     const request = session.aiMessages.slice(0, index).reverse().find((message) => message.role === "user");
     if (!request) return;
@@ -690,7 +694,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
             />
           )}
         </div>
-        <button className="icon-button quiet" title="助手设置" aria-label="助手设置" onClick={onOpenSettings}>
+        <button className="icon-button quiet" title="助手设置" aria-label="助手设置" onClick={() => { agent.cancelRetry(); onOpenSettings(); }}>
           <Settings2 size={14} />
         </button>
         <button
@@ -871,17 +875,21 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
                 )
                 : <div className="message-copy plain-text">{message.content}</div>}
               {message.role === "assistant" && message.status === "error" && (
-                <div className="ai-error-feedback">
+                <div className="ai-error-feedback" role="alert">
                   <strong>请求失败</strong>
                   <p>{message.error ?? "上次请求未完成，请检查模型配置或稍后重新发送。"}</p>
+                  {agent.retry?.messageId === message.id && <p className="ai-retry-countdown">
+                    {agent.retry.seconds} 秒后自动重试
+                  </p>}
                   <div className="ai-error-actions">
+                    {agent.retry?.messageId === message.id && <button type="button" onClick={agent.cancelRetry}>取消自动重试</button>}
                     <button
                       type="button"
                       disabled={agent.running || Boolean(input.trim()) || attachments.length > 0}
                       title={input.trim() || attachments.length ? "请先处理输入框中已有的草稿" : "恢复原请求，编辑并核对后再发送"}
                       onClick={() => editFailedRequest(message.id)}
                     >重新编辑请求</button>
-                    <button type="button" onClick={onOpenSettings}>检查助手设置</button>
+                    <button type="button" onClick={() => { agent.cancelRetry(); onOpenSettings(); }}>检查助手设置</button>
                   </div>
                 </div>
               )}

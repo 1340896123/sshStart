@@ -42,6 +42,27 @@ interface ActiveRun {
   unlisten?: UnlistenFn;
 }
 
+interface PendingRetry {
+  messageId: string;
+  timeout: ReturnType<typeof setTimeout>;
+  interval: ReturnType<typeof setInterval>;
+}
+
+const RETRY_DELAY_MS = 5_000;
+
+const errorDetails = (reason: unknown): string => {
+  if (typeof reason === "string") return reason;
+  if (reason instanceof Error) {
+    const cause = (reason as Error & { cause?: unknown }).cause;
+    return cause === undefined ? reason.message : `${reason.message}\n${errorDetails(cause)}`;
+  }
+  try {
+    return JSON.stringify(reason, null, 2) ?? String(reason);
+  } catch {
+    return String(reason);
+  }
+};
+
 interface AiApprovalReview {
   decision: "approve" | "reject";
   reason: string;
@@ -107,12 +128,15 @@ export function useAiAgent({
 }: UseAiAgentOptions) {
   const [running, setRunning] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [retry, setRetry] = useState<{ messageId: string; seconds: number }>();
   const [resolvingApprovalId, setResolvingApprovalId] = useState<string>();
   const messagesRef = useRef(messages);
   const lastPropMessagesRef = useRef(messages);
   const pendingLocalMessagesRef = useRef<AiMessage[]>();
   const onMessagesChangeRef = useRef(onMessagesChange);
   const activeRunRef = useRef<ActiveRun>();
+  const pendingRetryRef = useRef<PendingRetry>();
+  const startRef = useRef<(input: StartAiAgentInput, retryMessageId?: string) => Promise<void>>();
   const approvalPolicyRef = useRef(approvalPolicy);
   const policySyncRef = useRef<Promise<void>>(Promise.resolve());
   const reviewingApprovalsRef = useRef(new Set<string>());
@@ -124,6 +148,38 @@ export function useAiAgent({
   }
   onMessagesChangeRef.current = onMessagesChange;
   approvalPolicyRef.current = approvalPolicy;
+
+  const clearRetryTimers = () => {
+    const pending = pendingRetryRef.current;
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    clearInterval(pending.interval);
+    pendingRetryRef.current = undefined;
+  };
+
+  const cancelRetry = () => {
+    clearRetryTimers();
+    setRetry(undefined);
+  };
+
+  const scheduleRetry = (messageId: string, input: StartAiAgentInput) => {
+    cancelRetry();
+    const retryAt = Date.now() + RETRY_DELAY_MS;
+    const pending: PendingRetry = {
+      messageId,
+      timeout: setTimeout(() => {
+        if (pendingRetryRef.current !== pending) return;
+        cancelRetry();
+        void startRef.current?.(input, messageId);
+      }, RETRY_DELAY_MS),
+      interval: setInterval(() => {
+        if (pendingRetryRef.current !== pending) return;
+        setRetry({ messageId, seconds: Math.max(1, Math.ceil((retryAt - Date.now()) / 1_000)) });
+      }, 1_000),
+    };
+    pendingRetryRef.current = pending;
+    setRetry({ messageId, seconds: RETRY_DELAY_MS / 1_000 });
+  };
 
   const commit = (
     updater: (messages: AiMessage[]) => AiMessage[],
@@ -390,6 +446,7 @@ export function useAiAgent({
         }));
         break;
       case "run_cancelled":
+        activeRun.cancelRequested = true;
         updateAssistant(messageId, (message) => ({
           ...message,
           approval: undefined,
@@ -418,8 +475,14 @@ export function useAiAgent({
     }
   };
 
-  const start = async ({ content, attachments, allowTools }: StartAiAgentInput) => {
+  const start = async (input: StartAiAgentInput, retryMessageId?: string) => {
     if (activeRunRef.current) return;
+    cancelRetry();
+    if (retryMessageId) {
+      const lastMessage = messagesRef.current[messagesRef.current.length - 1];
+      if (lastMessage?.id !== retryMessageId || lastMessage.status !== "error") return;
+    }
+    const { content, attachments, allowTools } = input;
     const now = Date.now();
     const runId = uid("ai-run");
     const userMessage: AiMessage = {
@@ -434,7 +497,7 @@ export function useAiAgent({
       status: "completed",
     };
     const assistantMessage: AiMessage = {
-      id: uid("ai-assistant"),
+      id: retryMessageId ?? uid("ai-assistant"),
       role: "assistant",
       messageType: "text",
       content: "",
@@ -442,7 +505,9 @@ export function useAiAgent({
       updatedAt: now,
       status: "started",
     };
-    const pendingMessages = [...messagesRef.current, userMessage, assistantMessage];
+    const pendingMessages = retryMessageId
+      ? messagesRef.current.map((message) => message.id === retryMessageId ? assistantMessage : message)
+      : [...messagesRef.current, userMessage, assistantMessage];
     activeRunRef.current = { runId, messageId: assistantMessage.id, cancelRequested: false };
     commit(() => pendingMessages, true);
     setRunning(true);
@@ -514,8 +579,8 @@ export function useAiAgent({
       }, true);
     } catch (reason) {
       if (activeRunRef.current?.runId !== runId) return;
-      const error = String(reason);
-      if (error.includes("AI 运行已取消")) {
+      const error = errorDetails(reason);
+      if (activeRunRef.current.cancelRequested || error.includes("AI 运行已取消")) {
         const completedAt = Date.now();
         updateAssistant(assistantMessage.id, (message) => ({
           ...message,
@@ -564,11 +629,17 @@ export function useAiAgent({
         setResolvingApprovalId(undefined);
         setRunning(false);
         setStopping(false);
+        const lastMessage = messagesRef.current[messagesRef.current.length - 1];
+        if (!activeRun.cancelRequested && lastMessage?.id === assistantMessage.id && lastMessage.status === "error") {
+          scheduleRetry(assistantMessage.id, input);
+        }
       }
     }
   };
+  startRef.current = start;
 
   const cancel = async () => {
+    cancelRetry();
     const activeRun = activeRunRef.current;
     if (!activeRun) return;
     activeRun.cancelRequested = true;
@@ -593,6 +664,11 @@ export function useAiAgent({
   };
 
   useEffect(() => {
+    const pending = pendingRetryRef.current;
+    if (pending && messages[messages.length - 1]?.id !== pending.messageId) cancelRetry();
+  }, [messages]);
+
+  useEffect(() => {
     if (approvalPolicy !== "reviewer") {
       const messageId = activeRunRef.current?.messageId;
       const message = messagesRef.current.find((candidate) => candidate.id === messageId);
@@ -605,6 +681,7 @@ export function useAiAgent({
   }, [approvalPolicy]);
 
   useEffect(() => () => {
+    clearRetryTimers();
     const activeRun = activeRunRef.current;
     if (!activeRun) return;
     activeRun.unlisten?.();
@@ -615,6 +692,8 @@ export function useAiAgent({
   return {
     running,
     stopping,
+    retry,
+    cancelRetry,
     activeMessageId: activeRunRef.current?.messageId,
     resolvingApprovalId,
     start,

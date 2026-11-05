@@ -28,26 +28,28 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-async function setup(t, initialPolicy, onInvoke = () => undefined, initialMessages = []) {
+async function setup(t, initialPolicy, onInvoke = () => undefined, initialMessages = [], input = { content: "部署应用并重启服务", attachments: [], allowTools: true }) {
   const calls = [];
   const run = deferred();
-  let agent, messages, root, runPromise, runId;
+  const runs = [run];
+  let agent, messages, root, runPromise, runId, replaceMessages;
   let sequence = 0;
   const config = { tools: { allowMutatingTools: false } };
   invokeHandler = (command, args) => {
     calls.push({ command, args });
-    if (command === "run_ai_agent") { runId = args.runId; return run.promise; }
-    if (command === "cancel_ai_run") { run.reject("AI 运行已取消"); return Promise.resolve(); }
+    if (command === "run_ai_agent") { runId = args.runId; return runs.at(-1).promise; }
+    if (command === "cancel_ai_run") { runs.at(-1).reject("AI 运行已取消"); return Promise.resolve(); }
     return Promise.resolve(onInvoke(command, args));
   };
   function Harness({ policy }) {
     const [history, setHistory] = React.useState(initialMessages);
+    replaceMessages = setHistory;
     messages = history;
     agent = useAiAgent({ config, server: { id: "test" }, messages: history, onMessagesChange: setHistory, approvalPolicy: policy });
     return null;
   }
   await act(async () => { root = renderer.create(React.createElement(Harness, { policy: initialPolicy })); });
-  await act(async () => { runPromise = agent.start({ content: "部署应用并重启服务", attachments: [], allowTools: true }); });
+  await act(async () => { runPromise = agent.start(input); });
   const emit = (event) => act(async () => {
     eventListener({ payload: { runId, sequence: ++sequence, timestamp: Date.now(), ...event } });
   });
@@ -59,7 +61,11 @@ async function setup(t, initialPolicy, onInvoke = () => undefined, initialMessag
   return {
     calls, config, run, emit,
     latest: () => messages.at(-1),
+    messages: () => messages,
     agent: () => agent,
+    nextRun: () => { const next = deferred(); runs.push(next); return next; },
+    replaceMessages: (next) => act(async () => { replaceMessages(next); }),
+    unmount: () => act(async () => { root.unmount(); }),
     finish: (result) => act(async () => { run.resolve(result); await runPromise; }),
     setPolicy: (policy) => act(async () => { root.update(React.createElement(Harness, { policy })); }),
   };
@@ -215,4 +221,108 @@ test("a terminal run failure cannot be replaced by a successful IPC result", asy
   await harness.finish({ content: "" });
   assert.equal(harness.latest().status, "error");
   assert.equal(harness.latest().error, "连接中断");
+});
+
+test("failed requests retry after exactly five seconds with the same messages and attachments", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const attachments = [{ id: "image-1", kind: "image", name: "error.png", remotePath: "/tmp/error.png", mimeType: "image/png", size: 8 }];
+  const harness = await setup(t, "request", undefined, [], { content: "检查图片", attachments, allowTools: false });
+  const original = harness.calls.find(({ command }) => command === "run_ai_agent").args;
+  const assistantId = harness.latest().id;
+  await harness.emit({ type: "run_failed", error: "HTTP 503\n{\"error\":\"upstream unavailable\"}" });
+  await act(async () => { harness.run.reject("IPC channel closed"); });
+  assert.deepEqual(harness.agent().retry, { messageId: assistantId, seconds: 5 });
+  assert.match(harness.latest().error, /upstream unavailable/);
+  const second = harness.nextRun();
+  await act(async () => { t.mock.timers.tick(4_999); });
+  assert.equal(harness.agent().retry.seconds, 1);
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 1);
+  await act(async () => { t.mock.timers.tick(1); });
+  const retried = harness.calls.filter(({ command }) => command === "run_ai_agent").at(-1).args;
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 2);
+  assert.deepEqual(retried.messages, original.messages);
+  assert.equal(retried.conversationId, original.conversationId);
+  assert.notEqual(retried.runId, original.runId);
+  assert.equal(retried.allowTools, false);
+  assert.equal(harness.messages().length, 2);
+  assert.equal(harness.latest().id, assistantId);
+  assert.equal(harness.latest().error, undefined);
+  assert.equal(harness.agent().retry, undefined);
+  assert.equal(harness.agent().running, true);
+  await act(async () => { second.resolve({ content: "恢复成功", usage }); });
+  assert.equal(harness.latest().status, "completed");
+  await act(async () => { t.mock.timers.tick(10_000); });
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 2);
+});
+
+test("each retry failure starts a new five-second countdown and retains structured errors", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const harness = await setup(t, "request");
+  const reason = { status: 429, error: { message: "rate limited", request_id: "req-123" } };
+  await act(async () => { harness.run.reject(reason); });
+  assert.equal(harness.latest().error, JSON.stringify(reason, null, 2));
+  const second = harness.nextRun();
+  await harness.setPolicy("full-access");
+  await act(async () => { t.mock.timers.tick(5_000); });
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").at(-1).args.approvalPolicy, "full-access");
+  await act(async () => { second.reject(new Error("request failed", { cause: new Error("connection reset") })); });
+  assert.equal(harness.latest().error, "request failed\nconnection reset");
+  assert.equal(harness.agent().retry.seconds, 5);
+  harness.nextRun();
+  await act(async () => { t.mock.timers.tick(4_999); });
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 2);
+  await act(async () => { t.mock.timers.tick(1); });
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 3);
+});
+
+test("cancelling a countdown preserves the original failure and prevents more requests", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const harness = await setup(t, "request");
+  await act(async () => { harness.run.reject("连接超时"); });
+  await act(async () => { harness.agent().cancelRetry(); });
+  await act(async () => { t.mock.timers.tick(30_000); });
+  assert.equal(harness.agent().retry, undefined);
+  assert.equal(harness.latest().error, "连接超时");
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 1);
+});
+
+test("sending a new request replaces the pending retry", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const harness = await setup(t, "request");
+  await act(async () => { harness.run.reject("连接超时"); });
+  const second = harness.nextRun();
+  await act(async () => { void harness.agent().start({ content: "新请求", attachments: [], allowTools: false }); });
+  await act(async () => { second.resolve({ content: "完成", usage }); });
+  await act(async () => { t.mock.timers.tick(30_000); });
+  assert.equal(harness.agent().retry, undefined);
+  const requests = harness.calls.filter(({ command }) => command === "run_ai_agent");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].args.messages.at(-1).content, "新请求");
+});
+
+test("switching conversations and unmounting clear pending retries", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const harness = await setup(t, "request");
+  await act(async () => { harness.run.reject("连接超时"); });
+  await harness.replaceMessages([]);
+  await act(async () => { t.mock.timers.tick(30_000); });
+  assert.equal(harness.agent().retry, undefined);
+  const second = harness.nextRun();
+  await act(async () => { void harness.agent().start({ content: "新请求", attachments: [], allowTools: false }); });
+  await act(async () => { second.reject("服务不可用"); });
+  assert.equal(harness.agent().retry.seconds, 5);
+  await harness.unmount();
+  await act(async () => { t.mock.timers.tick(30_000); });
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 2);
+});
+
+test("a user stop never schedules a retry even when the backend reports a different failure", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const harness = await setup(t, "request");
+  await harness.emit({ type: "run_cancelled" });
+  await act(async () => { harness.run.reject("IPC channel closed"); });
+  assert.equal(harness.latest().status, "cancelled");
+  await act(async () => { t.mock.timers.tick(30_000); });
+  assert.equal(harness.agent().retry, undefined);
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 1);
 });
