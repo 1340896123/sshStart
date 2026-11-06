@@ -1,0 +1,27 @@
+sshstar.123756.xyz {
+    root * /var/www/sshstar/current
+    encode zstd gzip
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        Strict-Transport-Security "max-age=31536000"
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'none'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; upgrade-insecure-requests"
+        -Server
+    }
+    @immutable path /assets/* /downloads/*.exe /downloads/*.msi
+    header @immutable Cache-Control "public, max-age=31536000, immutable"
+    @document path / /index.html /404.html /release.json /robots.txt /sitemap.xml /downloads/SHA256SUMS.txt
+    header @document Cache-Control "no-cache"
+    @installer path /downloads/*.exe /downloads/*.msi
+    header @installer {
+        Content-Type "application/octet-stream"
+        Content-Disposition "attachment"
+    }
+    file_server
+    handle_errors {
+        rewrite * /404.html
+        file_server
+    }
+}

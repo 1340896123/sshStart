@@ -1,5 +1,7 @@
 # sshStar
 
+**产品官网与下载：[sshstar.123756.xyz](https://sshstar.123756.xyz/)**
+
 sshStar is a compact Tauri desktop workspace for managing SSH servers. Each server can have multiple isolated sessions with its own terminal buffer, remote file location, selection, and AI conversation.
 
 The desktop product, window title, and executable are named `sshStar` (`sshStar.exe` on Windows). Application data and credentials use the `com.sshstar.app` identifier. The Windows database is stored at `%APPDATA%/com.sshstar.app/sshStar.sqlite3`, and encryption keys and managed SSH private keys are stored at `~/.sshStar/`. The application starts with independent data and credentials under this identity.
@@ -27,6 +29,8 @@ npm run tauri dev
 The browser-only preview is available with `npm run dev`. It uses interactive demo terminal, file, and AI data; native SSH, SFTP, system credentials, and remote AI tools require Tauri.
 
 ## Build
+
+The independent product website lives in [`website/`](website/README.md). Run `npm run dev:website` for local development, `npm run build:website` to build it, and `npm run deploy:website` to publish it to the `fwd` SSH host. See the website README for dependency installation, release asset verification, and deployment details.
 
 The AI runtime uses [Rig 0.45](https://github.com/0xPlaygrounds/rig/releases/tag/v0.45.0).
 Rust 1.97.1 is required and selected by `rust-toolchain.toml`.

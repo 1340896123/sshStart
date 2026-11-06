@@ -1,0 +1,16 @@
+{
+  "name": "sshstar-website",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 4321",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4321",
+    "release:sync": "node scripts/sync-release.mjs"
+  },
+  "devDependencies": {
+    "typescript": "~5.6.2",
+    "vite": "^8.1.5"
+  }
+}

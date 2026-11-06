@@ -1,0 +1,15 @@
+{
+  "version": "0.1.2",
+  "date": "2026-11-05",
+  "url": "https://github.com/1340896123/sshStart/releases/tag/v0.1.2",
+  "exe": {
+    "name": "sshStar_0.1.2_x64-setup.exe",
+    "size": 9457749,
+    "sha256": "a1effca472ff859a90389bd61af1ea1c27235844715717d288971582e40e6ef4"
+  },
+  "msi": {
+    "name": "sshStar_0.1.2_x64_en-US.msi",
+    "size": 12390400,
+    "sha256": "e057e4b9db84bebb0e8876abcd0d67a108880a1ad856e296c9781e44e04ae9a2"
+  }
+}

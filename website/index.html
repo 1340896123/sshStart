@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090e0d" />
+    <title>sshStar — SSH、远程文件与 AI 的桌面工作台</title>
+    <meta
+      name="description"
+      content="sshStar 将 SSH 终端、SFTP 远程文件管理、多模型 AI 助手和可选加密同步放进一个轻巧的桌面工作台。下载 Windows x64 版本，专注每一次连接。"
+    />
+    <link rel="canonical" href="https://sshstar.123756.xyz/" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="sshStar" />
+    <meta
+      property="og:title"
+      content="sshStar — 连接每一台服务器，专注真正重要的事。"
+    />
+    <meta
+      property="og:description"
+      content="SSH 终端、远程文件和 AI 助手，一个工作台就够了。"
+    />
+    <meta property="og:url" content="https://sshstar.123756.xyz/" />
+    <meta
+      property="og:image"
+      content="https://sshstar.123756.xyz/images/social.png"
+    />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="sshStar — SSH 与 AI 的桌面工作台" />
+    <meta
+      name="twitter:image"
+      content="https://sshstar.123756.xyz/images/social.png"
+    />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "sshStar",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Windows 10, Windows 11 (x64)",
+        "softwareVersion": "{{VERSION}}",
+        "url": "https://sshstar.123756.xyz/",
+        "downloadUrl": "https://sshstar.123756.xyz{{EXE_URL}}",
+        "description": "集成 SSH 终端、SFTP 文件管理和多模型 AI 助手的桌面工作台。"
+      }
+    </script>
+  </head>
+  <body>
+    <svg
+      class="svg-definitions"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <defs>
+        <symbol id="i-arrow" viewBox="0 0 24 24">
+          <path d="M4 12h16m-6-6 6 6-6 6" />
+        </symbol>
+        <symbol id="i-external" viewBox="0 0 24 24">
+          <path d="M7 17 17 7M7 7h10v10" />
+        </symbol>
+        <symbol id="i-download" viewBox="0 0 24 24">
+          <path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4" />
+        </symbol>
+        <symbol id="i-terminal" viewBox="0 0 24 24">
+          <rect x="3" y="4" width="18" height="16" rx="3" />
+          <path d="m7 9 3 3-3 3m6 0h4" />
+        </symbol>
+        <symbol id="i-folder" viewBox="0 0 24 24">
+          <path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3Z" />
+          <path d="m8 14 2 2 5-5" />
+        </symbol>
+        <symbol id="i-sparkles" viewBox="0 0 24 24">
+          <path
+            d="m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4ZM20 2v4m-2-2h4"
+          />
+        </symbol>
+        <symbol id="i-layers" viewBox="0 0 24 24">
+          <path d="m12 3 10 5-10 5L2 8Zm-9 9 9 5 9-5m-18 5 9 5 9-5" />
+        </symbol>
+        <symbol id="i-cloud" viewBox="0 0 24 24">
+          <path
+            d="M6 18a5 5 0 0 1-.8-9.9A7 7 0 0 1 18.6 9 4.5 4.5 0 0 1 19 18M12 12v9m-3-3 3 3 3-3"
+          />
+        </symbol>
+        <symbol id="i-shield" viewBox="0 0 24 24">
+          <path d="M12 3 3 7v5c0 5 9 10 9 10s9-5 9-10V7Z" />
+          <path d="m8 12 3 3 5-6" />
+        </symbol>
+        <symbol id="i-check" viewBox="0 0 24 24">
+          <path d="m5 12 4 4L19 6" />
+        </symbol>
+        <symbol id="i-chevron" viewBox="0 0 24 24">
+          <path d="m8 5 7 7-7 7" />
+        </symbol>
+        <symbol id="i-lock" viewBox="0 0 24 24">
+          <rect x="5" y="10" width="14" height="11" rx="2" />
+          <path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2" />
+        </symbol>
+        <symbol id="i-copy" viewBox="0 0 24 24">
+          <rect x="8" y="8" width="12" height="13" rx="2" />
+          <path d="M15 8V3H3v13h5" />
+        </symbol>
+        <symbol id="i-github" viewBox="0 0 24 24">
+          <path
+            d="M9 19c-4 1-4-2-6-2m12 5v-3.5a3 3 0 0 0-.8-2.4c2.7-.3 5.5-1.3 5.5-6A4.7 4.7 0 0 0 18.4 7a4.3 4.3 0 0 0-.1-3.1s-1-.3-3.3 1.3a11.4 11.4 0 0 0-6 0C6.7 3.6 5.7 3.9 5.7 3.9A4.3 4.3 0 0 0 5.6 7a4.7 4.7 0 0 0-1.3 3.3c0 4.7 2.8 5.7 5.5 6a3 3 0 0 0-.8 2.4V22"
+          />
+        </symbol>
+        <symbol id="i-windows" viewBox="0 0 24 24">
+          <path
+            d="M3 5.2 10.4 4v7.2H3Zm9-1.5L21 2v9.2h-9ZM3 12.8h7.4V20L3 18.8Zm9 0h9V22l-9-1.5Z"
+            fill="currentColor"
+            stroke="none"
+          />
+        </symbol>
+      </defs>
+    </svg>
+    <a href="#main" class="skip-link">跳转到主要内容</a>
+    <header class="header">
+      <div class="container header-inner">
+        <a class="brand" href="#" aria-label="sshStar 首页"
+          ><img src="/favicon.svg" width="33" height="33" alt="" /><span
+            >ssh<span class="brand-star">Star</span></span
+          ></a
+        >
+        <nav id="navigation" class="navigation" aria-label="主导航">
+          <a class="nav-link" href="#features">功能特性</a
+          ><a class="nav-link" href="#workspace">工作台</a
+          ><a class="nav-link" href="#security">安全设计</a
+          ><a class="nav-link" href="#changelog">更新日志</a>
+        </nav>
+        <div class="header-actions">
+          <a
+            class="github-link"
+            href="https://github.com/1340896123/sshStart"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="在 GitHub 查看 sshStar（新窗口）"
+            ><svg aria-hidden="true" class="icon">
+              <use href="#i-github" /></svg></a
+          ><a href="#download" class="button button-small"
+            >立即下载<svg aria-hidden="true" class="icon">
+              <use href="#i-download" /></svg></a
+          ><button
+            class="menu-toggle"
+            aria-controls="navigation"
+            aria-expanded="false"
+            aria-label="切换导航菜单"
+          >
+            <span></span><span></span>
+          </button>
+        </div>
+      </div>
+    </header>
+    <main id="main">
+      <section class="hero container" aria-labelledby="hero-heading">
+        <a class="release-pill" href="#changelog"
+          ><span class="status-dot"></span><span>v{{VERSION}} 现已发布</span
+          ><span class="pill-divider"></span><span>看看新变化</span
+          ><svg aria-hidden="true" class="icon"><use href="#i-arrow" /></svg
+        ></a>
+        <h1 id="hero-heading">
+          连接每一台服务器，<br /><span>专注真正重要的事。</span>
+        </h1>
+        <p class="hero-description">
+          把 SSH 终端、远程文件和 AI 助手，放进一个轻巧的桌面工作台。<br
+            class="desktop-break"
+          />少一点窗口切换，多一点心流。
+        </p>
+        <div class="hero-actions">
+          <a href="{{EXE_URL}}" class="button button-primary" download
+            ><svg aria-hidden="true" class="icon"><use href="#i-windows" /></svg
+            >下载 Windows 版<svg aria-hidden="true" class="icon trailing-icon">
+              <use href="#i-download" /></svg></a
+          ><a href="#workspace" class="button button-secondary"
+            >探索工作台<svg aria-hidden="true" class="icon">
+              <use href="#i-arrow" /></svg
+          ></a>
+        </div>
+        <p class="hero-meta">
+          Windows 10 / 11 ·
+          x64<span>·</span>v{{VERSION}}<span>·</span>{{EXE_SIZE}}
+        </p>
+        <div class="hero-coordinates" aria-hidden="true">
+          <span>01 / CONNECT</span><span>LESS FRICTION. MORE FLOW.</span>
+        </div>
+      </section>
+
+      <section
+        id="workspace"
+        class="workspace-section container"
+        aria-label="产品工作台预览"
+      >
+        <div class="preview-toolbar">
+          <div class="preview-label">
+            <span class="status-dot"></span>一个工作台，完整的上下文
+          </div>
+          <div class="preview-tabs" role="tablist" aria-label="选择界面预览">
+            <button
+              id="tab-workspace"
+              role="tab"
+              aria-selected="true"
+              aria-controls="preview-panel"
+              data-image="/images/workspace.webp"
+              data-alt="sshStar 实际界面预览：左侧服务器列表、中间 SSH 终端和进程管理、右侧 AI 助手，使用示例服务器数据。"
+              data-description="终端、诊断和 AI 助手并排呈现，处理问题时不用来回切换。"
+            >
+              工作台</button
+            ><button
+              id="tab-files"
+              role="tab"
+              aria-selected="false"
+              aria-controls="preview-panel"
+              tabindex="-1"
+              data-image="/images/files.webp"
+              data-alt="sshStar 实际远程文件管理界面预览：SFTP 文件列表与终端位于同一个会话中，使用示例数据。"
+              data-description="浏览远程目录、管理文件，让终端操作和文件工作保持同步。"
+            >
+              远程文件</button
+            ><button
+              id="tab-models"
+              role="tab"
+              aria-selected="false"
+              aria-controls="preview-panel"
+              tabindex="-1"
+              data-image="/images/models.webp"
+              data-alt="sshStar 实际模型提供商设置界面预览：按提供商配置模型、API 模式和推理级别。"
+              data-description="按提供商组织模型，自行配置 API 端点、模型与推理级别。"
+            >
+              模型配置
+            </button>
+          </div>
+        </div>
+        <div
+          class="preview-window"
+          id="preview-panel"
+          role="tabpanel"
+          aria-labelledby="tab-workspace"
+          tabindex="0"
+        >
+          <div class="window-bar" aria-hidden="true">
+            <div class="window-dots"><i></i><i></i><i></i></div>
+            <span>sshStar / workspace</span
+            ><svg aria-hidden="true" class="icon">
+              <use href="#i-terminal" />
+            </svg>
+          </div>
+          <img
+            id="preview-image"
+            src="/images/workspace.webp"
+            width="1440"
+            height="900"
+            fetchpriority="high"
+            alt="sshStar 实际界面预览：左侧服务器列表、中间 SSH 终端和进程管理、右侧 AI 助手，使用示例服务器数据。"
+          />
+        </div>
+        <div class="preview-caption">
+          <p id="preview-description" aria-live="polite">
+            终端、诊断和 AI 助手并排呈现，处理问题时不用来回切换。
+          </p>
+          <span>实际应用界面 · 示例数据</span>
+        </div>
+      </section>
+
+      <div class="capability-strip container" aria-label="核心能力">
+        <span
+          ><svg aria-hidden="true" class="icon"><use href="#i-terminal" /></svg
+          >原生 SSH + SFTP</span
+        ><span
+          ><svg aria-hidden="true" class="icon"><use href="#i-sparkles" /></svg
+          >自选 AI 模型</span
+        ><span
+          ><svg aria-hidden="true" class="icon"><use href="#i-shield" /></svg
+          >本地加密存储</span
+        ><span
+          ><svg aria-hidden="true" class="icon"><use href="#i-layers" /></svg
+          >Tauri + Rust</span
+        >
+      </div>
+
+      <section id="features" class="section container">
+        <div class="section-intro">
+          <div>
+            <p class="eyebrow">BUILT FOR YOUR FLOW</p>
+            <h2>好工具，让工作自然发生。</h2>
+          </div>
+          <p>从连接、排查到文件管理，<br />让日常操作顺畅一点，再顺畅一点。</p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <div class="feature-icon">
+              <svg aria-hidden="true" class="icon">
+                <use href="#i-terminal" />
+              </svg>
+            </div>
+            <h3>连接有序，会话独立</h3>
+            <p>
+              按环境分组管理服务器。同一台服务器也能打开多个独立会话，各自保留终端、文件位置和
+              AI 对话。
+            </p>
+            <div class="card-bottom session-chips" aria-hidden="true">
+              <span><i></i>production-01</span><span><i></i>staging-01</span>
+            </div>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon">
+              <svg aria-hidden="true" class="icon">
+                <use href="#i-folder" />
+              </svg>
+            </div>
+            <h3>远程文件，触手可及</h3>
+            <p>
+              SFTP
+              浏览、上传、下载与目录管理。内置编辑器支持直接修改远程文本文件，减少工具之间的往返。
+            </p>
+            <div class="card-bottom file-chips" aria-hidden="true">
+              <span>config.yaml</span><span>deploy.sh</span
+              ><span>README.md</span>
+            </div>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon">
+              <svg aria-hidden="true" class="icon">
+                <use href="#i-sparkles" />
+              </svg>
+            </div>
+            <h3>你的模型，你来选择</h3>
+            <p>
+              接入兼容 OpenAI API
+              的服务，按提供商管理模型，在对话中切换模型与推理级别。API
+              密钥由你配置。
+            </p>
+            <div class="card-bottom mono-label" aria-hidden="true">
+              Chat Completions <span>/</span> Responses
+            </div>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon">
+              <svg aria-hidden="true" class="icon">
+                <use href="#i-layers" />
+              </svg>
+            </div>
+            <h3>排查信息，一眼看清</h3>
+            <p>
+              查看服务器系统信息、进程、网络与容器状态。常用命令保存为片段，下次需要时直接找到。
+            </p>
+            <div class="card-bottom mini-metrics" aria-hidden="true">
+              <span>CPU <b>24%</b><i style="--level: 24%"></i></span
+              ><span>MEM <b>48%</b><i style="--level: 48%"></i></span>
+            </div>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon">
+              <svg aria-hidden="true" class="icon"><use href="#i-cloud" /></svg>
+            </div>
+            <h3>换个设备，继续工作</h3>
+            <p>
+              接入可选同步服务后，加密同步服务器配置与设置。私钥备份使用自定义口令单独加密，按需启用。
+            </p>
+            <div class="card-bottom mono-label" aria-hidden="true">
+              <svg aria-hidden="true" class="icon"><use href="#i-lock" /></svg
+              >ENCRYPT LOCALLY. SYNC SECURELY.
+            </div>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon">
+              <svg aria-hidden="true" class="icon">
+                <use href="#i-shield" />
+              </svg>
+            </div>
+            <h3>自动化，也有分寸</h3>
+            <p>
+              AI
+              工具可逐项配置权限。写入工具按需开启，高风险操作经过审批，让每一步操作都有据可查。
+            </p>
+            <div class="card-bottom approval-label" aria-hidden="true">
+              <span class="status-dot"></span>等待你的确认<svg
+                aria-hidden="true"
+                class="icon"
+              >
+                <use href="#i-check" />
+              </svg>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="ai-section container" aria-labelledby="ai-heading">
+        <div class="ai-copy">
+          <p class="eyebrow">AN ASSISTANT, IN CONTEXT</p>
+          <h2 id="ai-heading">遇到问题，<br />不用独自面对。</h2>
+          <p>
+            让 AI 结合当前 SSH
+            会话，协助查看日志、分析资源使用，或梳理远程目录。工具调用和运行状态清晰可见，思路与操作始终在同一个地方。
+          </p>
+          <a href="#download" class="text-link"
+            >给工作台加一点 AI<svg aria-hidden="true" class="icon">
+              <use href="#i-arrow" /></svg></a
+          ><span class="ai-note"
+            >使用 AI 功能需自行配置模型服务与 API 密钥。</span
+          >
+        </div>
+        <div class="ai-example">
+          <div class="example-title">
+            <svg aria-hidden="true" class="icon"><use href="#i-sparkles" /></svg
+            ><span>AI 助手</span><span class="example-tag">示例工作流</span>
+          </div>
+          <div class="user-message">帮我检查一下服务器的磁盘空间。</div>
+          <div class="assistant-message">
+            <span class="assistant-avatar"
+              ><svg aria-hidden="true" class="icon">
+                <use href="#i-sparkles" /></svg
+            ></span>
+            <div>
+              <strong>先看数据，再做判断。</strong>
+              <p>我会先读取磁盘使用情况，不修改服务器文件。</p>
+            </div>
+          </div>
+          <div class="tool-example">
+            <div>
+              <svg aria-hidden="true" class="icon">
+                <use href="#i-terminal" /></svg
+              >终端命令<span>只读检查</span>
+            </div>
+            <code><span>$</span> df -hT</code>
+          </div>
+          <div class="workflow-line">
+            <span
+              ><svg aria-hidden="true" class="icon"><use href="#i-check" /></svg
+              >查看工具调用</span
+            ><i></i
+            ><span
+              >由你掌握下一步<svg aria-hidden="true" class="icon">
+                <use href="#i-arrow" /></svg
+            ></span>
+          </div>
+        </div>
+      </section>
+
+      <section id="security" class="section security-section container">
+        <div class="security-visual" aria-hidden="true">
+          <div class="orbit orbit-one"></div>
+          <div class="orbit orbit-two"></div>
+          <div class="security-core">
+            <svg aria-hidden="true" class="icon"><use href="#i-shield" /></svg>
+          </div>
+          <span class="security-label security-label-one"
+            ><svg aria-hidden="true" class="icon"><use href="#i-lock" /></svg
+            >LOCAL FIRST</span
+          ><span class="security-label security-label-two">AES-256-GCM</span
+          ><span class="orbit-node node-one"></span
+          ><span class="orbit-node node-two"></span
+          ><span class="security-visual-caption"
+            >YOUR SERVERS. YOUR CONTROL.</span
+          >
+        </div>
+        <div class="security-copy">
+          <p class="eyebrow">TRUST STARTS WITH CONTROL</p>
+          <h2>连接远方，<br />安全留在手中。</h2>
+          <p>
+            服务器访问需要信任，也需要清晰的边界。<br />从凭据存储到 AI
+            操作，每一层都认真对待。
+          </p>
+          <ul class="security-list">
+            <li>
+              <svg aria-hidden="true" class="icon"><use href="#i-check" /></svg>
+              <div>
+                <h3>凭据妥善保管</h3>
+                <p>密码和 API 密钥保存在系统凭据库，应用状态在本地加密存储。</p>
+              </div>
+            </li>
+            <li>
+              <svg aria-hidden="true" class="icon"><use href="#i-check" /></svg>
+              <div>
+                <h3>确认服务器身份</h3>
+                <p>使用 known_hosts 验证 SSH 主机密钥，首次连接需确认信任。</p>
+              </div>
+            </li>
+            <li>
+              <svg aria-hidden="true" class="icon"><use href="#i-check" /></svg>
+              <div>
+                <h3>同步前，先加密</h3>
+                <p>
+                  可选云同步只上传密文。AI
+                  请求会发送给你配置的模型服务，请按实际需要选择服务与工具权限。
+                </p>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section id="changelog" class="section release-section container">
+        <div>
+          <p class="eyebrow">KEEP GETTING BETTER</p>
+          <h2>每次更新，<br />都更进一步。</h2>
+          <a
+            href="https://github.com/1340896123/sshStart/releases"
+            class="text-link"
+            target="_blank"
+            rel="noopener noreferrer"
+            >查看全部版本<svg aria-hidden="true" class="icon">
+              <use href="#i-external" /></svg
+          ></a>
+        </div>
+        <article class="release-card">
+          <div class="release-card-top">
+            <span class="version">v{{VERSION}}</span
+            ><span class="latest-tag">最新版本</span
+            ><time datetime="{{RELEASE_DATE}}">{{RELEASE_DATE}}</time>
+          </div>
+          <h3>更清晰的反馈，更连贯的体验。</h3>
+          <ul>
+            <li>显示 AI 请求的原始错误与网络原因，排查问题更直接。</li>
+            <li>请求失败后 5 秒自动重试，支持随时取消。</li>
+            <li>完善多提供商模型配置、云同步与会话交互。</li>
+          </ul>
+          <a
+            href="{{RELEASE_URL}}"
+            class="text-link"
+            target="_blank"
+            rel="noopener noreferrer"
+            >阅读完整更新日志<svg aria-hidden="true" class="icon">
+              <use href="#i-arrow" /></svg
+          ></a>
+        </article>
+      </section>
+
+      <section
+        id="download"
+        class="download-section container"
+        aria-labelledby="download-heading"
+      >
+        <div class="download-glow" aria-hidden="true"></div>
+        <span class="eyebrow">READY WHEN YOU ARE</span>
+        <h2 id="download-heading">
+          下一次连接，<span>从 sshStar 开始。</span>
+        </h2>
+        <p>让服务器管理，回到简单、专注的状态。</p>
+        <a class="button button-primary" href="{{EXE_URL}}" download
+          ><svg aria-hidden="true" class="icon"><use href="#i-windows" /></svg
+          >下载 Windows 版<svg aria-hidden="true" class="icon trailing-icon">
+            <use href="#i-download" /></svg
+        ></a>
+        <div class="download-options">
+          <span>v{{VERSION}} · Windows x64 · EXE {{EXE_SIZE}}</span
+          ><a href="{{MSI_URL}}" download
+            >MSI 安装包（{{MSI_SIZE}}）<svg aria-hidden="true" class="icon">
+              <use href="#i-external" /></svg
+          ></a>
+        </div>
+        <div class="checksum-actions">
+          <a href="/downloads/SHA256SUMS.txt" download>下载 SHA-256 校验文件</a
+          ><span>·</span
+          ><button id="copy-checksum" data-checksum="{{EXE_HASH}}">
+            <svg aria-hidden="true" class="icon"><use href="#i-copy" /></svg
+            >复制 EXE 校验值</button
+          ><span>·</span
+          ><a href="{{RELEASE_URL}}" target="_blank" rel="noopener noreferrer"
+            >GitHub 备用下载</a
+          >
+        </div>
+        <span id="copy-status" class="copy-status" role="status"></span>
+        <details id="checksum-details" class="checksum-details">
+          <summary>查看 EXE SHA-256</summary>
+          <code>{{EXE_HASH}}</code>
+        </details>
+      </section>
+
+      <section
+        class="section faq-section container"
+        aria-labelledby="faq-heading"
+      >
+        <div>
+          <p class="eyebrow">A FEW THINGS TO KNOW</p>
+          <h2 id="faq-heading">开始之前。</h2>
+          <p>
+            还有其他问题？<a
+              href="https://github.com/1340896123/sshStart/issues"
+              target="_blank"
+              rel="noopener noreferrer"
+              >在 GitHub 提交反馈<svg aria-hidden="true" class="icon">
+                <use href="#i-external" /></svg
+            ></a>
+          </p>
+        </div>
+        <div class="faq-list">
+          <details>
+            <summary>
+              目前支持哪些系统？<svg aria-hidden="true" class="icon">
+                <use href="#i-chevron" />
+              </svg>
+            </summary>
+            <p>
+              当前发布 Windows x64 安装包，面向 Windows 10 / 11，提供 EXE 与 MSI
+              两种格式。其他平台暂无官方发布包，请以 GitHub Releases 为准。
+            </p>
+          </details>
+          <details>
+            <summary>
+              使用 SSH 功能需要注册吗？<svg aria-hidden="true" class="icon">
+                <use href="#i-chevron" />
+              </svg>
+            </summary>
+            <p>
+              不需要。安装后添加服务器即可使用 SSH 和
+              SFTP。云同步为可选功能，启用时需要配置同步服务并登录该服务。
+            </p>
+          </details>
+          <details>
+            <summary>
+              AI 助手怎么接入？<svg aria-hidden="true" class="icon">
+                <use href="#i-chevron" />
+              </svg>
+            </summary>
+            <p>
+              在“设置 → 模型提供商”中配置兼容 OpenAI API 的服务地址、API
+              密钥和模型。支持 Chat Completions 与 Responses
+              模式，具体能力取决于提供商和模型；服务费用以提供商为准。
+            </p>
+          </details>
+          <details>
+            <summary>
+              我的服务器数据会传到哪里？<svg aria-hidden="true" class="icon">
+                <use href="#i-chevron" />
+              </svg>
+            </summary>
+            <p>
+              SSH、SFTP
+              直接连接你配置的服务器。启用云同步后，加密快照会发往你配置的同步服务。使用
+              AI
+              时，消息和相关工具结果会发送到你选择的模型服务，请按需要配置权限。
+            </p>
+          </details>
+          <details>
+            <summary>
+              如何验证下载的安装包？<svg aria-hidden="true" class="icon">
+                <use href="#i-chevron" />
+              </svg>
+            </summary>
+            <p>
+              下载上方 SHA256SUMS.txt，在 PowerShell 中运行
+              <code
+                >Get-FileHash .\sshStar_*_x64-setup.exe -Algorithm SHA256</code
+              >，将结果与校验文件中的对应条目比较。
+            </p>
+          </details>
+        </div>
+      </section>
+    </main>
+    <footer class="footer container">
+      <div>
+        <a class="brand" href="#" aria-label="返回 sshStar 首页"
+          ><img src="/favicon.svg" width="28" height="28" alt="" /><span
+            >ssh<span class="brand-star">Star</span></span
+          ></a
+        >
+        <p>A little less friction. A lot more flow.</p>
+      </div>
+      <nav aria-label="页脚导航">
+        <a
+          href="https://github.com/1340896123/sshStart"
+          target="_blank"
+          rel="noopener noreferrer"
+          >GitHub<svg aria-hidden="true" class="icon">
+            <use href="#i-external" /></svg></a
+        ><a
+          href="https://github.com/1340896123/sshStart#readme"
+          target="_blank"
+          rel="noopener noreferrer"
+          >使用文档</a
+        ><a
+          href="https://github.com/1340896123/sshStart/issues"
+          target="_blank"
+          rel="noopener noreferrer"
+          >问题反馈</a
+        >
+      </nav>
+      <span class="footer-note">Crafted for the way you work.</span>
+    </footer>
+    <noscript
+      ><p class="noscript-note">
+        你可以正常浏览产品介绍和下载安装包；切换界面预览与复制校验值需要启用
+        JavaScript。
+      </p></noscript
+    >
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
