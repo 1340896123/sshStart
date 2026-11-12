@@ -1,4 +1,5 @@
 mod ai;
+mod command;
 mod cloud_sync;
 mod crypto;
 mod server_transfer;

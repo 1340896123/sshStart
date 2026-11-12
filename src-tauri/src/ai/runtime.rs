@@ -44,7 +44,7 @@ struct PendingApproval {
 
 #[derive(Debug)]
 enum ApprovalDecision {
-    Approve(Option<Value>),
+    Approve,
     Reject(String),
 }
 
@@ -137,7 +137,7 @@ impl AiRuntimeState {
             return Err(AI_RUN_CANCELLED.to_string());
         }
         if *approval_policy.borrow() == AiApprovalPolicy::FullAccess {
-            return Ok(ApprovalDecision::Approve(None));
+            return Ok(ApprovalDecision::Approve);
         }
         let (sender, receiver) = oneshot::channel();
         self.inner
@@ -157,7 +157,7 @@ impl AiRuntimeState {
                 return Err(AI_RUN_CANCELLED.to_string());
             }
             if *approval_policy.borrow() == AiApprovalPolicy::FullAccess {
-                return Ok(ApprovalDecision::Approve(None));
+                return Ok(ApprovalDecision::Approve);
             }
             tokio::select! {
                 biased;
@@ -193,11 +193,10 @@ pub(super) fn resolve_approval(
     state: &AiRuntimeState,
     approval_id: String,
     decision: String,
-    arguments: Option<Value>,
     reason: Option<String>,
 ) -> Result<(), String> {
     let decision = match decision.as_str() {
-        "approve" => ApprovalDecision::Approve(arguments),
+        "approve" => ApprovalDecision::Approve,
         "reject" => ApprovalDecision::Reject(
             reason
                 .filter(|value| !value.trim().is_empty())
@@ -393,7 +392,7 @@ impl RunHook {
                 )
                 .await
             {
-                Ok(ApprovalDecision::Approve(Some(arguments))) => {
+                Ok(ApprovalDecision::Approve) => {
                     self.sink.emit(AiAgentEventKind::ToolStarted {
                         action_id: action_id.clone(),
                         tool: tool_name.to_string(),
@@ -401,16 +400,8 @@ impl RunHook {
                         arguments: arguments.clone(),
                         started_at,
                     });
-                    DispatchAction::rewrite_tool_args(event.kind, arguments)
-                }
-                Ok(ApprovalDecision::Approve(None)) => {
-                    self.sink.emit(AiAgentEventKind::ToolStarted {
-                        action_id: action_id.clone(),
-                        tool: tool_name.to_string(),
-                        command,
-                        arguments,
-                        started_at,
-                    });
+                    // Approval authorizes the backend-held call; renderer input
+                    // cannot replace the model's original arguments.
                     DispatchAction::proceed()
                 }
                 Ok(ApprovalDecision::Reject(reason)) => DispatchAction::skip(reason),
@@ -579,17 +570,12 @@ mod tests {
             let result = state
                 .request_approval("approval-1".into(), cancellation, approval_policy, || {
                     state
-                        .resolve(
-                            "approval-1",
-                            ApprovalDecision::Approve(Some(json!({"command": "uptime"}))),
-                        )
+                        .resolve("approval-1", ApprovalDecision::Approve)
                         .unwrap();
                 })
                 .await
                 .unwrap();
-            assert!(
-                matches!(result, ApprovalDecision::Approve(Some(args)) if args["command"] == "uptime")
-            );
+            assert!(matches!(result, ApprovalDecision::Approve));
             assert!(state.inner.approvals.lock().unwrap().is_empty());
         }
     }
@@ -606,7 +592,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(result, ApprovalDecision::Approve(None)));
+        assert!(matches!(result, ApprovalDecision::Approve));
         assert!(state.inner.approvals.lock().unwrap().is_empty());
     }
 
@@ -628,7 +614,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             request.await.unwrap(),
-            ApprovalDecision::Approve(None)
+            ApprovalDecision::Approve
         ));
         assert_eq!(*approval_policy.borrow(), AiApprovalPolicy::FullAccess);
         assert!(state.inner.approvals.lock().unwrap().is_empty());

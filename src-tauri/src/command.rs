@@ -390,12 +390,14 @@ mod tests {
         let original = Path::new("/original's file");
         let temp = Path::new("/temporary file");
         sftp.create(original).unwrap().write_all(b"old").unwrap();
-        let (_, original_revision) = super::super::read_editor_bytes(&sftp, original.to_str().unwrap()).unwrap();
+        let original_snapshot = super::super::read_remote_snapshot(&sftp, original.to_str().unwrap()).unwrap();
+        let original_revision = original_snapshot.revision;
         sftp.create(temp).unwrap().write_all(b"new").unwrap();
         super::super::rename_overwrite(&session, &sftp, temp, original).unwrap();
         assert!(session.is_blocking(), "command fallback must restore SFTP's blocking mode");
-        let (bytes, updated_revision) = super::super::read_editor_bytes(&sftp, original.to_str().unwrap()).unwrap();
-        assert_eq!(bytes, b"new");
+        let updated_snapshot = super::super::read_remote_snapshot(&sftp, original.to_str().unwrap()).unwrap();
+        assert_eq!(updated_snapshot.bytes, b"new");
+        let updated_revision = updated_snapshot.revision;
         assert_eq!(original_revision.size, updated_revision.size);
         assert_eq!(original_revision.modified, updated_revision.modified);
         assert!(super::super::ensure_remote_revision(&original_revision, &updated_revision).is_err());
