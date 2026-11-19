@@ -5038,6 +5038,27 @@ body.is-resizing-rows .system-dock {
   max-width: 130px;
 }
 
+.host-key-reset-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.host-key-reset-row > span {
+  min-width: 0;
+  flex: 1;
+}
+
+.host-key-reset-row .secondary-button {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  font-size: 10px;
+}
+
 .auth-section {
   padding: 13px 14px 16px;
   border-top: 1px solid var(--border);

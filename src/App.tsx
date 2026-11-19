@@ -1452,6 +1452,7 @@ export default function App() {
           initialGroup={serverDialogGroup}
           onClose={() => { setServerDialogOpen(false); setEditingServer(undefined); setServerDialogGroup(undefined); }}
           onSave={saveServer}
+          onResetHostKey={async (host, port) => { await invoke("remove_known_host", { host, port }); }}
           onDelete={editingServer ? () => { deleteServer(editingServer.id); setServerDialogOpen(false); setEditingServer(undefined); } : undefined}
         />
       )}

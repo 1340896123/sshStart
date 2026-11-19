@@ -8,10 +8,11 @@ interface Props {
   initialGroup?: string;
   onClose: () => void;
   onSave: (server: ServerProfile) => void | Promise<void>;
+  onResetHostKey?: (host: string, port: number) => Promise<void>;
   onDelete?: () => void;
 }
 
-export function ServerDialog({ server, initialGroup, onClose, onSave, onDelete }: Props) {
+export function ServerDialog({ server, initialGroup, onClose, onSave, onResetHostKey, onDelete }: Props) {
   const [value, setValue] = useState<ServerProfile>(server ?? {
     id: uid("server"),
     name: "",
@@ -34,6 +35,7 @@ export function ServerDialog({ server, initialGroup, onClose, onSave, onDelete }
   const [showPassword, setShowPassword] = useState(false);
   const [showJumpPassword, setShowJumpPassword] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [resettingHostKey, setResettingHostKey] = useState(false);
   const [error, setError] = useState("");
 
   const set = <K extends keyof ServerProfile>(key: K, next: ServerProfile[K]) =>
@@ -74,6 +76,23 @@ export function ServerDialog({ server, initialGroup, onClose, onSave, onDelete }
     }
   };
 
+  const resetHostKeyAndConnect = async () => {
+    if (!onResetHostKey || resettingHostKey) return;
+    setResettingHostKey(true);
+    setError("");
+    try {
+      const host = value.host.trim();
+      if (!host) throw new Error("请输入主机地址");
+      if (!Number.isInteger(value.port) || value.port < 1 || value.port > 65535) throw new Error("主机端口无效");
+      await onResetHostKey(host, value.port);
+      await onSave({ ...value, host, name: value.name.trim() || host, jumpHost: value.jumpHost?.enabled ? { ...value.jumpHost, host: value.jumpHost.host.trim() } : value.jumpHost });
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setResettingHostKey(false);
+    }
+  };
+
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <form className="dialog server-dialog" onSubmit={submit}>
@@ -90,6 +109,7 @@ export function ServerDialog({ server, initialGroup, onClose, onSave, onDelete }
           <label className="field host-field"><span>主机地址</span><input value={value.host} onChange={(e) => set("host", e.target.value)} placeholder="192.168.1.10" required /></label>
           <label className="field port-field"><span>端口</span><input type="number" min={1} max={65535} value={value.port} onChange={(e) => set("port", Number(e.target.value))} required /></label>
         </div>
+        {server && onResetHostKey && <div className="host-key-reset-row"><KeyRound size={13} /><span>服务器重装或更换主机密钥后，可清除本机旧指纹并重新校验。</span><button type="button" className="secondary-button" disabled={saving || resettingHostKey} onClick={() => void resetHostKeyAndConnect()}>{resettingHostKey ? "重连中…" : "清除旧主机指纹并重连"}</button></div>}
 
         <div className="auth-section">
           <div className="section-caption"><KeyRound size={14} /><span>身份验证</span></div>
