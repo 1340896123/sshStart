@@ -4,12 +4,12 @@
   "url": "https://github.com/1340896123/sshStart/releases/tag/v0.1.6",
   "exe": {
     "name": "sshStar_0.1.6_x64-setup.exe",
-    "size": 10501311,
-    "sha256": "5942b53fe368ed94cbe2d9af1ca49bc4e615fb598407d9c87a29ca3c3539f6cc"
+    "size": 10506416,
+    "sha256": "71178e371880ddd9b75b22748d70d6671a690717249df5217e51e46cb7d52bbd"
   },
   "msi": {
     "name": "sshStar_0.1.6_x64_en-US.msi",
     "size": 14004224,
-    "sha256": "e81bee130f340788a91fb97dcc0774ff6979c6b818e444b29df334b01883d200"
+    "sha256": "82e2d3b8bd97dbf554698ca214ba5b548dd21763d410fc2e1e866cd88ba94397"
   }
 }
