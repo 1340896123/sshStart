@@ -8,7 +8,7 @@ use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -166,6 +166,8 @@ struct KeyBundle {
     version: u32,
     created_at: u64,
     files: Vec<KeyBundleFile>,
+    #[serde(default)]
+    server_paths: Vec<KeyBundleServerPath>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +175,14 @@ struct KeyBundle {
 struct KeyBundleFile {
     name: String,
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyBundleServerPath {
+    server_id: String,
+    jump_host: bool,
+    file_name: String,
 }
 
 #[derive(Debug)]
@@ -861,6 +871,20 @@ fn build_key_bundle(servers: &[ServerKeyProfile]) -> Result<PreparedKeyBundle, S
     if inventory.files.len() > MAX_KEY_FILES {
         return Err(format!("密钥文件数量不能超过 {MAX_KEY_FILES} 个"));
     }
+    let path_updates = inventory.path_updates;
+    let server_paths = path_updates
+        .iter()
+        .filter_map(|update| {
+            Path::new(&update.private_key_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|file_name| KeyBundleServerPath {
+                    server_id: update.server_id.clone(),
+                    jump_host: update.jump_host,
+                    file_name: file_name.to_string(),
+                })
+        })
+        .collect();
     let mut total_bytes = 0_u64;
     let mut bundle_files = Vec::with_capacity(inventory.files.len());
     let mut managed_copies = Vec::new();
@@ -888,8 +912,9 @@ fn build_key_bundle(servers: &[ServerKeyProfile]) -> Result<PreparedKeyBundle, S
             version: 1,
             created_at: unix_timestamp(),
             files: bundle_files,
+            server_paths,
         },
-        path_updates: inventory.path_updates,
+        path_updates,
         managed_copies,
     })
 }
@@ -982,20 +1007,84 @@ fn decode_key_bundle(raw: &[u8]) -> Result<(KeyBundle, Vec<(String, Vec<u8>)>), 
         });
         decoded.push((name, bytes));
     }
+    let server_paths_count = bundle.server_paths.len();
+    let mut binding_keys = HashSet::new();
+    let server_paths = bundle
+        .server_paths
+        .into_iter()
+        .filter(|binding| {
+            !binding.server_id.trim().is_empty()
+                && is_key_file_name(&binding.file_name)
+                && names.contains(&binding.file_name.to_lowercase())
+                && binding_keys.insert((binding.server_id.to_lowercase(), binding.jump_host))
+        })
+        .collect::<Vec<_>>();
+    if server_paths.len() != server_paths_count {
+        return Err("密钥备份包含无效的服务器密钥绑定".to_string());
+    }
     Ok((
         KeyBundle {
             version: bundle.version,
             created_at: bundle.created_at,
             files: normalized_files,
+            server_paths,
         },
         decoded,
     ))
+}
+
+fn restored_key_path_updates(
+    bundle: &KeyBundle,
+    servers: &[ServerKeyProfile],
+    directory: &Path,
+) -> Vec<ServerKeyPathUpdate> {
+    let available_files = bundle
+        .files
+        .iter()
+        .map(|file| (file.name.to_lowercase(), file.name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let bindings = bundle
+        .server_paths
+        .iter()
+        .map(|binding| {
+            (
+                (binding.server_id.as_str(), binding.jump_host),
+                binding.file_name.as_str(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut updates = Vec::new();
+    for reference in server_key_references(servers) {
+        let binding_key = (reference.server_id.as_str(), reference.jump_host);
+        let current_name = reference
+            .source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| available_files.get(&name.to_lowercase()).copied());
+        let generated_name = server_key_file_name(&reference);
+        let file_name = bindings
+            .get(&binding_key)
+            .copied()
+            .filter(|name| available_files.contains_key(&name.to_lowercase()))
+            .or(current_name)
+            .or_else(|| available_files.get(&generated_name.to_lowercase()).copied());
+        let Some(file_name) = file_name else {
+            continue;
+        };
+        updates.push(ServerKeyPathUpdate {
+            server_id: reference.server_id,
+            jump_host: reference.jump_host,
+            private_key_path: directory.join(file_name).to_string_lossy().to_string(),
+        });
+    }
+    updates
 }
 
 fn restore_key_bundle(
     bundle: &KeyBundle,
     files: Vec<(String, Vec<u8>)>,
     overwrite: bool,
+    servers: &[ServerKeyProfile],
 ) -> Result<KeySyncResult, String> {
     let directory = sshstar_directory()?;
     fs::create_dir_all(&directory).map_err(|error| format!("创建本地密钥目录失败: {error}"))?;
@@ -1051,7 +1140,7 @@ fn restore_key_bundle(
             })
             .collect(),
         updated_at: bundle.created_at,
-        path_updates: Vec::new(),
+        path_updates: restored_key_path_updates(bundle, servers, &directory),
     })
 }
 
@@ -1061,6 +1150,7 @@ fn merge_key_bundles(local: &KeyBundle, remote: Option<KeyBundle>) -> Result<Key
             version: local.version,
             created_at: local.created_at,
             files: local.files.clone(),
+            server_paths: local.server_paths.clone(),
         });
     };
     let local_cloud_key = local
@@ -1087,10 +1177,22 @@ fn merge_key_bundles(local: &KeyBundle, remote: Option<KeyBundle>) -> Result<Key
     for file in &local.files {
         files.insert(file.name.to_lowercase(), file.clone());
     }
+    let mut server_paths = remote
+        .server_paths
+        .into_iter()
+        .map(|path| ((path.server_id.to_lowercase(), path.jump_host), path))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for path in &local.server_paths {
+        server_paths.insert(
+            (path.server_id.to_lowercase(), path.jump_host),
+            path.clone(),
+        );
+    }
     Ok(KeyBundle {
         version: 1,
         created_at: local.created_at.max(remote_created_at),
         files: files.into_values().collect(),
+        server_paths: server_paths.into_values().collect(),
     })
 }
 
@@ -2060,6 +2162,7 @@ fn download_keys(
     endpoint: String,
     passphrase: String,
     overwrite: bool,
+    servers: Vec<ServerKeyProfile>,
 ) -> Result<KeySyncResult, String> {
     emit_progress(
         &app,
@@ -2111,7 +2214,7 @@ fn download_keys(
         82,
         "正在恢复密钥文件",
     );
-    let mut result = restore_key_bundle(&bundle, files, overwrite)?;
+    let mut result = restore_key_bundle(&bundle, files, overwrite, &servers)?;
     if let Some(updated_at) = server_updated_at {
         result.updated_at = updated_at;
     }
@@ -2143,6 +2246,7 @@ pub async fn sync_download_keys(
     endpoint: String,
     passphrase: String,
     overwrite: bool,
+    servers: Vec<ServerKeyProfile>,
     operation_id: String,
 ) -> Result<KeySyncResult, String> {
     let endpoint = normalize_endpoint(&endpoint)?;
@@ -2156,6 +2260,7 @@ pub async fn sync_download_keys(
             endpoint,
             passphrase,
             overwrite,
+            servers,
         )
     })
     .await
@@ -2218,7 +2323,7 @@ mod tests {
         assert!(config["providers"].as_array().unwrap().iter().all(|provider| provider.get("apiKey").is_none()));
     }
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn test_session(endpoint: &str) -> super::SyncSession {
         super::SyncSession {
@@ -2695,6 +2800,77 @@ mod tests {
     }
 
     #[test]
+    fn downloaded_key_bindings_rewrite_paths_for_the_current_device() {
+        let server = super::ServerKeyProfile {
+            id: "server-123".to_string(),
+            name: "Renamed locally".to_string(),
+            auth_type: "key".to_string(),
+            private_key_path: Some("old-device\\private.key".to_string()),
+            jump_host: None,
+        };
+        let bundle = super::KeyBundle {
+            version: 1,
+            created_at: 1,
+            files: vec![super::KeyBundleFile {
+                name: "server-production-primary-abcdef.key".to_string(),
+                content: "a2V5".to_string(),
+            }],
+            server_paths: vec![super::KeyBundleServerPath {
+                server_id: "server-123".to_string(),
+                jump_host: false,
+                file_name: "server-production-primary-abcdef.key".to_string(),
+            }],
+        };
+        let updates = super::restored_key_path_updates(
+            &bundle,
+            &[server],
+            Path::new("current-device/.sshStar"),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].server_id, "server-123");
+        assert_eq!(
+            PathBuf::from(&updates[0].private_key_path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("server-production-primary-abcdef.key")
+        );
+    }
+
+    #[test]
+    fn downloaded_legacy_key_bindings_fall_back_to_stable_names() {
+        let server = super::ServerKeyProfile {
+            id: "server-123".to_string(),
+            name: "Production / Web".to_string(),
+            auth_type: "key".to_string(),
+            private_key_path: Some("old-device\\id_ed25519".to_string()),
+            jump_host: None,
+        };
+        let reference = super::ServerKeyReference {
+            server_id: "server-123".to_string(),
+            server_name: "Production / Web".to_string(),
+            jump_host: false,
+            source_path: PathBuf::from("old-device\\id_ed25519"),
+        };
+        let generated_name = super::server_key_file_name(&reference);
+        let bundle = super::KeyBundle {
+            version: 1,
+            created_at: 1,
+            files: vec![super::KeyBundleFile {
+                name: generated_name.clone(),
+                content: "a2V5".to_string(),
+            }],
+            server_paths: Vec::new(),
+        };
+        let updates = super::restored_key_path_updates(
+            &bundle,
+            &[server],
+            Path::new("current-device/.sshStar"),
+        );
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].private_key_path.ends_with(&generated_name));
+    }
+
+    #[test]
     fn cloud_sync_endpoints_accept_http_and_https() {
         assert_eq!(
             super::normalize_endpoint("http://sync.example.com/api/"),
@@ -2763,6 +2939,7 @@ mod tests {
                 name: "cloud.key".to_string(),
                 content: "bG9jYWw=".to_string(),
             }],
+            server_paths: Vec::new(),
         };
         let remote = super::KeyBundle {
             version: 1,
@@ -2771,6 +2948,7 @@ mod tests {
                 name: "cloud.key".to_string(),
                 content: "cmVtb3Rl".to_string(),
             }],
+            server_paths: Vec::new(),
         };
         assert!(super::merge_key_bundles(&local, Some(remote)).is_err());
     }

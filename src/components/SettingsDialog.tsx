@@ -382,8 +382,9 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     setError("");
     setKeySyncNotice("");
     try {
-      const result = await downloadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, overwrite, `keys-download-${crypto.randomUUID()}`);
+      const result = await downloadCloudSyncKeys(value.cloudSync.endpoint, keyPassphrase, overwrite, servers, `keys-download-${crypto.randomUUID()}`);
       setKeyFiles(result.files);
+      await onManageServerKeyPaths(result.pathUpdates);
       await onSyncNow(value.cloudSync.endpoint);
       setKeySyncNotice(`已解密恢复 ${result.files.length} 个密钥文件，并重新拉取应用数据。`);
       setKeyPassphrase("");

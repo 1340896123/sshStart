@@ -199,6 +199,7 @@ export default function App() {
   const markSyncChange = useCallback((change: Parameters<typeof advanceSyncMetadata>[1]) => {
     const next = markPendingSyncChange(syncMetaRef.current, change);
     syncMetaRef.current = next;
+    snapshotRef.current = { ...snapshotRef.current, syncMeta: next };
     setSyncMeta(next);
   }, []);
 
@@ -618,7 +619,7 @@ export default function App() {
       else current.primary = update.privateKeyPath;
       paths.set(update.serverId, current);
     });
-    setServers((current) => current.map((server) => {
+    const nextServers = snapshotRef.current.servers.map((server) => {
       const update = paths.get(server.id);
       if (!update) return server;
       return {
@@ -628,7 +629,11 @@ export default function App() {
           ? { ...server.jumpHost, privateKeyPath: update.jump ?? server.jumpHost.privateKeyPath }
           : undefined,
       };
-    }));
+    });
+    // Keep an immediate snapshot for callers that synchronize right after this
+    // state update, before React has committed the next render.
+    snapshotRef.current = { ...snapshotRef.current, servers: nextServers };
+    setServers(nextServers);
     markSyncChange({ serverIds: paths.keys() });
   };
 

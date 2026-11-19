@@ -204,7 +204,7 @@ export const uploadCloudSyncKeys = (endpoint: string, passphrase: string, server
     ? invoke<KeySyncResult>("sync_upload_keys", { endpoint, passphrase, servers: cloudKeyServers(servers), operationId })
     : Promise.reject(new Error("密钥同步仅可在桌面应用中使用"));
 
-export const downloadCloudSyncKeys = (endpoint: string, passphrase: string, overwrite: boolean, operationId: string) =>
+export const downloadCloudSyncKeys = (endpoint: string, passphrase: string, overwrite: boolean, servers: ServerProfile[], operationId: string) =>
   isTauri()
-    ? invoke<KeySyncResult>("sync_download_keys", { endpoint, passphrase, overwrite, operationId })
+    ? invoke<KeySyncResult>("sync_download_keys", { endpoint, passphrase, overwrite, servers: cloudKeyServers(servers), operationId })
     : Promise.reject(new Error("密钥同步仅可在桌面应用中使用"));
