@@ -300,6 +300,26 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
     }
   };
 
+  const hostKeyMismatch = error.includes("SSH 主机密钥不匹配");
+
+  const resetHostKeyAndReconnect = async () => {
+    if (!isTauri() || reconnectingRef.current || !mountedRef.current) return;
+    try {
+      await invoke("remove_known_host", { host: server.host, port: server.port });
+      await reconnect();
+    } catch (reason) {
+      if (!mountedRef.current) return;
+      const message = String(reason);
+      diagnosticError("terminal.host_key_reset.failed", reason, {
+        sessionId: session.id,
+        host: server.host,
+        port: server.port,
+      });
+      setError(message);
+      setStatus("failed");
+    }
+  };
+
   return (
     <div className="pane terminal-pane">
       <div className="pane-header">
@@ -313,7 +333,7 @@ export function TerminalPane({ session, server, onUpdate }: Props) {
         <button className="icon-button quiet" title="重新连接" disabled={status === "connecting"} onClick={() => void reconnect()}><RotateCcw size={13} /></button>
         <button className="icon-button quiet" title="最大化终端"><Maximize2 size={13} /></button>
       </div>
-      {error && <div className="inline-error"><span>{error}</span><button onClick={() => void reconnect()}>重试</button></div>}
+      {error && <div className="inline-error"><span>{error}</span><button disabled={status === "connecting"} onClick={() => void (hostKeyMismatch ? resetHostKeyAndReconnect() : reconnect())}>{hostKeyMismatch ? "清除旧主机密钥并重试" : "重试"}</button></div>}
       <div ref={hostRef} className="terminal-host" />
       <div className="terminal-footer"><span>UTF-8</span><span>{terminalRef.current?.cols ?? 0} × {terminalRef.current?.rows ?? 0}</span><span>会话 {session.id.slice(-5)}</span></div>
     </div>

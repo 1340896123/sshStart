@@ -476,6 +476,11 @@ fn load_server_secrets(server_id: String) -> Result<ServerSecretBundle, String> 
     })
 }
 
+#[tauri::command]
+fn remove_known_host(host: String, port: u16) -> Result<bool, String> {
+    remove_known_host_entries(&host, port)
+}
+
 fn resolve_address(server: &ServerProfile) -> Result<SocketAddr, String> {
     (server.host.as_str(), server.port)
         .to_socket_addrs()
@@ -489,6 +494,61 @@ fn known_hosts_path() -> Result<PathBuf, String> {
         .or_else(|| std::env::var_os("HOME"))
         .ok_or_else(|| "无法定位用户主目录，不能验证 SSH 主机密钥".to_string())?;
     Ok(PathBuf::from(home).join(".ssh").join("known_hosts"))
+}
+
+fn known_host_line_matches(line: &str, host: &str, port: u16) -> bool {
+    let Some(host_field) = line.split_whitespace().next() else {
+        return false;
+    };
+    let expected = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    host_field.split(',').any(|candidate| candidate == expected)
+}
+
+fn remove_known_host_entries(host: &str, port: u16) -> Result<bool, String> {
+    let host = host.trim();
+    if host.is_empty() || port == 0 {
+        return Err("SSH 主机和端口不能为空".to_string());
+    }
+    let _guard = KNOWN_HOSTS_LOCK
+        .lock()
+        .map_err(|_| "known_hosts 状态锁已损坏".to_string())?;
+    let path = known_hosts_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let session = Session::new().map_err(|error| format!("初始化 SSH 会话失败: {error}"))?;
+    let mut known_hosts = session
+        .known_hosts()
+        .map_err(|error| format!("初始化 known_hosts 失败: {error}"))?;
+    known_hosts
+        .read_file(&path, KnownHostFileKind::OpenSSH)
+        .map_err(|error| format!("读取 known_hosts 失败: {error}"))?;
+
+    let mut removed = false;
+    let entries = known_hosts
+        .hosts()
+        .map_err(|error| format!("读取 known_hosts 条目失败: {error}"))?;
+    for entry in entries {
+        let line = known_hosts
+            .write_string(&entry, KnownHostFileKind::OpenSSH)
+            .map_err(|error| format!("读取 known_hosts 条目内容失败: {error}"))?;
+        if known_host_line_matches(&line, host, port) {
+            known_hosts
+                .remove(&entry)
+                .map_err(|error| format!("删除 known_hosts 条目失败: {error}"))?;
+            removed = true;
+        }
+    }
+    if removed {
+        known_hosts
+            .write_file(&path, KnownHostFileKind::OpenSSH)
+            .map_err(|error| format!("写入 known_hosts 失败: {error}"))?;
+    }
+    Ok(removed)
 }
 
 fn verify_known_host(session: &Session, server: &ServerProfile) -> Result<(), String> {
@@ -3157,6 +3217,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             store_server_secret,
             load_server_secrets,
+            remove_known_host,
             copy_server_secret,
             delete_server_secret,
             store_ai_key,
@@ -3247,6 +3308,35 @@ mod tests {
     fn formats_unix_permissions() {
         assert_eq!(mode_string(Some(0o100755), false), "-rwxr-xr-x");
         assert_eq!(mode_string(Some(0o040750), true), "drwxr-x---");
+    }
+
+    #[test]
+    fn matches_known_host_entries_for_default_and_custom_ports() {
+        assert!(super::known_host_line_matches(
+            "13.140.248.81 ssh-rsa AAAA",
+            "13.140.248.81",
+            22
+        ));
+        assert!(super::known_host_line_matches(
+            "[127.0.0.1]:2201 ssh-ed25519 AAAA",
+            "127.0.0.1",
+            2201
+        ));
+        assert!(super::known_host_line_matches(
+            "alias,13.140.248.81 ssh-rsa AAAA",
+            "13.140.248.81",
+            22
+        ));
+        assert!(!super::known_host_line_matches(
+            "13.140.248.80 ssh-rsa AAAA",
+            "13.140.248.81",
+            22
+        ));
+        assert!(!super::known_host_line_matches(
+            "13.140.248.81 ssh-rsa AAAA",
+            "13.140.248.81",
+            2201
+        ));
     }
 
     #[test]
