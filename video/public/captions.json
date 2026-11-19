@@ -1,0 +1,268 @@
+[
+  {
+    "text": "如果每一次连接，都能更专注。",
+    "startMs": 952,
+    "endMs": 3614,
+    "timestampMs": 952,
+    "confidence": null
+  },
+  {
+    "text": "这就是 sshStar，为服务器管理准备的桌面工作台。",
+    "startMs": 4046,
+    "endMs": 8964,
+    "timestampMs": 4046,
+    "confidence": null
+  },
+  {
+    "text": "终端里敲命令，文件窗口里找目录。",
+    "startMs": 12952,
+    "endMs": 16478,
+    "timestampMs": 12952,
+    "confidence": null
+  },
+  {
+    "text": "查看日志，还要切到另一个 AI 对话。",
+    "startMs": 16909,
+    "endMs": 20423,
+    "timestampMs": 16909,
+    "confidence": null
+  },
+  {
+    "text": "少一点窗口切换，才能多一点专注。",
+    "startMs": 20865,
+    "endMs": 24005,
+    "timestampMs": 20865,
+    "confidence": null
+  },
+  {
+    "text": "sshStar 把 SSH 终端、远程文件和 AI 助手放在一起。",
+    "startMs": 28944,
+    "endMs": 34534,
+    "timestampMs": 28944,
+    "confidence": null
+  },
+  {
+    "text": "左边选择服务器，中间处理任务，右边随时展开对话。",
+    "startMs": 34933,
+    "endMs": 39642,
+    "timestampMs": 34933,
+    "confidence": null
+  },
+  {
+    "text": "信息并排呈现，当前会话的上下文，一直留在眼前。",
+    "startMs": 40039,
+    "endMs": 44689,
+    "timestampMs": 40039,
+    "confidence": null
+  },
+  {
+    "text": "按生产、测试或个人环境，为服务器分组。",
+    "startMs": 46944,
+    "endMs": 50978,
+    "timestampMs": 46944,
+    "confidence": null
+  },
+  {
+    "text": "使用密码或私钥连接，也可以配置跳板机。",
+    "startMs": 51379,
+    "endMs": 54935,
+    "timestampMs": 51379,
+    "confidence": null
+  },
+  {
+    "text": "同一台服务器，能够打开多个独立会话。",
+    "startMs": 55335,
+    "endMs": 58412,
+    "timestampMs": 55335,
+    "confidence": null
+  },
+  {
+    "text": "终端内容、文件位置和 AI 对话，各自保留，",
+    "startMs": 58812,
+    "endMs": 62977,
+    "timestampMs": 58812,
+    "confidence": null
+  },
+  {
+    "text": "切换时井然有序。",
+    "startMs": 63054,
+    "endMs": 64698,
+    "timestampMs": 63054,
+    "confidence": null
+  },
+  {
+    "text": "文件管理，就在终端下面。",
+    "startMs": 66944,
+    "endMs": 69300,
+    "timestampMs": 66944,
+    "confidence": null
+  },
+  {
+    "text": "浏览远程目录，上传、下载，或者创建文件夹，",
+    "startMs": 69703,
+    "endMs": 74037,
+    "timestampMs": 69703,
+    "confidence": null
+  },
+  {
+    "text": "都能直接完成。",
+    "startMs": 74091,
+    "endMs": 75404,
+    "timestampMs": 74091,
+    "confidence": null
+  },
+  {
+    "text": "修改配置时，内置编辑器可以打开远程文本文件。",
+    "startMs": 75805,
+    "endMs": 80223,
+    "timestampMs": 75805,
+    "confidence": null
+  },
+  {
+    "text": "保存后继续在终端验证，让文件操作和命令执行，",
+    "startMs": 80624,
+    "endMs": 85162,
+    "timestampMs": 80624,
+    "confidence": null
+  },
+  {
+    "text": "保持同一个节奏。",
+    "startMs": 85216,
+    "endMs": 86708,
+    "timestampMs": 85216,
+    "confidence": null
+  },
+  {
+    "text": "遇到问题，可以让 AI 结合当前 SSH 会话，",
+    "startMs": 88952,
+    "endMs": 93560,
+    "timestampMs": 88952,
+    "confidence": null
+  },
+  {
+    "text": "一起排查。",
+    "startMs": 93642,
+    "endMs": 94681,
+    "timestampMs": 93642,
+    "confidence": null
+  },
+  {
+    "text": "比如查看磁盘与内存使用，分析错误日志，",
+    "startMs": 95126,
+    "endMs": 99193,
+    "timestampMs": 95126,
+    "confidence": null
+  },
+  {
+    "text": "或者梳理部署目录。",
+    "startMs": 99353,
+    "endMs": 101088,
+    "timestampMs": 99353,
+    "confidence": null
+  },
+  {
+    "text": "助手的运行状态和工具调用，会显示在对话里。",
+    "startMs": 101530,
+    "endMs": 105920,
+    "timestampMs": 101530,
+    "confidence": null
+  },
+  {
+    "text": "你可以看到它正在做什么，再决定接下来怎么做。",
+    "startMs": 106337,
+    "endMs": 110559,
+    "timestampMs": 106337,
+    "confidence": null
+  },
+  {
+    "text": "模型服务，由你自己选择。",
+    "startMs": 112952,
+    "endMs": 115382,
+    "timestampMs": 112952,
+    "confidence": null
+  },
+  {
+    "text": "配置兼容 OpenAI API 的提供商、服务地址和密钥。",
+    "startMs": 115827,
+    "endMs": 120809,
+    "timestampMs": 115827,
+    "confidence": null
+  },
+  {
+    "text": "按提供商管理模型，在对话中切换模型与推理级别。",
+    "startMs": 121252,
+    "endMs": 126312,
+    "timestampMs": 121252,
+    "confidence": null
+  },
+  {
+    "text": "更顺手的自动化，需要清晰的边界。",
+    "startMs": 130952,
+    "endMs": 134091,
+    "timestampMs": 130952,
+    "confidence": null
+  },
+  {
+    "text": "凭据保存在系统凭据库，应用状态在本地加密存储。",
+    "startMs": 134536,
+    "endMs": 139595,
+    "timestampMs": 134536,
+    "confidence": null
+  },
+  {
+    "text": "验证主机密钥，按需授权 AI 工具，",
+    "startMs": 140038,
+    "endMs": 143732,
+    "timestampMs": 140038,
+    "confidence": null
+  },
+  {
+    "text": "高风险操作经过审批。",
+    "startMs": 143840,
+    "endMs": 145936,
+    "timestampMs": 143840,
+    "confidence": null
+  },
+  {
+    "text": "换个设备，也能继续工作。",
+    "startMs": 148949,
+    "endMs": 151267,
+    "timestampMs": 148949,
+    "confidence": null
+  },
+  {
+    "text": "接入可选同步服务后，配置与设置会先加密，再上传。",
+    "startMs": 151699,
+    "endMs": 156853,
+    "timestampMs": 151699,
+    "confidence": null
+  },
+  {
+    "text": "私钥备份用自定义口令单独加密；是否开启，由你决定。",
+    "startMs": 157270,
+    "endMs": 162664,
+    "timestampMs": 157270,
+    "confidence": null
+  },
+  {
+    "text": "现在，前往屏幕上的官网，下载 Windows 版本。",
+    "startMs": 164952,
+    "endMs": 168968,
+    "timestampMs": 164952,
+    "confidence": null
+  },
+  {
+    "text": "sshStar，让每一次连接，都更得心应手。",
+    "startMs": 169412,
+    "endMs": 173479,
+    "timestampMs": 169412,
+    "confidence": null
+  },
+  {
+    "text": "连接你的服务器，开启新的工作流。",
+    "startMs": 173922,
+    "endMs": 176920,
+    "timestampMs": 173922,
+    "confidence": null
+  }
+]

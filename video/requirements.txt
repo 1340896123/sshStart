@@ -1,0 +1,6 @@
+edge-tts==7.3.1
+imageio-ffmpeg>=0.6
+numpy>=1.26
+Pillow>=10
+playwright>=1.48
+qrcode>=8.2
