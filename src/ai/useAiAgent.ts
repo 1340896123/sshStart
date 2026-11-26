@@ -30,6 +30,15 @@ interface StartAiAgentInput {
   content: string;
   attachments: AiImageAttachment[];
   allowTools: boolean;
+  config?: AiConfig;
+}
+
+export type AiSendMode = "queue" | "steer";
+
+interface PendingAiMessage extends StartAiAgentInput {
+  id: string;
+  mode: AiSendMode;
+  config: AiConfig;
 }
 
 interface ActiveRun {
@@ -131,6 +140,10 @@ export function useAiAgent({
   const [stopping, setStopping] = useState(false);
   const [retry, setRetry] = useState<{ messageId: string; seconds: number }>();
   const [resolvingApprovalId, setResolvingApprovalId] = useState<string>();
+  const [pendingMessages, setPendingMessages] = useState<PendingAiMessage[]>([]);
+  const [queuePaused, setQueuePaused] = useState(false);
+  const queueRef = useRef<PendingAiMessage[]>([]);
+  const queuePausedRef = useRef(false);
   const messagesRef = useRef(messages);
   const lastPropMessagesRef = useRef(messages);
   const pendingLocalMessagesRef = useRef<AiMessage[]>();
@@ -161,6 +174,30 @@ export function useAiAgent({
   const cancelRetry = () => {
     clearRetryTimers();
     setRetry(undefined);
+  };
+
+  const updateQueue = (next: PendingAiMessage[]) => {
+    queueRef.current = next;
+    setPendingMessages(next);
+  };
+
+  const pauseQueue = (paused: boolean) => {
+    queuePausedRef.current = paused;
+    setQueuePaused(paused);
+  };
+
+  const clearQueue = () => {
+    updateQueue([]);
+    pauseQueue(false);
+    cancelRetry();
+  };
+
+  const drainQueue = () => {
+    if (activeRunRef.current || queuePausedRef.current || pendingRetryRef.current) return;
+    const [next, ...rest] = queueRef.current;
+    if (!next) return;
+    updateQueue(rest);
+    void startRef.current?.(next);
   };
 
   const scheduleRetry = (messageId: string, input: StartAiAgentInput) => {
@@ -266,8 +303,18 @@ export function useAiAgent({
       updatedAt: Date.now(),
     }), true);
     try {
+      const configuredProviders = config.providers ?? [];
+      const reviewerProvider = configuredProviders.find((provider) => provider.id === config.reviewerProviderId)
+        ?? configuredProviders.find((provider) => provider.id === config.selectedProviderId);
+      const reviewConfig = reviewerProvider ? {
+        ...config,
+        selectedProviderId: reviewerProvider.id,
+        apiMode: reviewerProvider.apiMode,
+        endpoint: reviewerProvider.endpoint,
+        apiKey: reviewerProvider.apiKey,
+      } : config;
       const review = await invoke<AiApprovalReview>("review_ai_approval", {
-        config,
+        config: reviewConfig,
         server,
         tool: approval.tool,
         command: approval.command,
@@ -478,6 +525,7 @@ export function useAiAgent({
 
   const start = async (input: StartAiAgentInput, retryMessageId?: string) => {
     if (activeRunRef.current) return;
+    input = { ...input, config: input.config ?? config };
     cancelRetry();
     if (retryMessageId) {
       const lastMessage = messagesRef.current[messagesRef.current.length - 1];
@@ -528,7 +576,7 @@ export function useAiAgent({
       activeRunRef.current.unlisten = unlisten;
       if (activeRunRef.current.cancelRequested) return;
       const result = await invoke<AiRunResult>("run_ai_agent", {
-        config,
+        config: input.config,
         server,
         messages: (() => {
           const next = pendingMessages
@@ -539,7 +587,7 @@ export function useAiAgent({
             modelMessages: message.role === "assistant" && message.status === "completed"
               ? message.modelMessages : undefined,
             content: message.role === "assistant" && message.status === "cancelled"
-              ? `${message.content}\n\n[上一轮回复在此处被用户停止，请基于已有内容继续对话。]`
+              ? `${message.content}\n\n[上一轮回复在此处被用户停止，请优先遵循用户最新消息。已执行或中断的命令如下，请核对实际状态，避免重复已完成的操作。]\n${(message.toolCalls ?? []).map((tool) => `$ ${tool.command}\n状态：${tool.status}\n${tool.output}`).join("\n\n")}`
               : message.content,
             attachments: message.attachments?.map(({ kind, name, remotePath, mimeType, size }) => ({
               kind,
@@ -573,6 +621,7 @@ export function useAiAgent({
         approvalPolicy: approvalPolicyRef.current,
       });
       if (activeRunRef.current?.runId !== runId) return;
+      if (activeRunRef.current.cancelRequested) return;
       const completedAt = Date.now();
       updateAssistant(assistantMessage.id, (message) => {
         if (message.status === "error") return message;
@@ -655,19 +704,65 @@ export function useAiAgent({
         const lastMessage = messagesRef.current[messagesRef.current.length - 1];
         if (!activeRun.cancelRequested && lastMessage?.id === assistantMessage.id && lastMessage.status === "error") {
           scheduleRetry(assistantMessage.id, input);
+        } else {
+          drainQueue();
         }
       }
     }
   };
   startRef.current = start;
 
-  const cancel = async () => {
+  const cancel = async (pausePending = true) => {
     cancelRetry();
+    if (pausePending) pauseQueue(queueRef.current.length > 0);
     const activeRun = activeRunRef.current;
-    if (!activeRun) return;
+    if (!activeRun || activeRun.cancelRequested) return;
     activeRun.cancelRequested = true;
     setStopping(true);
     await invoke("cancel_ai_run", { runId: activeRun.runId }).catch(() => undefined);
+  };
+
+  const submit = (input: StartAiAgentInput, mode: AiSendMode = "queue") => {
+    const pending: PendingAiMessage = { ...input, id: uid("ai-pending"), mode, config: structuredClone(input.config ?? config) };
+    if (mode === "steer") {
+      updateQueue([pending, ...queueRef.current]);
+      pauseQueue(false);
+      cancelRetry();
+      if (activeRunRef.current) void cancel(false);
+      else drainQueue();
+    } else {
+      updateQueue([...queueRef.current, pending]);
+      if (!activeRunRef.current && !queuePausedRef.current) {
+        drainQueue();
+      }
+    }
+  };
+
+  const removePending = (id: string) => {
+    updateQueue(queueRef.current.filter((message) => message.id !== id));
+    if (!queueRef.current.length) pauseQueue(false);
+  };
+
+  const steerPending = (id: string) => {
+    const pending = queueRef.current.find((message) => message.id === id);
+    if (!pending) return;
+    updateQueue([{ ...pending, mode: "steer" }, ...queueRef.current.filter((message) => message.id !== id)]);
+    pauseQueue(false);
+    cancelRetry();
+    if (activeRunRef.current) void cancel(false);
+    else drainQueue();
+  };
+
+  const resumeQueue = () => {
+    pauseQueue(false);
+    cancelRetry();
+    drainQueue();
+  };
+
+  const cancelCommand = async () => {
+    const activeRun = activeRunRef.current;
+    if (!activeRun) return;
+    await invoke("cancel_ai_command", { runId: activeRun.runId }).catch(() => undefined);
   };
 
   const resolveApproval = async (
@@ -705,6 +800,7 @@ export function useAiAgent({
 
   useEffect(() => () => {
     clearRetryTimers();
+    queueRef.current = [];
     const activeRun = activeRunRef.current;
     if (!activeRun) return;
     activeRun.unlisten?.();
@@ -716,11 +812,19 @@ export function useAiAgent({
     running,
     stopping,
     retry,
-    cancelRetry,
+    pendingMessages,
+    queuePaused,
+    submit,
+    clearQueue,
+    removePending,
+    steerPending,
+    resumeQueue,
+    cancelRetry: () => { cancelRetry(); pauseQueue(queueRef.current.length > 0); },
     activeMessageId: activeRunRef.current?.messageId,
     resolvingApprovalId,
     start,
     cancel,
+    cancelCommand,
     resolveApproval,
   };
 }

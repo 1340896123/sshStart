@@ -5,14 +5,14 @@ import React from "react";
 import renderer, { act } from "react-test-renderer";
 
 let invokeHandler;
-mock.module("@tauri-apps/api/core", { exports: { invoke: (...args) => invokeHandler(...args) } });
-mock.module("@tauri-apps/api/event", { exports: { listen: async () => () => {} } });
-mock.module("@tauri-apps/plugin-dialog", { exports: { open: async () => null, save: async () => null } });
-mock.module(new URL("../src/devBootstrap.ts", import.meta.url).href, { exports: { DEV_BOOTSTRAP: undefined } });
+mock.module("@tauri-apps/api/core", { namedExports: { invoke: (...args) => invokeHandler(...args) } });
+mock.module("@tauri-apps/api/event", { namedExports: { listen: async () => () => {} } });
+mock.module("@tauri-apps/plugin-dialog", { namedExports: { open: async () => null, save: async () => null } });
+mock.module(new URL("../src/devBootstrap.ts", import.meta.url).href, { namedExports: { DEV_BOOTSTRAP: undefined } });
 const components = {};
-for (const name of ["AiPane", "AiImportDialog", "ColumnSplitter", "FilePane", "ServerDialog", "ServerTree", "SettingsDialog", "TerminalPane", "TransferPanel", "SystemDock"]) {
+for (const name of ["AiPane", "AiImportDialog", "ColumnSplitter", "FilePane", "ServerDialog", "ServerTree", "SettingsDialog", "TerminalPane", "TransferPanel", "SystemDock", "WindowControls"]) {
   components[name] = () => null;
-  mock.module(new URL(`../src/components/${name}.tsx`, import.meta.url).href, { exports: { [name]: components[name] } });
+  mock.module(new URL(`../src/components/${name}.tsx`, import.meta.url).href, { namedExports: { [name]: components[name] } });
 }
 const { default: App } = await import("../src/App.tsx");
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };

@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import {
   Bot,
   Check,
@@ -8,7 +7,6 @@ import {
   Download,
   Eye,
   EyeOff,
-  FilePenLine,
   FolderTree,
   KeyRound,
   ListTree,
@@ -68,18 +66,16 @@ const TOOL_GROUPS: Array<{
   tools: Array<{ key: AiToolKey; label: string; description: string; icon: typeof SquareTerminal; write?: boolean }>;
 }> = [
   {
-    title: "Bash 终端",
-    description: "让助手在当前 SSH 服务器上通过 Bash 执行命令和多行脚本。",
+    title: "远端命令",
+    description: "让助手在当前 SSH 服务器上原生执行命令和多行脚本。",
     icon: SquareTerminal,
     tools: [
-      { key: "bash", label: "Bash 执行", description: "执行 Bash 命令或多行脚本，并返回 stdout、stderr 和退出码。", icon: Play, write: true },
+      { key: "executeCommand", label: "命令执行", description: "执行远端命令或多行脚本，并返回 stdout、stderr 和退出码。", icon: Play, write: true },
     ],
   },
 ];
 
 type SettingsSection = "model" | "agent" | "tools" | "server-data" | "security" | "cloud-sync";
-type ModelPickerTarget = "agent" | "reviewer";
-
 const SETTINGS_SECTIONS: Array<{
   id: SettingsSection;
   label: string;
@@ -88,9 +84,9 @@ const SETTINGS_SECTIONS: Array<{
 }> = [
   { id: "model", label: "模型提供商", description: "提供商、密钥、模型与思考强度", icon: Bot },
   { id: "agent", label: "Agent", description: "运行参数与系统提示词", icon: SlidersHorizontal },
-  { id: "tools", label: "工具能力", description: "Bash 终端与执行策略", icon: Wrench },
+  { id: "tools", label: "工具能力", description: "远端命令与执行策略", icon: Wrench },
   { id: "server-data", label: "导入导出", description: "服务器列表与密钥策略", icon: Download },
-  { id: "security", label: "安全策略", description: "风险提示与变更权限", icon: ShieldCheck },
+  { id: "security", label: "安全策略", description: "风险提示与审批模型", icon: ShieldCheck },
   { id: "cloud-sync", label: "云端同步", description: "登录、加密与自动同步", icon: Cloud },
 ];
 
@@ -107,10 +103,6 @@ const syncDirectionLabel = (direction?: "upload" | "download") => direction === 
 export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncActivity, onSyncNow, onSave, onRemoveSavedKey, onManageServerKeyPaths, onClose }: Props) {
   const [value, setValue] = useState(() => normalizeAiConfig(config));
   const [savedValue, setSavedValue] = useState(() => normalizeAiConfig(config));
-  const [models, setModels] = useState<string[]>([]);
-  const [modelPickerTarget, setModelPickerTarget] = useState<ModelPickerTarget>();
-  const [modelSearch, setModelSearch] = useState("");
-  const [loadingModels, setLoadingModels] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const { syncStatus, refreshSyncStatus } = useCloudSyncStatus(value.cloudSync.endpoint, cloudSyncActivity);
@@ -127,8 +119,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
   const [keySyncNotice, setKeySyncNotice] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSection>("model");
   const [navSearch, setNavSearch] = useState("");
-  const modelPickerOpen = Boolean(modelPickerTarget);
-  const selectedPickerModel = modelPickerTarget === "reviewer" ? value.reviewerModel : value.model;
   const isDirty = JSON.stringify(value) !== JSON.stringify(savedValue);
   const keySyncBusy = Boolean(keySyncAction);
 
@@ -186,26 +176,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
     }
   };
 
-  const loadModels = async () => {
-    setLoadingModels(true);
-    setError("");
-    try {
-      if (!isTauri()) throw new Error("模型列表仅可在桌面应用中获取");
-      const nextModels = await invoke<string[]>("list_rig_models", { config: value });
-      setModels(nextModels);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setLoadingModels(false);
-    }
-  };
-
-  const openModelPicker = async (target: ModelPickerTarget) => {
-    setModelPickerTarget(target);
-    setModelSearch("");
-    await loadModels();
-  };
-
   const save = async () => {
     if (!isDirty) return;
     const invalidProvider = value.providers.find((provider) => !provider.name.trim() || !provider.endpoint.trim()
@@ -244,10 +214,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
       setError("工具输出上限需为正整数");
       return;
     }
-    if (!Number.isInteger(value.tools.commandTimeoutSeconds) || value.tools.commandTimeoutSeconds < 5) {
-      setError("命令超时需为不小于 5 秒的整数");
-      return;
-    }
     if (value.cloudSync.enabled && !value.cloudSync.endpoint.trim()) {
       setError("启用同步前请填写同步服务地址");
       return;
@@ -265,6 +231,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
           name: provider.name.trim(), endpoint: provider.endpoint.trim(), apiKey: provider.apiKey.trim(),
           selectedModelId: provider.selectedModelId.trim(), models: provider.models.map((model) => ({ ...model, id: model.id.trim() })),
         })),
+        reviewerProviderId: value.reviewerProviderId.trim(),
         reviewerModel: value.reviewerModel.trim(),
         tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...value.tools },
       });
@@ -493,7 +460,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
 
   return (
     <div className="settings-backdrop">
-      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape") { if (modelPickerOpen) setModelPickerTarget(undefined); else if (!busy && (!isDirty || window.confirm("设置有未保存的修改，确定要退出吗？"))) onClose(); } }}>
+      <form className="settings-workspace" role="dialog" aria-modal="true" aria-labelledby="settings-page-title" onSubmit={(event) => { event.preventDefault(); void save(); }} onKeyDown={(event) => { if (event.key === "Escape" && !busy && (!isDirty || window.confirm("设置有未保存的修改，确定要退出吗？"))) onClose(); }}>
         <aside className="settings-sidebar">
           <div className="settings-sidebar-header">
             <span className="settings-brand-mark"><Bot size={17} /></span>
@@ -592,12 +559,13 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                 <div className="settings-section-summary"><div><strong>工具权限</strong><small>只向模型暴露已启用的函数工具</small></div><span><ListTree size={14} /> {enabledToolCount}/{TOOL_GROUPS.flatMap((group) => group.tools).length}</span></div>
                 <div className="settings-tool-groups">{TOOL_GROUPS.map(renderToolGroup)}</div>
                 <section className="settings-panel settings-policy-panel">
-                  <header><strong>执行策略</strong><small>配置每次工具链的运行轮次、输出体积和命令超时</small></header>
+                  <header><strong>执行策略</strong><small>配置每次工具链的运行轮次、输出体积和命令执行方式</small></header>
                   <div className="tool-policy-grid">
                     <label className="field"><span>最大工具轮数 <small>每次请求</small></span><input type="number" min={1} step={1} value={value.tools.maxToolRounds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxToolRounds: Number(event.target.value) } })} /></label>
                     <label className="field"><span>单轮输出上限 <small>字符</small></span><input type="number" min={1} step={1} value={value.tools.maxOutputChars} onChange={(event) => setValue({ ...value, tools: { ...value.tools, maxOutputChars: Number(event.target.value) } })} /></label>
-                    <label className="field"><span>命令超时 <small>秒</small></span><input type="number" min={5} step={1} value={value.tools.commandTimeoutSeconds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, commandTimeoutSeconds: Number(event.target.value) } })} /></label>
+                    <div className="field settings-static-policy"><span>命令执行时长 <small>SSH 命令</small></span><strong>无限制</strong></div>
                   </div>
+                  <div className="settings-note"><CircleAlert size={15} /><span>命令不会因运行时间自动关闭；执行中的命令可单独停止，Agent 会继续处理后续步骤。</span></div>
                 </section>
               </>
             )}
@@ -630,21 +598,43 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
 
             {visibleActiveSection === "security" && (
               <>
-                <div className="settings-section-summary"><div><strong>安全与知识</strong><small>在执行前检查风险并复用经过整理的命令片段</small></div></div>
-                <section className="settings-panel">
-                  <header><strong>审批审核模型</strong><small>供会话中的“替我审批”策略评估单次工具调用</small></header>
-                  <label className="settings-config-row">
-                    <span className="settings-row-copy"><strong>审核模型</strong><small>复用主模型的接口模式、Base URL 与 API Key；替我审批需配置此项，完全访问无需审核模型</small></span>
-                    <span className="settings-model-control">
-                      <input className="settings-input settings-mono-input" value={value.reviewerModel} onChange={(event) => setValue({ ...value, reviewerModel: event.target.value })} placeholder="输入审核模型 ID" />
-                      <button type="button" disabled={loadingModels} onClick={() => void openModelPicker("reviewer")}>
-                        <RefreshCw className={loadingModels ? "spinning" : ""} size={14} />
-                        {loadingModels ? "获取中" : "选择模型"}
-                      </button>
-                    </span>
-                  </label>
-                </section>
-                <label className="mutating-tools-toggle"><span className="tool-permission-icon"><FilePenLine size={14} /></span><span className="tool-permission-copy"><strong>允许 Agent 请求变更</strong><small>控制请求批准、替我审批模式中的变更操作；完全访问模式直接允许已启用工具的变更。</small></span><input type="checkbox" checked={value.tools.allowMutatingTools} onChange={(event) => setValue({ ...value, tools: { ...value.tools, allowMutatingTools: event.target.checked } })} /><span className="switch" aria-hidden="true" /></label>
+                <div className="settings-section-summary"><div><strong>安全与审批</strong><small>在执行前检查风险，并为自动审批选择审核模型</small></div></div>
+                {(() => {
+                  const reviewerProvider = value.providers.find((provider) => provider.id === value.reviewerProviderId) ?? value.providers[0];
+                  const reviewerModels = reviewerProvider?.models.filter((model) => model.id.trim()) ?? [];
+                  return <section className="settings-panel security-reviewer-panel">
+                    <header><strong>审批审核模型</strong><small>先选择供应商，再选择该供应商下用于“替我审批”的模型</small></header>
+                    <div className="security-reviewer-flow">
+                      <section className="security-picker-step" aria-labelledby="reviewer-provider-title">
+                        <div className="security-picker-heading"><span>01</span><div><strong id="reviewer-provider-title">选择供应商</strong><small>审核请求将使用该供应商的接口和密钥</small></div></div>
+                        <div className="security-provider-cards" role="listbox" aria-label="审核模型供应商">
+                          {value.providers.map((provider) => {
+                            const selected = provider.id === reviewerProvider?.id;
+                            return <button className={`security-provider-card ${selected ? "selected" : ""}`} type="button" role="option" aria-selected={selected} key={provider.id} onClick={() => setValue({ ...value, reviewerProviderId: provider.id, reviewerModel: provider.models.some((model) => model.id === value.reviewerModel) ? value.reviewerModel : provider.models.find((model) => model.id.trim())?.id ?? "" })}>
+                              <span className="security-provider-icon"><ServerCog size={16} /></span>
+                              <span className="security-provider-copy"><strong>{provider.name || "未命名提供商"}</strong><small>{provider.apiMode === "responses" ? "Responses" : "Chat Completions"}</small></span>
+                              <em>{provider.models.length} 个模型</em>
+                              {selected && <Check size={15} aria-label="已选择" />}
+                            </button>;
+                          })}
+                        </div>
+                      </section>
+                      <section className="security-picker-step" aria-labelledby="reviewer-model-title">
+                        <div className="security-picker-heading"><span>02</span><div><strong id="reviewer-model-title">选择模型</strong><small>{reviewerProvider ? `从「${reviewerProvider.name || "未命名提供商"}」的模型中选择` : "请先配置供应商"}</small></div></div>
+                        <div className="security-model-cards" role="listbox" aria-label="审核模型">
+                          {reviewerModels.map((model) => {
+                            const selected = model.id === value.reviewerModel;
+                            return <button className={`security-model-card ${selected ? "selected" : ""}`} type="button" role="option" aria-selected={selected} key={model.id} onClick={() => setValue({ ...value, reviewerProviderId: reviewerProvider?.id ?? value.reviewerProviderId, reviewerModel: model.id })}>
+                              <span className="security-model-icon"><Bot size={15} /></span><span className="security-model-copy"><strong>{model.id}</strong><small>{model.reasoningEfforts.length} 个思考档位可用</small></span>{selected && <Check size={15} aria-label="已选择" />}
+                            </button>;
+                          })}
+                          {!reviewerModels.length && <p className="security-picker-empty">当前供应商还没有可用模型，请先在“模型提供商”中添加。</p>}
+                        </div>
+                      </section>
+                    </div>
+                    <footer className="security-reviewer-footer"><span>当前审核模型</span><code>{value.reviewerModel || "未选择"}</code></footer>
+                  </section>;
+                })()}
                 <div className="settings-note"><ShieldCheck size={15} /><span>审核模型返回无法解析的结果或请求失败时，sshStar 会退回人工审批，不会默认放行。</span></div>
               </>
             )}
@@ -747,27 +737,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
           </div>
         </main>
 
-        {modelPickerOpen && (
-          <div className="model-picker-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setModelPickerTarget(undefined); }}>
-            <section className="model-picker" role="dialog" aria-modal="true" aria-labelledby="model-picker-title">
-              <header className="model-picker-header">
-                <div><span>模型服务</span><h3 id="model-picker-title">{modelPickerTarget === "reviewer" ? "选择审核模型" : "选择模型"}</h3><small>{models.length > 0 ? `${models.length} 个模型可用` : "从当前接口读取模型列表"}</small></div>
-                <button className="icon-button quiet" type="button" onClick={() => setModelPickerTarget(undefined)} title="关闭模型选择" aria-label="关闭模型选择"><X size={16} /></button>
-              </header>
-              <label className="model-picker-search"><Search size={14} /><input autoFocus value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="筛选模型 ID" aria-label="筛选模型 ID" /></label>
-              <div className="model-picker-list" role="listbox" aria-label="可用模型">
-                {models.filter((model) => model.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())).map((model) => (
-                  <button className={`model-picker-option ${selectedPickerModel === model ? "selected" : ""}`} type="button" role="option" aria-selected={selectedPickerModel === model} key={model} onClick={() => { setValue(modelPickerTarget === "reviewer" ? { ...value, reviewerModel: model } : { ...value, model }); setModelPickerTarget(undefined); }}>
-                    <span className="model-picker-option-icon"><Bot size={14} /></span><span>{model}</span>{selectedPickerModel === model && <Check size={14} />}
-                  </button>
-                ))}
-                {models.length === 0 && !loadingModels && <div className="model-picker-empty"><CircleAlert size={16} /><span>没有可显示的模型，请检查接口地址和密钥，或直接在文本框输入模型 ID。</span></div>}
-                {models.length > 0 && models.filter((model) => model.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())).length === 0 && <div className="model-picker-empty"><Search size={16} /><span>没有匹配的模型</span></div>}
-              </div>
-              <footer className="model-picker-footer"><span>当前选择</span><code>{selectedPickerModel || "未选择"}</code></footer>
-            </section>
-          </div>
-        )}
       </form>
     </div>
   );

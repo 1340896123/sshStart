@@ -43,7 +43,7 @@ import {
   snapshotsEqual,
   stampUnversionedSnapshot,
 } from "./cloudSyncMerge";
-import { isTauri, uid } from "./lib";
+import { connectionIdentity, isTauri, uid } from "./lib";
 import {
   isGroupWithin,
   moveGroupToPosition,
@@ -139,6 +139,7 @@ export default function App() {
   const hadStoredAiConfig = useRef(false);
   const syncHydrated = useRef(!isTauri());
   const [storageReady, setStorageReady] = useState(!isTauri());
+  const [storageError, setStorageError] = useState<string>();
   const [servers, setServers] = useState<ServerProfile[]>([]);
   const [deletedServerIds, setDeletedServerIds] = useState<string[]>([]);
   const [savedGroups, setSavedGroups] = useState<string[]>([]);
@@ -181,7 +182,7 @@ export default function App() {
   const importFileRef = useRef<HTMLInputElement>(null);
 
   const activeSession = sessions.find((session) => session.id === activeSessionId);
-  const activeServer = servers.find((server) => server.id === activeSession?.serverId);
+  const activeServer = activeSession?.server ?? servers.find((server) => server.id === activeSession?.serverId);
 
   const currentSnapshot: AppStorageSnapshot = {
     servers,
@@ -375,7 +376,7 @@ export default function App() {
       .catch((error) => {
         if (disposed) return;
         console.error("Failed to load SQLite application state", error);
-        setStorageReady(true);
+        setStorageError(String(error));
       });
     return () => {
       disposed = true;
@@ -541,7 +542,8 @@ export default function App() {
 
   const openSession = (server: ServerProfile, forceNew = false) => {
     if (!forceNew) {
-      const existing = sessions.find((session) => session.serverId === server.id);
+      const existing = sessions.find((session) => session.serverId === server.id
+        && connectionIdentity(session.server ?? server) === connectionIdentity(server));
       if (existing) {
         setActiveSessionId(existing.id);
         return;
@@ -552,6 +554,7 @@ export default function App() {
     const session: SessionState = {
       id: uid("session"),
       serverId: server.id,
+      server: structuredClone(server),
       title: count > 1 ? `${server.name} ${count}` : server.name,
       connected: false,
       terminalStarted: false,
@@ -584,10 +587,10 @@ export default function App() {
     if (isTauri()) {
       await invoke("store_server_secret", {
         serverId: nextServer.id,
-        password: nextServer.password?.trim() || null,
-        passphrase: nextServer.passphrase?.trim() || null,
-        jumpPassword: nextServer.jumpHost?.password?.trim() || null,
-        jumpPassphrase: nextServer.jumpHost?.passphrase?.trim() || null,
+        password: nextServer.password ?? null,
+        passphrase: nextServer.passphrase ?? null,
+        jumpPassword: nextServer.jumpHost?.password ?? null,
+        jumpPassphrase: nextServer.jumpHost?.passphrase ?? null,
       });
     }
     setServers((current) => {
@@ -635,6 +638,27 @@ export default function App() {
     snapshotRef.current = { ...snapshotRef.current, servers: nextServers };
     setServers(nextServers);
     markSyncChange({ serverIds: paths.keys() });
+  };
+
+  const copyServerInfo = async (server: ServerProfile) => {
+    if (!navigator.clipboard) throw new Error("当前环境不支持复制到剪贴板");
+    let info = server;
+    if (isTauri()) {
+      const secrets = await invoke<ServerSecretBundle>("load_server_secrets", { serverId: server.id });
+      info = {
+        ...server,
+        password: secrets.password ?? server.password,
+        passphrase: secrets.passphrase ?? server.passphrase,
+        jumpHost: server.jumpHost
+          ? {
+              ...server.jumpHost,
+              password: secrets.jumpPassword ?? server.jumpHost.password,
+              passphrase: secrets.jumpPassphrase ?? server.jumpHost.passphrase,
+            }
+          : server.jumpHost,
+      };
+    }
+    await navigator.clipboard.writeText(JSON.stringify(info, null, 2));
   };
 
   const copyServer = async (server: ServerProfile) => {
@@ -722,6 +746,7 @@ export default function App() {
       sessionTitle: session.title,
       serverName: server.name,
       serverHost: server.host,
+      server: structuredClone(server),
       status: "queued",
       createdAt: Date.now(),
       transferredBytes: 0,
@@ -768,9 +793,9 @@ export default function App() {
 
   const retryTransfer = async (task: TransferTask) => {
     const session = sessions.find((item) => item.id === task.sessionId);
-    const server = session
+    const server = task.server ?? session?.server ?? (session
       ? servers.find((item) => item.id === session.serverId)
-      : servers.find((item) => item.name === task.serverName && item.host === task.serverHost);
+      : servers.find((item) => item.name === task.serverName && item.host === task.serverHost));
     if (!server) {
       setTransfers((current) => current.map((item) => item.id === task.id
         ? { ...item, status: "failed", error: "找不到对应的服务器配置，请重新连接后再试。", finishedAt: Date.now() }
@@ -1172,6 +1197,21 @@ export default function App() {
     setAiPaneWidth(clampWidth(nextWidth, AI_PANE_MIN_WIDTH, Math.max(AI_PANE_MIN_WIDTH, maxWidth)));
   };
 
+  if (!storageReady) {
+    return (
+      <div className="app-shell">
+        <header className="titlebar" data-tauri-drag-region="deep">
+          <div className="brand-lockup"><span>sshStar</span></div>
+          <div className="titlebar-actions" data-tauri-drag-region="false"><WindowControls /></div>
+        </header>
+        <main className="empty-workspace" role="status">
+          <h2>{storageError ? "无法加载本地数据" : "正在加载本地数据"}</h2>
+          {storageError && <><p>{storageError}</p><button className="primary-button" onClick={() => window.location.reload()}>重试</button></>}
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="titlebar" data-tauri-drag-region="deep">
@@ -1277,6 +1317,7 @@ export default function App() {
               onNewSession={(server) => { setSelectedServerId(server.id); openSession(server, true); }}
               onAddServer={(group) => openServerDialog(undefined, group)}
               onCopyServer={(server) => { void copyServer(server); }}
+              onCopyServerInfo={copyServerInfo}
               onEditServer={(server) => openServerDialog(server)}
               onDeleteServer={(server) => deleteServer(server.id)}
               onMoveServer={moveServer}
@@ -1387,7 +1428,7 @@ export default function App() {
           ) : (
             <div className="workspace-sessions">
               {sessions.map((session) => {
-                const server = servers.find((item) => item.id === session.serverId);
+                const server = session.server ?? servers.find((item) => item.id === session.serverId);
                 if (!server) return null;
                 return (
                   <div

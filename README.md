@@ -14,7 +14,7 @@ The desktop product, window title, and executable are named `sshStar` (`sshStar.
 - OpenAI-compatible assistant with SSH command tools and visible reasoning summaries
 - Configurable AI tool catalog in settings: terminal jobs, file/SFTP, system metrics, process/network diagnostics, Docker/systemd, logs, snippets, and risk checks
 - High-risk AI command blocking; explicit `/run <command>` remains available to the operator
-- Mutating tools are opt-in, with per-tool output/timeout/round limits and an inline human approval step for high-risk actions
+- Remote command changes follow the selected approval mode; request and reviewer modes keep an inline approval step for each command
 - Secrets stored in the operating-system credential vault; all SQLite app state is encrypted at rest
 - Optional end-to-end cloud sync for server profiles, settings, and referenced SSH private keys; the cloud receives only AES-256-GCM ciphertext
 - SSH host-key verification through `~/.ssh/known_hosts`, including trust on first use

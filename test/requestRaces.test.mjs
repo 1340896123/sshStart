@@ -5,12 +5,12 @@ import React from "react";
 import renderer, { act } from "react-test-renderer";
 
 let invokeHandler;
-mock.module("@tauri-apps/api/core", { exports: { invoke: (...args) => invokeHandler(...args) } });
-mock.module("@tauri-apps/api/webview", { exports: { getCurrentWebview: () => ({
+mock.module("@tauri-apps/api/core", { namedExports: { invoke: (...args) => invokeHandler(...args) } });
+mock.module("@tauri-apps/api/webview", { namedExports: { getCurrentWebview: () => ({
   window: { scaleFactor: async () => 1, onScaleChanged: async () => () => {} }, onDragDropEvent: async () => () => {},
 }) } });
-mock.module("@tauri-apps/plugin-dialog", { exports: { open: async () => null, save: async () => null } });
-mock.module(new URL("../src/components/FileEditor.tsx", import.meta.url).href, { exports: { FileEditor: () => null } });
+mock.module("@tauri-apps/plugin-dialog", { namedExports: { open: async () => null, save: async () => null } });
+mock.module(new URL("../src/components/FileEditor.tsx", import.meta.url).href, { namedExports: { FileEditor: () => null } });
 const { FilePane } = await import("../src/components/FilePane.tsx");
 const { SystemDock } = await import("../src/components/SystemDock.tsx");
 const serverA = { id: "a", host: "a.example" };

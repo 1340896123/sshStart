@@ -3,12 +3,13 @@ use super::{
     tools::{self, AiToolSettings, ToolPermission},
     AI_RUN_CANCELLED,
 };
+use crate::command::CommandControl;
 use rig::agent::{
     AgentHook, DispatchAction, DispatchEvent, HookContext, OutcomeAction, OutcomeEvent,
     StepEventKind,
 };
 use rig::message::Message;
-use rig::tool::{ToolExecutionError, ToolResult};
+use rig::tool::{ToolErrorKind, ToolExecutionError, ToolResult};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -37,6 +38,7 @@ struct AiRuntimeInner {
 struct ActiveRun {
     cancellation: watch::Sender<bool>,
     approval_policy: watch::Sender<AiApprovalPolicy>,
+    command_control: Arc<Mutex<Option<Arc<CommandControl>>>>,
 }
 
 struct PendingApproval {
@@ -68,9 +70,17 @@ impl AiRuntimeState {
         &self,
         run_id: &str,
         policy: AiApprovalPolicy,
-    ) -> Result<(watch::Receiver<bool>, watch::Receiver<AiApprovalPolicy>), String> {
+    ) -> Result<
+        (
+            watch::Receiver<bool>,
+            watch::Receiver<AiApprovalPolicy>,
+            Arc<Mutex<Option<Arc<CommandControl>>>>,
+        ),
+        String,
+    > {
         let (cancellation, receiver) = watch::channel(false);
         let (approval_policy, policy_receiver) = watch::channel(policy);
+        let command_control = Arc::new(Mutex::new(None));
         let mut runs = self
             .inner
             .runs
@@ -84,9 +94,10 @@ impl AiRuntimeState {
             ActiveRun {
                 cancellation,
                 approval_policy,
+                command_control: command_control.clone(),
             },
         );
-        Ok((receiver, policy_receiver))
+        Ok((receiver, policy_receiver, command_control))
     }
 
     pub(super) fn set_approval_policy(
@@ -125,6 +136,25 @@ impl AiRuntimeState {
             .cancellation
             .send(true)
             .map_err(|_| "AI 运行已结束".to_string())
+    }
+
+    pub(super) fn cancel_command(&self, run_id: &str) -> Result<(), String> {
+        let runs = self
+            .inner
+            .runs
+            .lock()
+            .map_err(|_| "AI 运行状态已损坏".to_string())?;
+        let run = runs
+            .get(run_id)
+            .ok_or_else(|| "AI 运行不存在或已结束".to_string())?;
+        let command = run
+            .command_control
+            .lock()
+            .map_err(|_| "SSH 命令状态锁已损坏".to_string())?
+            .clone()
+            .ok_or_else(|| "当前没有正在执行的 SSH 命令".to_string())?;
+        command.cancel();
+        Ok(())
     }
 
     async fn request_approval(
@@ -452,6 +482,8 @@ impl RunHook {
             .unwrap_or_else(|| if result.is_error() { 1 } else { 0 });
         let status = if result.is_skipped() {
             "rejected"
+        } else if result.is_error_kind(ToolErrorKind::Cancelled) {
+            "cancelled"
         } else if result.is_error() || result.is_refused() || exit_code != 0 {
             "error"
         } else {
@@ -526,7 +558,9 @@ mod tests {
         AiAgentEvent, AiAgentEventKind, AiApprovalPolicy, AiRuntimeState, ApprovalDecision,
         AI_RUN_CANCELLED,
     };
+    use crate::command::CommandControl;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn serializes_agent_events_for_the_frontend_contract() {
@@ -537,9 +571,9 @@ mod tests {
             event: AiAgentEventKind::ApprovalRequired {
                 approval_id: "approval-1".to_string(),
                 action_id: "action-1".to_string(),
-                tool: "bash".to_string(),
+                tool: "exec_command".to_string(),
                 command: "uptime".to_string(),
-                arguments: json!({ "command": "uptime" }),
+                arguments: json!({ "cmd": "uptime" }),
                 reason: "需要审批".to_string(),
             },
         })
@@ -555,7 +589,7 @@ mod tests {
     #[test]
     fn cancels_registered_agent_runs() {
         let state = AiRuntimeState::default();
-        let (mut cancellation, _) = state.begin_run("run-1", AiApprovalPolicy::Request).unwrap();
+        let (mut cancellation, _, _) = state.begin_run("run-1", AiApprovalPolicy::Request).unwrap();
 
         state.cancel_run("run-1").unwrap();
         futures::executor::block_on(cancellation.changed()).unwrap();
@@ -565,11 +599,28 @@ mod tests {
         assert!(state.cancel_run("run-1").is_err());
     }
 
+    #[test]
+    fn cancels_active_command_without_cancelling_agent_run() {
+        let state = AiRuntimeState::default();
+        let (cancellation, _, command_slot) =
+            state.begin_run("run-1", AiApprovalPolicy::Request).unwrap();
+        let control = Arc::new(CommandControl::unlimited(1024));
+        *command_slot.lock().unwrap() = Some(control.clone());
+
+        state.cancel_command("run-1").unwrap();
+
+        assert!(!*cancellation.borrow());
+        assert!(control
+            .check(std::time::Instant::now())
+            .unwrap_err()
+            .contains("取消"));
+    }
+
     #[tokio::test]
     async fn registers_approval_before_an_immediate_reply() {
         for policy in [AiApprovalPolicy::Request, AiApprovalPolicy::Reviewer] {
             let state = AiRuntimeState::default();
-            let (cancellation, approval_policy) = state.begin_run("run-1", policy).unwrap();
+            let (cancellation, approval_policy, _) = state.begin_run("run-1", policy).unwrap();
             let result = state
                 .request_approval("approval-1".into(), cancellation, approval_policy, || {
                     state
@@ -586,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn full_access_needs_no_frontend_or_reviewer() {
         let state = AiRuntimeState::default();
-        let (cancellation, approval_policy) = state
+        let (cancellation, approval_policy, _) = state
             .begin_run("run-1", AiApprovalPolicy::FullAccess)
             .unwrap();
         let result = state
@@ -602,7 +653,7 @@ mod tests {
     #[tokio::test]
     async fn switching_to_full_access_resumes_a_waiting_approval() {
         let state = AiRuntimeState::default();
-        let (cancellation, approval_policy) = state
+        let (cancellation, approval_policy, _) = state
             .begin_run("run-1", AiApprovalPolicy::Reviewer)
             .unwrap();
         let mut request = Box::pin(state.request_approval(
@@ -615,10 +666,7 @@ mod tests {
         state
             .set_approval_policy("run-1", AiApprovalPolicy::FullAccess)
             .unwrap();
-        assert!(matches!(
-            request.await.unwrap(),
-            ApprovalDecision::Approve
-        ));
+        assert!(matches!(request.await.unwrap(), ApprovalDecision::Approve));
         assert_eq!(*approval_policy.borrow(), AiApprovalPolicy::FullAccess);
         assert!(state.inner.approvals.lock().unwrap().is_empty());
         assert!(state
@@ -632,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn switching_back_to_request_restores_approval() {
         let state = AiRuntimeState::default();
-        let (cancellation, approval_policy) = state
+        let (cancellation, approval_policy, _) = state
             .begin_run("run-1", AiApprovalPolicy::FullAccess)
             .unwrap();
         state
@@ -652,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_takes_priority_over_full_access() {
         let state = AiRuntimeState::default();
-        let (cancellation, approval_policy) = state
+        let (cancellation, approval_policy, _) = state
             .begin_run("run-1", AiApprovalPolicy::FullAccess)
             .unwrap();
         state.cancel_run("run-1").unwrap();
@@ -668,7 +716,7 @@ mod tests {
     async fn cancellation_and_dropped_futures_remove_pending_approvals() {
         for cancel in [true, false] {
             let state = AiRuntimeState::default();
-            let (cancellation, approval_policy) =
+            let (cancellation, approval_policy, _) =
                 state.begin_run("run-1", AiApprovalPolicy::Request).unwrap();
             let mut request = Box::pin(state.request_approval(
                 "approval-1".into(),

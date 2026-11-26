@@ -3274,6 +3274,7 @@ pub fn run() {
             ai::list_rig_models,
             ai::review_ai_approval,
             ai::cancel_ai_run,
+            ai::cancel_ai_command,
             ai::resolve_ai_approval,
             ai::set_ai_approval_policy,
             ai::run_ai_agent,

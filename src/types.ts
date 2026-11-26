@@ -30,6 +30,7 @@ export interface ServerProfile {
 export interface SessionState {
   id: string;
   serverId: string;
+  server?: ServerProfile;
   title: string;
   connected: boolean;
   terminalStarted: boolean;
@@ -153,6 +154,7 @@ export interface TransferProgressEvent {
 }
 
 export interface TransferTask extends TransferRequest {
+  server?: ServerProfile;
   id: string;
   transferId: string;
   sessionId: string;
@@ -254,22 +256,18 @@ export interface AiMessage {
 }
 
 export type AiToolKey =
-  | "bash";
+  | "executeCommand";
 
 export interface AiToolSettings {
-  bash: boolean;
+  executeCommand: boolean;
   maxToolRounds: number;
   maxOutputChars: number;
-  commandTimeoutSeconds: number;
-  allowMutatingTools: boolean;
 }
 
 export const DEFAULT_AI_TOOL_SETTINGS: AiToolSettings = {
-  bash: true,
+  executeCommand: true,
   maxToolRounds: 200,
   maxOutputChars: 128000,
-  commandTimeoutSeconds: 30,
-  allowMutatingTools: false,
 };
 
 export type AiApiMode = "chat-completions" | "responses";
@@ -345,6 +343,7 @@ export interface AiConfig {
   apiKey: string;
   model: string;
   reasoningEffort: AiReasoningEffort;
+  reviewerProviderId: string;
   reviewerModel: string;
   contextWindow: number;
   maxOutputTokens: number;
@@ -357,7 +356,7 @@ export interface AiConfig {
 
 export type AiConfigInput = Omit<Partial<AiConfig>, "providers" | "tools" | "serverImportExport" | "cloudSync"> & {
   providers?: Array<Omit<AiProvider, "apiKey"> & { apiKey?: string }>;
-  tools?: Partial<AiToolSettings>;
+  tools?: Partial<AiToolSettings> & { bash?: boolean };
   serverImportExport?: Partial<ServerImportExportSettings>;
   cloudSync?: Partial<CloudSyncSettings>;
 };
@@ -378,12 +377,13 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   apiKey: "",
   model: "gpt-4.1-mini",
   reasoningEffort: "auto",
+  reviewerProviderId: "default",
   reviewerModel: "",
   contextWindow: 1000000,
   maxOutputTokens: 384000,
   temperature: 0.2,
   systemPrompt:
-    "你是 sshStar 的 Rig 运维 Agent。主动完成用户任务，先观察再行动，使用唯一的 Bash 工具获取事实、读取和修改远端文件、管理服务并验证结果。Bash 命令可能修改远端状态，遵守用户限定的范围与当前会话审批策略，已有授权持续有效，不要重复请求确认。遇到可恢复的错误应自行修正并继续。不要声称读取过尚未通过 Bash 工具访问的文件，只有确实缺少必要信息或授权时才询问用户。",
+    "你是 sshStar 的 Rig 运维 Agent。主动完成用户任务，先观察再行动，使用唯一的 exec_command 工具获取事实、读取和修改远端文件、管理服务并验证结果。命令可能修改远端状态，遵守用户限定的范围与当前会话审批策略，已有授权持续有效，不要重复请求确认。遇到可恢复的错误应自行修正并继续。不要声称读取过尚未通过 exec_command 工具访问的文件，只有确实缺少必要信息或授权时才询问用户。",
   tools: DEFAULT_AI_TOOL_SETTINGS,
   serverImportExport: DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,
   cloudSync: DEFAULT_CLOUD_SYNC_SETTINGS,
@@ -421,14 +421,14 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
   const provider = providers.find((item) => item.id === (config.selectedProviderId ?? fallback.selectedProviderId)) ?? providers[0];
   const model = provider?.models.find((item) => item.id === provider.selectedModelId) ?? provider?.models[0];
   if (provider && model) provider.selectedModelId = model.id;
+  const reviewerProvider = providers.find((item) => item.id === config.reviewerProviderId) ?? provider;
   const inputTools = config.tools ?? {};
   const fallbackTools = fallback.tools;
+  const legacyTools = inputTools as Partial<AiToolSettings> & { bash?: boolean };
   const tools: AiToolSettings = {
-    bash: inputTools.bash ?? fallbackTools.bash,
+    executeCommand: inputTools.executeCommand ?? legacyTools.bash ?? fallbackTools.executeCommand,
     maxToolRounds: inputTools.maxToolRounds ?? fallbackTools.maxToolRounds,
     maxOutputChars: inputTools.maxOutputChars ?? fallbackTools.maxOutputChars,
-    commandTimeoutSeconds: inputTools.commandTimeoutSeconds ?? fallbackTools.commandTimeoutSeconds,
-    allowMutatingTools: inputTools.allowMutatingTools ?? fallbackTools.allowMutatingTools,
   };
   return {
     providers,
@@ -438,6 +438,7 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
     apiKey: provider?.apiKey ?? "",
     model: model?.id ?? "",
     reasoningEffort: model?.reasoningEffort ?? "auto",
+    reviewerProviderId: reviewerProvider?.id ?? "",
     reviewerModel: config.reviewerModel ?? fallback.reviewerModel,
     contextWindow: config.contextWindow ?? fallback.contextWindow,
     maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,

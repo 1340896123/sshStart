@@ -394,7 +394,7 @@ pub(crate) async fn run_ai_agent(
     let api_key = api_key(&config)?;
     let client = openai_client(&config, &api_key)?;
     let runtime = state.inner().clone();
-    let (cancellation, approval_policy) =
+    let (cancellation, approval_policy, command_control) =
         runtime.begin_run(&run_id, approval_policy.unwrap_or_default())?;
     let sink = EventSink::new(app, &run_id);
     sink.emit(AiAgentEventKind::RunStarted {
@@ -414,6 +414,7 @@ pub(crate) async fn run_ai_agent(
                 allow_tools,
                 conversation_id.as_deref(),
                 approval_policy.clone(),
+                command_control.clone(),
             )
             .await
         }
@@ -429,6 +430,7 @@ pub(crate) async fn run_ai_agent(
                 allow_tools,
                 conversation_id.as_deref(),
                 approval_policy,
+                command_control,
             )
             .await
         }
@@ -462,6 +464,14 @@ pub(crate) fn cancel_ai_run(
 }
 
 #[tauri::command]
+pub(crate) fn cancel_ai_command(
+    state: tauri::State<'_, AiRuntimeState>,
+    run_id: String,
+) -> Result<(), String> {
+    state.inner().cancel_command(&run_id)
+}
+
+#[tauri::command]
 pub(crate) fn set_ai_approval_policy(
     state: tauri::State<'_, AiRuntimeState>,
     run_id: String,
@@ -491,6 +501,9 @@ async fn run_with_model<M>(
     allow_tools: bool,
     conversation_id: Option<&str>,
     approval_policy: watch::Receiver<AiApprovalPolicy>,
+    command_control: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<crate::command::CommandControl>>>,
+    >,
 ) -> Result<AiRunResult, AiRunError>
 where
     M: Into<DynModel<Completion>>,
@@ -498,7 +511,7 @@ where
     let (prompt, history) = split_messages(messages).map_err(AiRunError::message)?;
     let history_len = history.len();
     let dynamic_tools = if allow_tools {
-        tools::build_dynamic_tools(server, &config.tools, cancellation.clone())
+        tools::build_dynamic_tools(server, &config.tools, cancellation.clone(), command_control)
     } else {
         Vec::new()
     };
@@ -511,7 +524,7 @@ where
     )
     .map_err(AiRunError::message)?;
     let preamble = format!(
-        "{}\n\n当前 SSH 目标为 {}@{}:{}。附件均为服务器临时文件引用；必须通过 Bash 工具实际读取后才能声称看过内容。\n{}\n审批流程以当前会话策略及运行时结果为准。使用唯一的 bash 工具完成检查、读取、编辑、服务管理和验证；Bash 命令可能修改远端状态，执行前评估风险并遵守用户限定的目标、范围和禁止事项。前文授权在同一任务内持续有效。主动完成用户请求所需的检查、实施和验证，遇到可恢复的工具错误应自行修正并继续；动作被拒绝时解释具体原因，在现有授权范围内继续其他可完成的工作。只有确实缺少必要信息或无法继续时才向用户询问。",
+        "{}\n\n当前 SSH 目标为 {}@{}:{}。附件均为服务器临时文件引用；必须通过 exec_command 工具实际读取后才能声称看过内容。\n{}\n审批流程以当前会话策略及运行时结果为准。使用唯一的 exec_command 工具完成检查、读取、编辑、服务管理和验证；命令可能修改远端状态，执行前评估风险并遵守用户限定的目标、范围和禁止事项。前文授权在同一任务内持续有效。主动完成用户请求所需的检查、实施和验证，遇到可恢复的工具错误应自行修正并继续；动作被拒绝时解释具体原因，在现有授权范围内继续其他可完成的工作。只有确实缺少必要信息或无法继续时才向用户询问。",
         config.system_prompt,
         server.username,
         server.host,
@@ -829,7 +842,8 @@ fn contains_legacy_tool_call(value: &serde_json::Value) -> bool {
 fn is_removed_ai_tool(name: &str) -> bool {
     matches!(
         name,
-        "execute_command"
+        "bash"
+            | "execute_command"
             | "run_ssh_command"
             | "background_task"
             | "pty_interaction"
@@ -998,7 +1012,7 @@ mod tests {
         assert!(super::contains_legacy_tool_call(&serde_json::json!({
             "type": "function_call", "name": "read_file"
         })));
-        assert!(!super::contains_legacy_tool_call(&serde_json::json!({
+        assert!(super::contains_legacy_tool_call(&serde_json::json!({
             "type": "function_call", "name": "bash"
         })));
     }

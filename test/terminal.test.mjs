@@ -6,15 +6,15 @@ import renderer, { act } from "react-test-renderer";
 
 const listeners = new Map();
 const starts = [];
-mock.module("@tauri-apps/api/core", { exports: { invoke: (name) => name === "start_terminal" ? new Promise(resolve => starts.push(resolve)) : Promise.resolve() } });
-mock.module("@tauri-apps/api/event", { exports: { listen: async (name, handler) => { listeners.set(name, handler); return () => listeners.delete(name); } } });
-mock.module("@xterm/xterm", { exports: { Terminal: class {
+mock.module("@tauri-apps/api/core", { namedExports: { invoke: (name) => name === "start_terminal" ? new Promise(resolve => starts.push(resolve)) : Promise.resolve() } });
+mock.module("@tauri-apps/api/event", { namedExports: { listen: async (name, handler) => { listeners.set(name, handler); return () => listeners.delete(name); } } });
+mock.module("@xterm/xterm", { namedExports: { Terminal: class {
   cols = 80; rows = 24;
   loadAddon() {} open() {} write() {} writeln() {} dispose() {}
   onData() { return { dispose() {} }; }
 } } });
-mock.module("@xterm/addon-fit", { exports: { FitAddon: class { fit() {} } } });
-mock.module(new URL("../src/diagnostics.ts", import.meta.url).href, { exports: { diagnosticLog() {}, diagnosticError() {} } });
+mock.module("@xterm/addon-fit", { namedExports: { FitAddon: class { fit() {} } } });
+mock.module(new URL("../src/diagnostics.ts", import.meta.url).href, { namedExports: { diagnosticLog() {}, diagnosticError() {} } });
 const { TerminalPane } = await import("../src/components/TerminalPane.tsx");
 
 test("terminal closure before startup completes and late closure from a prior connection cannot mark the wrong generation connected", async t => {

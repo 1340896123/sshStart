@@ -83,7 +83,7 @@ flowchart LR
 - `model`：模型 ID。
 - `contextWindow`、`maxOutputTokens`、`temperature`：推理资源控制。
 - `autoCompress`：上下文超限前是否调用模型生成交接摘要。
-- `tools`：工具开关、最大轮数、输出上限、命令超时和变更权限。
+- `tools`：工具开关、最大轮数和输出上限；远端命令执行时长不设自动上限。
 
 Rust 使用枚举统一两种 API 模式：
 
@@ -312,7 +312,7 @@ const response = await invoke<AiResponse>("ai_chat", { config, server, messages,
 
 | 分类 | 工具 | 执行目标 | 可能产生副作用 |
 |---|---|---|---|
-| 远端 Bash | `bash` | 当前 SSH 服务器上的 `bash -lc` | 始终按变更型处理 |
+| 远端命令 | `exec_command` | 当前 SSH 服务器的默认 shell | 始终按变更型处理 |
 
 工具开关来自 [`src/types.ts`](../src/types.ts)，UI 配置来自 [`src/components/SettingsDialog.tsx`](../src/components/SettingsDialog.tsx)。
 
@@ -340,22 +340,22 @@ fn ai_function_tool(name: &str, description: &str, properties: Value, required: 
 
 源码：[`src-tauri/src/lib.rs:3829`](../src-tauri/src/lib.rs#L3829)
 
-`tool_definitions` 只在 Bash 开关启用时暴露一个 `bash` schema。因此工具开关不仅影响 UI，也影响模型能否看到工具 schema。
+`tool_definitions` 只在命令执行开关启用时暴露一个 `exec_command` schema。因此工具开关不仅影响 UI，也影响模型能否看到工具 schema。
 
 ```json
 {
-  "command": "必填的 Bash 命令或多行脚本",
+  "cmd": "必填的远端命令或多行脚本",
   "stdin": "可选标准输入"
 }
 ```
 
 ### 6.4 工具执行分派
 
-`execute_tool` 只处理 `bash`。所有读取、诊断、编辑、进程、Docker、systemd 和日志操作都由模型生成的 Bash 脚本完成；应用自身的 SFTP 和文件编辑能力仍供界面功能使用。
+`execute_tool` 只处理 `exec_command`。所有读取、诊断、编辑、进程、Docker、systemd 和日志操作都由模型生成的远端命令完成；应用自身的 SFTP 和文件编辑能力仍供界面功能使用。
 
 ```rust
 async fn execute_tool(...) -> Result<AiToolExecution, String> {
-    let command = required_ai_arg(arguments, "command")?.to_string();
+    let command = required_ai_arg(arguments, "cmd")?.to_string();
     let stdin = optional_ai_string(arguments, "stdin")?;
     let result = run_ai_command(server, command.clone(), stdin, settings).await?;
     Ok(AiToolExecution { display_command: command, result })
@@ -364,10 +364,9 @@ async fn execute_tool(...) -> Result<AiToolExecution, String> {
 
 源码：[`src-tauri/src/lib.rs:4224`](../src-tauri/src/lib.rs#L4224)
 
-所有 AI Bash 命令都会经过超时包装，并放入阻塞线程执行，避免阻塞 Tauri async runtime。命令通过 `bash -lc` 执行，远端缺少 Bash 时返回退出码 `127`。可选 stdin 通过 SSH channel 写入并在执行前发送 EOF：
+所有 AI 远端命令都会放入阻塞线程执行，避免阻塞 Tauri async runtime。命令不会被自动超时关闭；用户可单独停止当前命令，工具错误会返回给 Agent 继续后续任务。可选 stdin 通过 SSH channel 写入并在执行前发送 EOF：
 
 ```rust
-let command = bounded_ai_command(&command, settings.command_timeout_seconds);
 tauri::async_runtime::spawn_blocking(move || {
     command::run_with_stdin(&server, &command, stdin.as_deref(), &control)
 }).await?
@@ -395,7 +394,7 @@ sequenceDiagram
         alt 没有工具调用
             Agent-->>UI: AiResponse
         else 存在工具调用
-            Agent->>Policy: 校验启用状态、变更权限、风险、路径
+            Agent->>Policy: 校验启用状态、审批策略、风险、路径
             alt 高风险
                 Policy-->>UI: AiResponse(approval)
                 UI->>Agent: approve_ai_tool
@@ -417,7 +416,7 @@ sequenceDiagram
 1. 拼接流式 `function.arguments`。
 2. 使用 `serde_json` 解析为 JSON。
 3. 再次确认工具在设置中启用。
-4. 判断是否为变更型工具，以及用户是否允许变更。
+4. 判断是否为变更型工具，并按当前审批策略决定是否请求审批。
 5. 将工具参数还原为可供风险分析的命令。
 6. 命中高危规则时返回审批对象。
 7. 否则执行并生成标准化 `AiToolResult`。
@@ -468,21 +467,20 @@ Responses 模式还会保存原始 `response.output_item`，在下一轮请求�
 | 层级 | 控制 | 目的 |
 |---|---|---|
 | 暴露层 | `autoExecute` 关闭时不向模型发送任何工具 | 彻底关闭 Agent 执行能力 |
-| 工具层 | Bash 开关 | 控制模型是否能看到远端执行能力 |
-| 变更层 | `allowMutatingTools` | 控制所有可能产生副作用的工具 |
+| 工具层 | 命令执行开关 | 控制模型是否能看到远端执行能力 |
 | 参数层 | 必填字段、枚举、PID、端口、服务名校验 | 限制无效或异常输入 |
-| 命令层 | `bash -lc`、`shell_quote`、stdin 上限 | 统一解释器并限制输入 |
+| 命令层 | SSH 原生命令、stdin 上限 | 直接执行模型命令并限制输入 |
 | 风险层 | `risk_reasons` 静态规则 | 识别删除、格式化、关机、防火墙等高风险动作 |
 | 审批层 | 前端批准后调用 `approve_ai_tool` | 人在回路 |
 | 路径层 | 阻止写入 `/etc`、`/boot`、`/usr` 等路径 | 保护关键系统目录 |
-| 资源层 | 命令超时、工具轮数、输出和上下文预算 | 防止失控、阻塞和上下文膨胀 |
+| 资源层 | 工具轮数、输出和上下文预算；命令可单独取消 | 防止失控、阻塞和上下文膨胀 |
 | 凭据层 | OS Keyring | 避免密钥长期保存在 WebView |
 
 ### 8.2 变更型工具判断
 
 ```rust
 fn ai_tool_is_mutating(name: &str, _arguments: &Value) -> bool {
-    name == "bash"
+    name == "exec_command"
 }
 ```
 
@@ -498,7 +496,7 @@ fn ai_tool_is_mutating(name: &str, _arguments: &Value) -> bool {
 - 已完成工具调用列表；
 - token usage。
 
-前端只在内存 Map 中暂存审批参数。用户批准后调用 `approve_ai_tool`，后端会再次检查工具启用状态、变更权限和受保护路径，然后执行。
+前端只在内存 Map 中暂存审批参数。用户批准后调用 `approve_ai_tool`，后端会再次检查工具启用状态和受保护路径，然后执行。
 
 审批后端：[`src-tauri/src/lib.rs:4535`](../src-tauri/src/lib.rs#L4535)<br>
 审批前端：[`src/components/AiPane.tsx:607`](../src/components/AiPane.tsx#L607)
@@ -523,7 +521,7 @@ fn ai_tool_is_mutating(name: &str, _arguments: &Value) -> bool {
 
 ### 9.3 附件处理
 
-附件不会作为视觉输入直接发送给模型。前端将图片或大文本通过 Tauri/SFTP 上传到远端临时目录，消息中只注入远端路径、类型和大小。模型通过 `bash` 读取这些路径。
+附件不会作为视觉输入直接发送给模型。前端将图片或大文本通过 Tauri/SFTP 上传到远端临时目录，消息中只注入远端路径、类型和大小。模型通过 `exec_command` 读取这些路径。
 
 这是一种 **文件引用式上下文**，优点是避免大文件直接占用模型上下文；限制是当前并没有真正的多模态图像上传协议，模型也不能仅凭路径看到图片。
 
@@ -565,7 +563,6 @@ fn ai_tool_is_mutating(name: &str, _arguments: &Value) -> bool {
 
 | 优先级 | 问题 | 影响 | 建议 |
 |---|---|---|---|
-| 高 | 前端 `DEFAULT_AI_TOOL_SETTINGS.allowMutatingTools` 为 `true`，Rust `Default` 为 `false` | “变更能力默认关闭”的安全语义在前后端不一致；新用户实际走前端默认值 | 统一为 `false`，增加配置迁移和端到端测试 |
 | 中 | 人工批准后只执行 `approve_ai_tool`，不会自动把结果回灌原 Agent 循环 | 用户能看到执行结果，但模型不会自动基于结果生成最终结论 | 将 pending call 持久化为可恢复 Agent state，批准后继续下一轮模型请求 |
 | 中 | 工具目录静态编译，无 MCP 或插件注册表 | 接入新工具必须修改 Rust、重新编译和发布 | 抽象 `ToolProvider`，增加 MCP Provider 和动态工具发现 |
 | 中 | 高危检测基于字符串模式 | 容易出现编码、Shell 变体、间接命令和脚本包装造成的漏报 | 对结构化工具采用动作级风险元数据；任意 Shell 引入策略引擎或更严格审批 |
@@ -699,4 +696,4 @@ sshStar 已经具备一个完整的本地 Agent 骨架：
 | 5 分钟 | 当前限制与 MCP 演进方案 |
 | 2 分钟 | 总结与问答引导 |
 
-建议演示路径：模型请求系统状态 → `bash` 执行诊断脚本 → 工具状态流式展示 → 工具结果回灌 → 最终分析；随后演示一个命中风险规则的 Bash 命令及人工审批流程。
+建议演示路径：模型请求系统状态 → `exec_command` 执行诊断脚本 → 工具状态流式展示 → 工具结果回灌 → 最终分析；随后演示一个命中风险规则的远端命令及人工审批流程。

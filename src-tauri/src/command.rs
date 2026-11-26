@@ -67,9 +67,10 @@ impl Drop for CommandRegistration {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CommandControl {
     cancelled: AtomicBool,
-    timeout: Duration,
+    timeout: Option<Duration>,
     max_bytes: usize,
 }
 
@@ -77,18 +78,28 @@ impl CommandControl {
     pub(crate) fn new(timeout: Duration, max_bytes: usize) -> Self {
         Self {
             cancelled: AtomicBool::new(false),
-            timeout,
+            timeout: Some(timeout),
+            max_bytes,
+        }
+    }
+    pub(crate) fn unlimited(max_bytes: usize) -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            timeout: None,
             max_bytes,
         }
     }
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
-    fn check(&self, started: Instant) -> Result<(), String> {
+    pub(crate) fn check(&self, started: Instant) -> Result<(), String> {
         if self.cancelled.load(Ordering::Relaxed) {
             return Err("命令已取消".into());
         }
-        if started.elapsed() >= self.timeout {
+        if self
+            .timeout
+            .is_some_and(|timeout| started.elapsed() >= timeout)
+        {
             return Err("命令执行超时，已关闭 SSH 命令通道".into());
         }
         Ok(())
@@ -97,7 +108,7 @@ impl CommandControl {
 
 impl Default for CommandControl {
     fn default() -> Self {
-        Self::new(Duration::from_secs(60), 8 * 1024 * 1024)
+        Self::unlimited(8 * 1024 * 1024)
     }
 }
 
@@ -325,6 +336,14 @@ mod tests {
             .unwrap_err()
             .contains("取消")
         );
+    }
+
+    #[test]
+    fn default_command_control_has_no_execution_timeout() {
+        let control = CommandControl::default();
+        assert!(control
+            .check(Instant::now() - Duration::from_secs(24 * 60 * 60))
+            .is_ok());
     }
 
     #[test]

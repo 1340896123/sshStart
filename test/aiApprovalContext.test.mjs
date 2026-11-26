@@ -7,9 +7,9 @@ test("reviewing a continuation retains the original authorization and execution 
     { role: "user", content: "部署 /srv/app，允许更新配置并重启服务" },
     {
       role: "assistant", content: "配置已更新",
-      approval: { tool: "bash", command: "printf updated > /srv/app/config" },
+      approval: { tool: "exec_command", command: "printf updated > /srv/app/config" },
       approvalState: "approved", approvalNote: "你已批准",
-      toolCalls: [{ tool: "bash", command: "printf updated > /srv/app/config", status: "completed", exitCode: 0, output: "private log contents" }],
+      toolCalls: [{ tool: "exec_command", command: "printf updated > /srv/app/config", status: "completed", exitCode: 0, output: "private log contents" }],
     },
     { role: "user", content: "继续" },
   ]));

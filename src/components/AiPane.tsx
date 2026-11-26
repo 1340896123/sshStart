@@ -19,10 +19,12 @@ import {
   ChevronRight,
   CircleGauge,
   CircleStop,
+  CornerUpLeft,
   Copy,
   FileText,
   History,
   ImageIcon,
+  ListPlus,
   MessageSquarePlus,
   Play,
   Plus,
@@ -30,6 +32,7 @@ import {
   ShieldCheck,
   Settings2,
   Sparkles,
+  Square,
   TerminalSquare,
   X,
 } from "lucide-react";
@@ -40,7 +43,7 @@ import {
   upsertAiConversation,
   type AiConversation,
 } from "../aiHistory";
-import { useAiAgent } from "../ai/useAiAgent";
+import { useAiAgent, type AiSendMode } from "../ai/useAiAgent";
 import { formatBytes, isTauri, uid } from "../lib";
 import type {
   AiActionStatus,
@@ -110,7 +113,7 @@ type AiTimelineItem =
 
 const STARTERS = ["检查磁盘与内存使用", "查看最近的错误日志", "分析当前目录的部署结构"];
 const TOOL_LABELS: Record<string, string> = {
-  bash: "Bash",
+  exec_command: "命令执行",
 };
 const ACTION_STATUS_LABELS: Record<AiActionStatus, string> = {
   started: "开始",
@@ -126,10 +129,9 @@ const MESSAGE_TYPE_LABELS: Record<AiMessageType, string> = {
   approval: "审批",
   error: "错误消息",
 };
-type AiPermissionMode = AiApprovalPolicy | "chat-only";
+type AiPermissionMode = AiApprovalPolicy;
 
 const PERMISSION_META: Record<AiPermissionMode, { label: string; description: string }> = {
-  "chat-only": { label: "仅对话", description: "只回答问题，不调用服务器工具" },
   request: { label: "请求批准", description: "高风险或变更型工具调用等待你确认" },
   reviewer: { label: "替我审批", description: "由设置中的审核模型逐次批准或拒绝" },
   "full-access": { label: "完全访问", description: "直接执行已启用工具，无需审批，并允许任务所需变更" },
@@ -240,7 +242,7 @@ function CopyAction({ text, label, className }: { text: string; label: string; c
   );
 }
 
-function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
+function ToolCallCard({ toolCall, onStop }: { toolCall: AiToolResult; onStop?: () => void }) {
   const running = toolCall.status === "started" || toolCall.status === "running";
   const [expanded, setExpanded] = useState(running);
   const contentId = useId();
@@ -277,6 +279,17 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
             {ACTION_STATUS_LABELS[toolCall.status]}
           </span>
         </button>
+        {onStop && (
+          <button
+            className="copy-action tool-call-stop"
+            type="button"
+            title="停止命令"
+            aria-label="停止命令"
+            onClick={onStop}
+          >
+            <CircleStop size={12} />
+          </button>
+        )}
         <CopyAction className="tool-call-copy" label="复制命令" text={toolCall.command} />
       </div>
       <div className="tool-call-body" id={contentId} aria-hidden={!expanded}>
@@ -294,7 +307,7 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
             : running
               ? <pre>助手正在执行…</pre>
               : stopped
-                ? <pre>工具调用已拒绝</pre>
+                ? <pre>{toolCall.status === "cancelled" ? "命令已停止，助手将继续处理" : "工具调用已拒绝"}</pre>
                 : failed
                   ? <pre>工具执行失败</pre>
                   : null}
@@ -306,9 +319,9 @@ function ToolCallCard({ toolCall }: { toolCall: AiToolResult }) {
 
 export function AiPane({ session, server, config, hidden = false, onUpdate, onModelSettingsChange, onOpenSettings, onClose }: Props) {
   const [drafts, setDrafts] = useState<Record<string, AiComposerDraft>>({});
-  const [allowTools, setAllowTools] = useState(true);
   const [thinkingOpen, setThinkingOpen] = useState<Record<string, boolean>>({});
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [sendMode, setSendMode] = useState<AiSendMode>("queue");
   const [conversations, setConversations] = useState<AiConversation[]>(readAiConversations);
   const [activeConversationId, setActiveConversationId] = useState<string>();
   const draftKey = activeConversationId ?? NEW_CONVERSATION_DRAFT;
@@ -361,7 +374,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
   };
 
   const approvalPolicy = session.approvalPolicy ?? "request";
-  const permissionMode: AiPermissionMode = allowTools ? approvalPolicy : "chat-only";
+  const permissionMode: AiPermissionMode = approvalPolicy;
   const agent = useAiAgent({
     config,
     server,
@@ -558,7 +571,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
   };
 
   const startNewConversation = () => {
-    agent.cancelRetry();
+    agent.clearQueue();
     if (agent.running) void agent.cancel();
     activeConversationIdRef.current = undefined;
     setActiveConversationId(undefined);
@@ -576,7 +589,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
       focusComposer();
       return;
     }
-    agent.cancelRetry();
+    agent.clearQueue();
     if (agent.running) void agent.cancel();
     activeConversationIdRef.current = conversation.id;
     setActiveConversationId(conversation.id);
@@ -597,7 +610,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
       return next;
     });
     if (activeConversationIdRef.current === conversationId) {
-      agent.cancelRetry();
+      agent.clearQueue();
       if (agent.running) void agent.cancel();
       activeConversationIdRef.current = undefined;
       setActiveConversationId(undefined);
@@ -624,8 +637,7 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
     focusComposer();
   };
 
-  const send = async (starter?: string) => {
-    if (agent.running) return;
+  const send = (starter?: string, mode: AiSendMode = sendMode) => {
     if (attachments.some((attachment) => attachment.status !== "ready")) return;
     const content = (starter ?? input).trim();
     const readyAttachments = attachments
@@ -644,8 +656,12 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
     setInput("");
     setAttachments([]);
     setPasteNotice(undefined);
-    await agent.start({ content, attachments: readyAttachments, allowTools });
+    agent.submit({ content, attachments: readyAttachments, allowTools: true }, mode);
   };
+  const hasDraft = Boolean(input.trim() || attachments.length);
+  const sendLabel = agent.running || agent.pendingMessages.length
+    ? sendMode === "queue" ? "加入队列" : "立即纠正"
+    : "发送";
 
   return (
     <aside id={`ai-pane-${session.id}`} className="ai-pane" hidden={hidden} aria-label="AI 助手">
@@ -797,7 +813,15 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
                     </div>
                   );
                 }
-                return <ToolCallCard toolCall={item.toolCall} key={item.toolCall.id} />;
+                return (
+                  <ToolCallCard
+                    toolCall={item.toolCall}
+                    key={item.toolCall.id}
+                    onStop={isStreaming && (item.toolCall.status === "started" || item.toolCall.status === "running")
+                      ? () => void agent.cancelCommand()
+                      : undefined}
+                  />
+                );
               })}
               {message.role === "assistant"
                 && !message.content
@@ -884,8 +908,45 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
       </div>
 
       <div className="ai-composer-wrap">
+        {agent.pendingMessages.length > 0 && (
+          <section className="ai-pending-queue" aria-label="待发送消息队列">
+            <header>
+              <span role="status" aria-live="polite" aria-atomic="true">
+                <ListPlus size={13} aria-hidden="true" />
+                {agent.queuePaused ? "队列已暂停" : "待发送"} · {agent.pendingMessages.length}
+              </span>
+              {agent.queuePaused && !agent.running && (
+                <button type="button" onClick={agent.resumeQueue}><Play size={12} aria-hidden="true" />继续队列</button>
+              )}
+            </header>
+            <ol>
+              {agent.pendingMessages.map((pending) => (
+                <li key={pending.id}>
+                  <div className="ai-pending-copy" title={`${pending.content}\n${pending.attachments.map((attachment) => attachment.name).join(" · ")}\n${pending.config.model} · ${pending.config.reasoningEffort}`}>
+                    <strong>{pending.mode === "steer" && <span>纠正 · </span>}{pending.content || pending.attachments.map((attachment) => attachment.name).join("、")}</strong>
+                    <small>{pending.config.model}{pending.attachments.length > 0 ? ` · ${pending.attachments.length} 个附件` : ""}</small>
+                  </div>
+                  <button type="button" title="立即纠正" aria-label={`立即纠正：${pending.content || "附件消息"}`} disabled={agent.stopping}
+                    onClick={() => agent.steerPending(pending.id)}><CornerUpLeft size={13} aria-hidden="true" /></button>
+                  <button type="button" title="移除待发送消息" aria-label={`移除待发送消息：${pending.content || "附件消息"}`}
+                    onClick={() => agent.removePending(pending.id)}><X size={13} aria-hidden="true" /></button>
+                </li>
+              ))}
+            </ol>
+          </section>
+        )}
         <div className="composer-meta">
-          <p className="composer-hint" id={`ai-composer-hint-${session.id}`}>Enter 发送 · Shift + Enter 换行</p>
+          <label className="approval-policy-control" data-policy={permissionMode} title={PERMISSION_META[permissionMode].description}>
+            <ShieldCheck size={11} aria-hidden="true" />
+            <select aria-label="助手权限" value={permissionMode} disabled={agent.running}
+              onChange={(event) => onUpdate({ approvalPolicy: event.target.value as AiPermissionMode })}>
+              <option value="request">请求批准</option>
+              <option value="reviewer" disabled={!config.reviewerModel.trim()}>替我审批</option>
+              <option value="full-access">完全访问</option>
+            </select>
+            <ChevronDown size={10} aria-hidden="true" />
+          </label>
+          <p className="composer-hint" id={`ai-composer-hint-${session.id}`}>Enter {agent.running ? sendMode === "queue" ? "排队" : "纠正" : "发送"} · Shift + Enter 换行</p>
           <div className="token-usage-control">
             <button
               className={`token-usage-button ${tokenUsage.available ? "has-data" : ""}`}
@@ -969,7 +1030,6 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
             ref={inputRef}
             rows={2}
             value={input}
-            disabled={agent.running}
             aria-label="给 AI 助手发送消息"
             aria-describedby={`ai-composer-hint-${session.id}`}
             onChange={(event) => {
@@ -980,10 +1040,10 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
                 event.preventDefault();
-                void send();
+                send(undefined, event.altKey ? "steer" : sendMode);
               }
             }}
-            placeholder="询问任何问题，或描述一个任务…"
+            placeholder={agent.running ? "补充消息，排队发送或纠正当前任务…" : "询问任何问题，或描述一个任务…"}
           />
           <div className="composer-footer">
             <input
@@ -994,7 +1054,6 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
               multiple
               tabIndex={-1}
               aria-label="选择图片附件"
-              disabled={agent.running}
               onChange={(event) => {
                 const files = Array.from(event.currentTarget.files ?? []).filter((file) => file.type.startsWith("image/"));
                 if (files.length) void addPastedAttachments(files);
@@ -1006,49 +1065,37 @@ export function AiPane({ session, server, config, hidden = false, onUpdate, onMo
               type="button"
               title="添加图片"
               aria-label="添加图片"
-              disabled={agent.running || attachments.length >= MAX_PASTED_ATTACHMENTS}
+              disabled={attachments.length >= MAX_PASTED_ATTACHMENTS}
               onClick={() => attachmentInputRef.current?.click()}
             ><Plus size={18} aria-hidden="true" /></button>
-            <label
-              className="approval-policy-control"
-              data-policy={permissionMode}
-              title={PERMISSION_META[permissionMode].description}
-            >
-              <ShieldCheck size={11} aria-hidden="true" />
-              <select
-                aria-label="助手权限"
-                value={permissionMode}
-                disabled={agent.running && !allowTools}
-                onChange={(event) => {
-                  const mode = event.target.value as AiPermissionMode;
-                  setAllowTools(mode !== "chat-only");
-                  if (mode !== "chat-only") onUpdate({ approvalPolicy: mode });
-                }}
-              >
-                <option value="chat-only" disabled={agent.running}>仅对话</option>
-                <option value="request">请求批准</option>
-                <option value="reviewer" disabled={!config.reviewerModel.trim()}>替我审批</option>
-                <option value="full-access">完全访问</option>
-              </select>
-              <ChevronDown size={10} aria-hidden="true" />
-            </label>
-            <AiModelControls config={config} disabled={agent.running} onChange={onModelSettingsChange} />
-            {agent.running ? (
-              <button className="send-button stop" title={agent.stopping ? "正在停止助手" : "停止助手"} aria-label="停止助手" disabled={agent.stopping} onClick={() => void agent.cancel()}>
-                <CircleStop size={15} />
-              </button>
-            ) : (
-              <button
+            <AiModelControls config={config} disabled={false} onChange={onModelSettingsChange} />
+            <div className="composer-send-actions">
+              <label className="composer-send-mode" title={sendMode === "queue" ? "当前任务完成后按顺序发送" : "停止当前回复，优先处理新消息；也可按 Alt + Enter"}>
+                <span className="sr-only">发送方式</span>
+                <select aria-label="发送方式" value={sendMode} onChange={(event) => setSendMode(event.target.value as AiSendMode)}>
+                  <option value="queue">队列</option>
+                  <option value="steer">纠正</option>
+                </select>
+                <ChevronDown size={10} aria-hidden="true" />
+              </label>
+              {agent.running && (
+                <button className="send-button stop" title={agent.stopping ? "正在停止助手" : "停止助手并暂停队列"} aria-label="停止助手" disabled={agent.stopping} onClick={() => void agent.cancel()}>
+                  <Square size={12} fill="currentColor" aria-hidden="true" />
+                </button>
+              )}
+              {(!agent.running || hasDraft) && <button
                 className="send-button"
-                title="发送"
-                aria-label="发送"
+                title={sendLabel}
+                aria-label={sendLabel}
                 disabled={attachments.some((attachment) => attachment.status !== "ready")
-                  || (!input.trim() && attachments.length === 0)}
+                  || !hasDraft}
                 onClick={() => void send()}
               >
-                <ArrowUp size={18} />
-              </button>
-            )}
+                {agent.running && sendMode === "queue" ? <ListPlus size={18} aria-hidden="true" />
+                  : agent.running && sendMode === "steer" ? <CornerUpLeft size={18} aria-hidden="true" />
+                  : <ArrowUp size={18} aria-hidden="true" />}
+              </button>}
+            </div>
           </div>
         </div>
         {pasteNotice && <p className="composer-notice" role="status">{pasteNotice}</p>}

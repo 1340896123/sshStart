@@ -17,6 +17,7 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [popoverPosition, setPopoverPosition] = useState<CSSProperties>({});
   const popoverId = useId();
+  const effortLabel = AI_REASONING_EFFORT_OPTIONS.find((option) => option.value === config.reasoningEffort)?.label ?? "自动";
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -29,10 +30,10 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
       const bounds = composer.getBoundingClientRect();
       const topEdge = Math.max(8, pane.getBoundingClientRect().top + 8);
       // Keep the input exposed when a usable picker fits above the composer.
-      const anchor = bounds.top - topEdge - 8 >= 180 ? bounds : trigger.getBoundingClientRect();
+      const anchor = bounds.top - topEdge - 8 >= 280 ? bounds : trigger.getBoundingClientRect();
       const above = Math.max(0, anchor.top - topEdge - 8);
       const below = Math.max(0, window.innerHeight - anchor.bottom - 8);
-      const showAbove = above >= 180 || above >= below;
+      const showAbove = above >= 280 || above >= below;
       const width = Math.min(bounds.width, window.innerWidth - 16);
       setPopoverPosition({
         left: Math.max(8, Math.min(bounds.left, window.innerWidth - width - 8)),
@@ -55,7 +56,7 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
     };
   }, [open]);
 
-  useEffect(() => { setOpen(false); }, [disabled, config.selectedProviderId]);
+  useEffect(() => { setOpen(false); }, [disabled]);
 
   useEffect(() => {
     if (!open) return;
@@ -82,25 +83,17 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
   const choose = (model: string) => {
     if (disabled || !model.trim()) return;
     onChange({ model: model.trim() });
-    setOpen(false);
-    triggerRef.current?.focus();
   };
 
   return (
-    <div className="ai-model-controls" ref={controlRef}>
-      <label className="composer-effort-control composer-provider-control" title={provider?.name}>
-        <span className="sr-only">模型提供商</span>
-        <select aria-label="模型提供商" value={config.selectedProviderId} disabled={disabled}
-          onChange={(event) => onChange({ providerId: event.target.value })}>
-          {config.providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-        </select>
-        <ChevronDown size={10} aria-hidden="true" />
-      </label>
+    <div className="ai-model-controls" ref={controlRef} onBlur={(event) => {
+      if (event.relatedTarget instanceof Node && !event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+    }}>
       <button
         className="composer-model-trigger"
         type="button"
         ref={triggerRef}
-        title={`选择模型：${config.model}`}
+        title={`${provider?.name ?? ""} · ${config.model} · 思考强度：${effortLabel}`}
         aria-label={`选择模型：${config.model}`}
         aria-haspopup="dialog"
         aria-expanded={open}
@@ -109,30 +102,31 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
         onClick={() => { setOpen((value) => !value); setQuery(""); }}
       >
         <span>{config.model || "选择模型"}</span>
+        <small>{effortLabel}</small>
         <ChevronDown size={11} aria-hidden="true" />
       </button>
-      <label className="composer-effort-control" title="思考强度；自动使用模型默认值，其他档位需模型支持">
-        <span className="sr-only">思考强度</span>
-        <select
-          aria-label="思考强度"
-          value={config.reasoningEffort}
-          disabled={disabled}
-          onChange={(event) => onChange({ reasoningEffort: event.target.value as AiReasoningEffort })}
-        >
-          {AI_REASONING_EFFORT_OPTIONS.filter((option) => modelConfig?.reasoningEfforts.includes(option.value)).map((option) => (
-            <option key={option.value} value={option.value}>{option.value === "auto" ? "思考 · 自动" : `思考 · ${option.label}`}</option>
-          ))}
-        </select>
-        <ChevronDown size={10} aria-hidden="true" />
-      </label>
       {open && (
         <section className="composer-model-popover" style={popoverPosition} id={popoverId} role="dialog" aria-label="选择对话模型">
           <header>
-            <strong>选择模型</strong>
+            <strong>模型与思考强度</strong>
+            <button className="composer-picker-done" type="button" onClick={() => { setOpen(false); triggerRef.current?.focus(); }}>完成</button>
           </header>
+          <label className="composer-picker-setting composer-provider-control">
+            <span>提供商</span>
+            <select aria-label="模型提供商" value={config.selectedProviderId} disabled={disabled}
+              onChange={(event) => { onChange({ providerId: event.target.value }); setQuery(""); }}>
+              {config.providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+            </select>
+          </label>
           <form className="composer-model-search" onSubmit={(event) => { event.preventDefault(); if (filtered.length === 1) choose(filtered[0]); }}>
             <Search size={14} aria-hidden="true" />
-            <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索模型 ID" placeholder="搜索已配置的模型" />
+            <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索模型 ID" placeholder="搜索已配置的模型"
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  controlRef.current?.querySelector<HTMLButtonElement>(".composer-model-option")?.focus();
+                }
+              }} />
           </form>
           <div className="composer-model-list" aria-label="可用模型">
             {filtered.map((model) => (
@@ -142,6 +136,15 @@ export function AiModelControls({ config, disabled, onChange }: Props) {
               </button>
             ))}
           </div>
+          <label className="composer-picker-setting composer-effort-control">
+            <span>思考强度</span>
+            <select aria-label="思考强度" value={config.reasoningEffort} disabled={disabled || !modelConfig}
+              onChange={(event) => onChange({ reasoningEffort: event.target.value as AiReasoningEffort })}>
+              {AI_REASONING_EFFORT_OPTIONS.filter((option) => modelConfig?.reasoningEfforts.includes(option.value)).map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </label>
           <p className="composer-model-note" role="status">{filtered.length ? `${provider?.name} · ${available.length} 个已配置模型` : "没有匹配的模型，可在设置中添加。"}</p>
         </section>
       )}

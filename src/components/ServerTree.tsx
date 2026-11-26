@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsUp,
+  ClipboardCopy,
   Copy,
   Download,
   Folder,
@@ -56,6 +57,7 @@ interface Props {
   onNewSession: (server: ServerProfile) => void;
   onAddServer: (group?: string) => void;
   onCopyServer: (server: ServerProfile) => void;
+  onCopyServerInfo: (server: ServerProfile) => Promise<void>;
   onEditServer: (server: ServerProfile) => void;
   onDeleteServer: (server: ServerProfile) => void;
   onMoveServer: (
@@ -185,6 +187,7 @@ export function ServerTree({
   onNewSession,
   onAddServer,
   onCopyServer,
+  onCopyServerInfo,
   onEditServer,
   onDeleteServer,
   onMoveServer,
@@ -203,6 +206,7 @@ export function ServerTree({
   const itemRefs = useRef(new Map<string, HTMLDivElement>());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set(initialCollapsedGroups));
   const [contextMenu, setContextMenu] = useState<ContextMenu>();
+  const [copyInfoStatus, setCopyInfoStatus] = useState("");
   const [groupEditor, setGroupEditor] = useState<GroupEditor>();
   const [groupError, setGroupError] = useState("");
   const [pendingGroupDelete, setPendingGroupDelete] = useState<{ group: string; serverCount: number }>();
@@ -237,6 +241,12 @@ export function ServerTree({
   useEffect(() => {
     setCollapsedGroups(new Set(initialCollapsedGroups));
   }, [initialCollapsedGroups]);
+
+  useEffect(() => {
+    if (!copyInfoStatus) return;
+    const timer = window.setTimeout(() => setCopyInfoStatus(""), 4000);
+    return () => window.clearTimeout(timer);
+  }, [copyInfoStatus]);
 
   useEffect(() => {
     if (!focusedKey || !visibleKeys.includes(focusedKey)) setFocusedKey(visibleKeys[0]);
@@ -404,6 +414,17 @@ export function ServerTree({
     });
     setGroupEditor(undefined);
     setGroupError("");
+  };
+
+  const copyServerInfo = async (server: ServerProfile) => {
+    setContextMenu(undefined);
+    setCopyInfoStatus("");
+    try {
+      await onCopyServerInfo(server);
+      setCopyInfoStatus("连接信息已复制（JSON）");
+    } catch {
+      setCopyInfoStatus("复制信息失败，请重试");
+    }
   };
 
   const confirmDeleteServer = (server: ServerProfile) => {
@@ -765,11 +786,11 @@ export function ServerTree({
       </label>
 
       <div className="tree-toolbar">
-        <span>{draggedItem
+        <span role="status">{copyInfoStatus || (draggedItem
           ? draggedItem.kind === "group"
             ? "边缘排序 · 中部嵌套"
             : "拖到服务器间排序 · 拖到分组内移动"
-          : `${visibleServerCount} 台服务器 · ${visibleGroups.length} 个分组`}</span>
+          : `${visibleServerCount} 台服务器 · ${visibleGroups.length} 个分组`)}</span>
         <button
           className="tree-tool-button"
           title={allGroupsCollapsed ? "全部展开" : "全部折叠"}
@@ -854,6 +875,13 @@ export function ServerTree({
               </button>
               <button role="menuitem" onClick={() => { onCopyServer(contextMenu.server); setContextMenu(undefined); }}>
                 <Copy size={14} /><span>复制</span>
+              </button>
+              <button
+                role="menuitem"
+                title="以 JSON 格式复制连接信息（包含已保存的凭据）"
+                onClick={() => { void copyServerInfo(contextMenu.server); }}
+              >
+                <ClipboardCopy size={14} aria-hidden="true" /><span>复制信息</span>
               </button>
               <div className="context-submenu">
                 <button role="menuitem" aria-haspopup="menu">

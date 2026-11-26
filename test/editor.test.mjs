@@ -9,7 +9,7 @@ registerHooks({ resolve(specifier, context, next) {
   return next(context.parentURL?.startsWith(sourceRoot) && specifier.startsWith(".") && !/\.[a-z]+$/i.test(specifier) ? `${specifier}.ts` : specifier, context);
 } });
 let invokeHandler;
-mock.module("@tauri-apps/api/core", { exports: { invoke: (...args) => invokeHandler(...args) } });
+mock.module("@tauri-apps/api/core", { namedExports: { invoke: (...args) => invokeHandler(...args) } });
 const { useRemoteFileEditor } = await import("../src/useRemoteFileEditor.ts");
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 

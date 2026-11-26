@@ -33,12 +33,18 @@ async function setup(t, initialPolicy, onInvoke = () => undefined, initialMessag
   const run = deferred();
   const runs = [run];
   let agent, messages, root, runPromise, runId, replaceMessages;
+  let activeRun = run;
   let sequence = 0;
-  const config = { tools: { allowMutatingTools: false } };
+  const config = { tools: {}, providers: [], selectedProviderId: "default" };
   invokeHandler = (command, args) => {
     calls.push({ command, args });
-    if (command === "run_ai_agent") { runId = args.runId; return runs.at(-1).promise; }
-    if (command === "cancel_ai_run") { runs.at(-1).reject("AI 运行已取消"); return Promise.resolve(); }
+    if (command === "run_ai_agent") { runId = args.runId; activeRun = runs.at(-1); return activeRun.promise; }
+    if (command === "cancel_ai_run") {
+      const result = onInvoke(command, args);
+      if (result !== undefined) return result;
+      activeRun.reject("AI 运行已取消");
+      return Promise.resolve();
+    }
     return Promise.resolve(onInvoke(command, args));
   };
   function Harness({ policy }) {
@@ -72,8 +78,8 @@ async function setup(t, initialPolicy, onInvoke = () => undefined, initialMessag
 }
 
 const approval = {
-  type: "approval_required", approvalId: "approval-1", actionId: "action-1", tool: "bash",
-  command: "systemctl restart app", arguments: { command: "systemctl restart app" }, reason: "Bash 变更状态",
+  type: "approval_required", approvalId: "approval-1", actionId: "action-1", tool: "exec_command",
+  command: "systemctl restart app", arguments: { cmd: "systemctl restart app" }, reason: "命令执行工具变更状态",
 };
 
 test("manual approval sends only the pending approval ID and decision, never executable arguments", async t => {
@@ -93,7 +99,7 @@ test("full access is sent to the backend without frontend auto-approval", async 
   await harness.emit(started);
   assert.equal(harness.latest().toolCalls[0].status, "running");
   assert.ok(!harness.calls.some(({ command }) => ["review_ai_approval", "resolve_ai_approval"].includes(command)));
-  assert.equal(harness.config.tools.allowMutatingTools, false);
+  assert.equal(Object.hasOwn(harness.config.tools, "allowMutatingTools"), false);
 });
 
 test("a late reviewer rejection cannot override switching to full access", async (t) => {
@@ -170,7 +176,7 @@ test("a provider without usage does not appear to have reported zero tokens", as
 test("completed transcripts survive persistence and are sent on the next turn", async (t) => {
   const harness = await setup(t, "request");
   const modelMessages = [
-    { role: "assistant", content: [{ id: "call-1", function: { name: "bash", arguments: { command: "cat /etc/app" } } }] },
+    { role: "assistant", content: [{ id: "call-1", function: { name: "exec_command", arguments: { cmd: "cat /etc/app" } } }] },
     { role: "user", content: [{ type: "toolresult", id: "call-1", content: [{ type: "text", text: "配置" }] }] },
     { role: "assistant", content: [{ text: "完成" }] },
   ];
@@ -273,11 +279,11 @@ test("failed requests resume from the saved model transcript instead of replayin
     allowTools: true,
   });
   const modelMessages = [
-    { role: "assistant", content: [{ id: "call-1", function: { name: "bash", arguments: { command: "systemctl status app" } } }] },
+    { role: "assistant", content: [{ id: "call-1", function: { name: "exec_command", arguments: { cmd: "systemctl status app" } } }] },
     { role: "user", content: [{ type: "toolresult", id: "call-1", content: [{ type: "text", text: "服务已停止" }] }] },
   ];
   const assistantId = harness.latest().id;
-  await harness.emit({ type: "tool_started", actionId: "call-1", tool: "bash", command: "systemctl status app", arguments: { command: "systemctl status app" }, startedAt: 1 });
+  await harness.emit({ type: "tool_started", actionId: "call-1", tool: "exec_command", command: "systemctl status app", arguments: { cmd: "systemctl status app" }, startedAt: 1 });
   await harness.emit({ type: "run_failed", error: "连接中断", modelMessages });
   await act(async () => { harness.run.reject("IPC channel closed"); });
   const second = harness.nextRun();
@@ -363,4 +369,159 @@ test("a user stop never schedules a retry even when the backend reports a differ
   await act(async () => { t.mock.timers.tick(30_000); });
   assert.equal(harness.agent().retry, undefined);
   assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 1);
+});
+
+test("submissions default to FIFO queueing and retain attachments, settings, and completed context", async (t) => {
+  const h = await setup(t, "request");
+  const attachment = { id: "queued-image", name: "state.png", kind: "image", remotePath: "/tmp/state.png" };
+  await act(async () => {
+    h.agent().submit({ content: "第二条", attachments: [attachment], allowTools: true, config: { ...h.config, model: "model-a", reasoningEffort: "high" } });
+    h.agent().submit({ content: "第三条", attachments: [], allowTools: false, config: { ...h.config, model: "model-b", reasoningEffort: "low" } });
+  });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  assert.equal(h.calls.filter(call => call.command === "cancel_ai_run").length, 0);
+  assert.deepEqual(h.agent().pendingMessages.map(message => message.content), ["第二条", "第三条"]);
+  const second = h.nextRun();
+  await h.finish({ content: "第一轮完成", usage });
+  let args = h.calls.filter(call => call.command === "run_ai_agent").at(-1).args;
+  assert.equal(args.messages.at(-1).content, "第二条");
+  assert.equal(args.messages.at(-2).content, "第一轮完成");
+  assert.equal(args.messages.at(-1).attachments[0].remotePath, "/tmp/state.png");
+  assert.equal(args.config.model, "model-a");
+  assert.equal(args.config.reasoningEffort, "high");
+  const third = h.nextRun();
+  await act(async () => { second.resolve({ content: "第二轮完成", usage }); });
+  args = h.calls.filter(call => call.command === "run_ai_agent").at(-1).args;
+  assert.equal(args.messages.at(-1).content, "第三条");
+  assert.equal(args.config.model, "model-b");
+  assert.equal(args.allowTools, false);
+  assert.equal(h.agent().pendingMessages.length, 0);
+  await act(async () => { third.resolve({ content: "第三轮完成", usage }); });
+});
+
+test("steering waits for cancellation to settle and runs before the remaining queue with tool facts", async (t) => {
+  const cancelled = deferred();
+  const h = await setup(t, "request", command => command === "cancel_ai_run" ? cancelled.promise : undefined);
+  await h.emit({ type: "text_delta", delta: "已经检查服务" });
+  await h.emit({ type: "tool_finished", actionId: "tool-1", tool: "exec_command", command: "systemctl status app", output: "active", status: "completed", exitCode: 0, startedAt: 1, completedAt: 2 });
+  await act(async () => {
+    h.agent().submit({ content: "稍后检查日志", attachments: [], allowTools: true });
+    h.agent().submit({ content: "先检查数据库", attachments: [], allowTools: true }, "steer");
+  });
+  assert.equal(h.agent().stopping, true);
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  await act(async () => { cancelled.resolve(); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  const correction = h.nextRun();
+  // A successful response racing with stop must still remain cancelled.
+  await h.finish({ content: "late success", usage });
+  const args = h.calls.filter(call => call.command === "run_ai_agent").at(-1).args;
+  assert.equal(args.messages.at(-1).content, "先检查数据库");
+  assert.match(args.messages.at(-2).content, /已经检查服务/);
+  assert.match(args.messages.at(-2).content, /systemctl status app\n状态：completed\nactive/);
+  assert.equal(h.messages()[1].status, "cancelled");
+  assert.deepEqual(h.agent().pendingMessages.map(message => message.content), ["稍后检查日志"]);
+  const queued = h.nextRun();
+  await act(async () => { correction.resolve({ content: "已检查数据库", usage }); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "稍后检查日志");
+  await act(async () => { queued.resolve({ content: "完成", usage }); });
+});
+
+test("manual stop pauses pending messages until resumed, and removing a message prevents execution", async (t) => {
+  const h = await setup(t, "request");
+  await act(async () => {
+    h.agent().submit({ content: "保留", attachments: [], allowTools: true });
+    h.agent().submit({ content: "移除", attachments: [], allowTools: true });
+  });
+  await act(async () => { await h.agent().cancel(); });
+  assert.equal(h.agent().queuePaused, true);
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  await act(async () => { h.agent().removePending(h.agent().pendingMessages[1].id); });
+  const next = h.nextRun();
+  await act(async () => { h.agent().resumeQueue(); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "保留");
+  await act(async () => { next.resolve({ content: "完成", usage }); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 2);
+});
+
+test("promoting a queued message steers exactly once without duplicating it", async (t) => {
+  const h = await setup(t, "request");
+  await act(async () => {
+    h.agent().submit({ content: "排队 A", attachments: [], allowTools: true });
+    h.agent().submit({ content: "优先 B", attachments: [], allowTools: true });
+  });
+  const next = h.nextRun();
+  await act(async () => { h.agent().steerPending(h.agent().pendingMessages[1].id); });
+  assert.equal(h.calls.filter(call => call.command === "cancel_ai_run").length, 1);
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "优先 B");
+  assert.deepEqual(h.agent().pendingMessages.map(message => message.content), ["排队 A"]);
+  await act(async () => { h.agent().clearQueue(); next.resolve({ content: "完成", usage }); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 2);
+});
+
+test("failures retry the current turn before draining queued messages", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const h = await setup(t, "request");
+  await act(async () => { h.agent().submit({ content: "下一项", attachments: [], allowTools: true }); });
+  await act(async () => { h.run.reject("连接超时"); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  const retry = h.nextRun();
+  await act(async () => { t.mock.timers.tick(5_000); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "部署应用并重启服务");
+  const queued = h.nextRun();
+  await act(async () => { retry.resolve({ content: "成功", usage }); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "下一项");
+  await act(async () => { queued.resolve({ content: "完成", usage }); });
+});
+
+test("clearing a conversation and unmounting never start pending work", async (t) => {
+  const h = await setup(t, "request");
+  await act(async () => {
+    h.agent().submit({ content: "旧会话的任务", attachments: [], allowTools: true });
+    h.agent().clearQueue();
+  });
+  await h.replaceMessages([]);
+  await h.finish({ content: "旧回复", usage });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  assert.deepEqual(h.messages(), []);
+  const next = h.nextRun();
+  await act(async () => {
+    h.agent().submit({ content: "新会话", attachments: [], allowTools: true });
+    h.agent().submit({ content: "待发送", attachments: [], allowTools: true });
+  });
+  await h.unmount();
+  await act(async () => { next.resolve({ content: "late", usage }); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 2);
+});
+
+test("queueing during a retry countdown keeps the failed turn ahead of new work", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const h = await setup(t, "request");
+  await act(async () => { h.run.reject("连接中断"); });
+  await act(async () => { h.agent().submit({ content: "等待当前任务", attachments: [], allowTools: true }); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  assert.equal(h.agent().retry.seconds, 5);
+  const retry = h.nextRun();
+  await act(async () => { t.mock.timers.tick(5_000); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "部署应用并重启服务");
+  const queued = h.nextRun();
+  await act(async () => { retry.resolve({ content: "已恢复", usage }); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "等待当前任务");
+  await act(async () => { queued.resolve({ content: "完成", usage }); });
+});
+
+test("cancelling a retry pauses its queue and settings are captured when submitted", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const h = await setup(t, "request");
+  await act(async () => { h.run.reject("连接中断"); });
+  h.config.model = "original-model";
+  await act(async () => { h.agent().submit({ content: "排队任务", attachments: [], allowTools: true }); });
+  h.config.model = "new-model";
+  await act(async () => { h.agent().cancelRetry(); t.mock.timers.tick(30_000); });
+  assert.equal(h.agent().queuePaused, true);
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  const queued = h.nextRun();
+  await act(async () => { h.agent().resumeQueue(); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.config.model, "original-model");
+  await act(async () => { queued.resolve({ content: "完成", usage }); });
 });

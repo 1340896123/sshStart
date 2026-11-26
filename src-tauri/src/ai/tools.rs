@@ -1,38 +1,37 @@
-use super::super::{risk_reasons, shell_quote, CommandResult, ServerProfile};
+use super::super::{risk_reasons, CommandResult, ServerProfile};
 use super::policy::AiApprovalPolicy;
+use crate::command::CommandControl;
 use rig::message::ToolName;
 use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 
-const MAX_BASH_STDIN_BYTES: usize = 256 * 1024;
+const MAX_EXEC_STDIN_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AiToolSettings {
     #[serde(skip)]
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
-    #[serde(default = "default_true")]
-    pub(super) bash: bool,
+    #[serde(default = "default_true", alias = "bash")]
+    pub(super) execute_command: bool,
     #[serde(default = "default_tool_rounds")]
     pub(super) max_tool_rounds: u32,
     #[serde(default = "default_tool_output_chars")]
     pub(super) max_output_chars: usize,
-    #[serde(default = "default_command_timeout_seconds")]
-    pub(super) command_timeout_seconds: u32,
-    #[serde(default)]
-    pub(super) allow_mutating_tools: bool,
+    #[serde(skip)]
+    pub(super) command_control: Option<Arc<Mutex<Option<Arc<CommandControl>>>>>,
 }
 
 impl Default for AiToolSettings {
     fn default() -> Self {
         Self {
             cancellation: None,
-            bash: true,
+            execute_command: true,
             max_tool_rounds: default_tool_rounds(),
             max_output_chars: default_tool_output_chars(),
-            command_timeout_seconds: default_command_timeout_seconds(),
-            allow_mutating_tools: false,
+            command_control: None,
         }
     }
 }
@@ -49,12 +48,8 @@ fn default_tool_output_chars() -> usize {
     128_000
 }
 
-fn default_command_timeout_seconds() -> u32 {
-    30
-}
-
 fn ai_tool_enabled(settings: &AiToolSettings, name: &str) -> bool {
-    name == "bash" && settings.bash
+    name == "exec_command" && settings.execute_command
 }
 
 fn ai_function_tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -74,17 +69,17 @@ fn ai_function_tool(name: &str, description: &str, properties: Value, required: 
 }
 
 fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
-    if !ai_tool_enabled(settings, "bash") {
+    if !ai_tool_enabled(settings, "exec_command") {
         return Vec::new();
     }
     vec![ai_function_tool(
-        "bash",
-        "在当前 SSH 服务器上使用 Bash 执行命令或多行脚本。命令可能读取或修改远端状态，执行前必须考虑风险。可选 stdin 会作为脚本的标准输入传入。",
+        "exec_command",
+        "在当前 SSH 服务器上执行命令，返回 stdout、stderr 和退出码。命令可能读取或修改远端状态，执行前必须考虑风险。可选 stdin 会作为命令的标准输入传入。",
         json!({
-            "command": { "type": "string", "description": "要通过 bash -lc 执行的完整命令或多行脚本" },
+            "cmd": { "type": "string", "description": "要执行的完整远端命令或多行脚本" },
             "stdin": { "type": "string", "description": "可选的标准输入内容，适合一次性交互或输入重定向" }
         }),
-        &["command"],
+        &["cmd"],
     )]
 }
 
@@ -109,14 +104,6 @@ fn optional_ai_string(arguments: &Value, key: &str) -> Result<Option<String>, St
         .ok_or_else(|| format!("工具参数 {key} 必须是字符串"))
 }
 
-fn bounded_ai_command(command: &str, timeout_seconds: u32) -> String {
-    let timeout_seconds = timeout_seconds.max(5);
-    let quoted = shell_quote(command);
-    format!(
-        "if ! command -v bash >/dev/null 2>&1; then printf '%s\\n' 'sshStar AI requires bash on the remote host' >&2; exit 127; fi; if command -v timeout >/dev/null 2>&1; then timeout --kill-after=5s --signal=TERM {timeout_seconds}s bash -lc {quoted}; else bash -lc {quoted}; fi"
-    )
-}
-
 async fn run_ai_command(
     server: &ServerProfile,
     command: String,
@@ -133,23 +120,36 @@ async fn run_ai_command(
     }
     if stdin
         .as_deref()
-        .is_some_and(|value| value.len() > MAX_BASH_STDIN_BYTES)
+        .is_some_and(|value| value.len() > MAX_EXEC_STDIN_BYTES)
     {
-        return Err(format!("Bash stdin 超过 {} 字节限制", MAX_BASH_STDIN_BYTES));
+        return Err(format!("命令 stdin 超过 {} 字节限制", MAX_EXEC_STDIN_BYTES));
     }
     let server = server.clone();
-    let command = bounded_ai_command(&command, settings.command_timeout_seconds);
     let stdin = stdin.map(String::into_bytes);
-    let control = std::sync::Arc::new(CommandControl::new(
-        std::time::Duration::from_secs(u64::from(settings.command_timeout_seconds.clamp(5, 3600))),
+    let control = std::sync::Arc::new(CommandControl::unlimited(
         settings
             .max_output_chars
             .clamp(1024, 2_000_000)
             .saturating_mul(4),
     ));
+    let active_command_guard = if let Some(slot) = settings.command_control.clone() {
+        {
+            let mut active = slot
+                .lock()
+                .map_err(|_| "SSH 命令状态锁已损坏".to_string())?;
+            *active = Some(control.clone());
+        }
+        Some(ActiveCommandGuard {
+            slot,
+            control: control.clone(),
+        })
+    } else {
+        None
+    };
     let guard = CancelOnDrop(control.clone());
+    let task_control = control.clone();
     let task = tauri::async_runtime::spawn_blocking(move || {
-        command::run_with_stdin(&server, &command, stdin.as_deref(), &control)
+        command::run_with_stdin(&server, &command, stdin.as_deref(), &task_control)
     });
     let result = if let Some(mut cancellation) = settings.cancellation.clone() {
         tokio::select! {
@@ -161,7 +161,27 @@ async fn run_ai_command(
             .map_err(|error| format!("AI 工具任务失败: {error}"))?
     };
     drop(guard);
+    drop(active_command_guard);
     result
+}
+
+struct ActiveCommandGuard {
+    slot: Arc<Mutex<Option<Arc<CommandControl>>>>,
+    control: Arc<CommandControl>,
+}
+
+impl Drop for ActiveCommandGuard {
+    fn drop(&mut self) {
+        let Ok(mut active) = self.slot.lock() else {
+            return;
+        };
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.control))
+        {
+            *active = None;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -176,10 +196,10 @@ async fn execute_tool(
     server: &ServerProfile,
     settings: &AiToolSettings,
 ) -> Result<AiToolExecution, String> {
-    if name != "bash" {
+    if name != "exec_command" {
         return Err(format!("未知 AI 工具 {name}"));
     }
-    let command = required_ai_arg(arguments, "command")?.to_string();
+    let command = required_ai_arg(arguments, "cmd")?.to_string();
     let stdin = optional_ai_string(arguments, "stdin")?;
     let result = run_ai_command(server, command.clone(), stdin, settings).await?;
     Ok(AiToolExecution {
@@ -192,9 +212,11 @@ pub(super) fn build_dynamic_tools(
     server: &ServerProfile,
     settings: &AiToolSettings,
     cancellation: tokio::sync::watch::Receiver<bool>,
+    command_control: Arc<Mutex<Option<Arc<CommandControl>>>>,
 ) -> Vec<DynamicTool> {
     let mut settings = settings.clone();
     settings.cancellation = Some(cancellation);
+    settings.command_control = Some(command_control);
     tool_definitions(&settings)
         .into_iter()
         .filter_map(|definition| {
@@ -216,7 +238,13 @@ pub(super) fn build_dynamic_tools(
                     Box::pin(async move {
                         let execution = execute_tool(&tool_name, &arguments, &server, &settings)
                             .await
-                            .map_err(ToolExecutionError::provider)?;
+                            .map_err(|error| {
+                                if error == "命令已取消" {
+                                    ToolExecutionError::cancelled(error)
+                                } else {
+                                    ToolExecutionError::provider(error)
+                                }
+                            })?;
                         let output = bounded_tool_output(
                             format!("{}{}", execution.result.stdout, execution.result.stderr),
                             settings.max_output_chars,
@@ -252,9 +280,6 @@ pub(super) fn tool_permission(
     if policy == AiApprovalPolicy::FullAccess {
         return ToolPermission::Allow;
     }
-    if ai_tool_is_mutating(name, arguments) && !settings.allow_mutating_tools {
-        return ToolPermission::Deny("设置已禁止变更型工具");
-    }
     match approval_reason(name, arguments) {
         Some(reason) => ToolPermission::Ask(reason),
         None => ToolPermission::Allow,
@@ -268,21 +293,24 @@ pub(super) fn approval_reason(name: &str, arguments: &Value) -> Option<String> {
     let command = ai_tool_command_for_risk(name, arguments);
     let reasons = command.as_deref().map(risk_reasons).unwrap_or_default();
     if reasons.is_empty() {
-        Some("Bash 工具可修改远端状态，需要按当前策略审批".to_string())
+        Some("命令执行工具可修改远端状态，需要按当前策略审批".to_string())
     } else {
-        Some(format!("Bash 工具可修改远端状态；{}", reasons.join("；")))
+        Some(format!(
+            "命令执行工具可修改远端状态；{}",
+            reasons.join("；")
+        ))
     }
 }
 
 pub(super) fn ai_tool_is_mutating(name: &str, _arguments: &Value) -> bool {
-    name == "bash"
+    name == "exec_command"
 }
 
 pub(super) fn ai_tool_command_for_risk(name: &str, arguments: &Value) -> Option<String> {
-    (name == "bash")
+    (name == "exec_command")
         .then(|| {
             arguments
-                .get("command")
+                .get("cmd")
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
@@ -307,14 +335,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_definitions_expose_only_bash_with_optional_stdin() {
+    fn tool_definitions_expose_only_exec_command_with_optional_stdin() {
         let definitions = tool_definitions(&AiToolSettings::default());
         assert_eq!(definitions.len(), 1);
         let function = &definitions[0]["function"];
-        assert_eq!(function["name"], "bash");
-        assert_eq!(function["parameters"]["required"], json!(["command"]));
+        assert_eq!(function["name"], "exec_command");
+        assert_eq!(function["parameters"]["required"], json!(["cmd"]));
         assert_eq!(
-            function["parameters"]["properties"]["command"]["type"],
+            function["parameters"]["properties"]["cmd"]["type"],
             "string"
         );
         assert_eq!(
@@ -324,47 +352,60 @@ mod tests {
     }
 
     #[test]
-    fn bash_wrapper_uses_bash_and_rejects_missing_interpreter() {
-        let wrapped = bounded_ai_command("printf hello", 30);
-        assert!(wrapped.contains("command -v bash"));
-        assert!(wrapped.contains("bash -lc"));
-        assert!(wrapped.contains("exit 127"));
-        assert!(!wrapped.contains(" sh -lc "));
-    }
-
-    #[test]
-    fn bash_is_a_mutating_tool_with_risk_details() {
+    fn exec_command_is_always_available_for_approval_with_risk_details() {
         let settings = AiToolSettings::default();
-        let arguments = json!({"command": "rm -rf /"});
-        assert!(matches!(
-            tool_permission(&settings, AiApprovalPolicy::Request, "bash", &arguments),
-            ToolPermission::Deny(_)
-        ));
-        let mut settings = settings;
-        settings.allow_mutating_tools = true;
-        let ToolPermission::Ask(reason) =
-            tool_permission(&settings, AiApprovalPolicy::Reviewer, "bash", &arguments)
-        else {
-            panic!("bash should require approval");
+        let arguments = json!({"cmd": "rm -rf /"});
+        let ToolPermission::Ask(reason) = tool_permission(
+            &settings,
+            AiApprovalPolicy::Request,
+            "exec_command",
+            &arguments,
+        ) else {
+            panic!("exec_command should require approval");
         };
         assert!(reason.contains("递归删除"));
+        assert!(matches!(
+            tool_permission(
+                &AiToolSettings::default(),
+                AiApprovalPolicy::Reviewer,
+                "exec_command",
+                &arguments,
+            ),
+            ToolPermission::Ask(_)
+        ));
         assert_eq!(
-            tool_permission(&settings, AiApprovalPolicy::FullAccess, "bash", &arguments),
+            tool_permission(
+                &AiToolSettings::default(),
+                AiApprovalPolicy::FullAccess,
+                "exec_command",
+                &arguments
+            ),
             ToolPermission::Allow
         );
     }
 
     #[test]
-    fn disabled_bash_is_not_exposed_or_authorized() {
+    fn disabled_exec_command_is_not_exposed_or_authorized() {
         let settings = AiToolSettings {
-            bash: false,
+            execute_command: false,
             ..Default::default()
         };
         assert!(tool_definitions(&settings).is_empty());
         assert!(matches!(
-            tool_permission(&settings, AiApprovalPolicy::FullAccess, "bash", &json!({})),
+            tool_permission(
+                &settings,
+                AiApprovalPolicy::FullAccess,
+                "exec_command",
+                &json!({}),
+            ),
             ToolPermission::Deny(_)
         ));
+    }
+
+    #[test]
+    fn legacy_bash_setting_migrates_to_exec_command() {
+        let settings: AiToolSettings = serde_json::from_value(json!({"bash": false})).unwrap();
+        assert!(!settings.execute_command);
     }
 
     #[tokio::test]
@@ -374,10 +415,10 @@ mod tests {
         }))
         .unwrap();
         let result = execute_tool(
-            "bash",
+            "exec_command",
             &json!({
-                "command": "cat",
-                "stdin": "x".repeat(MAX_BASH_STDIN_BYTES + 1)
+                "cmd": "cat",
+                "stdin": "x".repeat(MAX_EXEC_STDIN_BYTES + 1)
             }),
             &server,
             &AiToolSettings::default(),
