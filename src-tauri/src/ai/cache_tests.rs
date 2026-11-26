@@ -26,13 +26,13 @@ fn restores_tool_calls_results_and_reasoning_without_rewriting_the_prefix() {
             AssistantContent::reasoning("check uptime"),
             AssistantContent::tool_call(
                 "call-1",
-                ToolName::new("read_file").unwrap(),
-                json!({"path": "/proc/uptime"}),
+                ToolName::new("bash").unwrap(),
+                json!({"command": "cat /proc/uptime"}),
             ),
         ])),
         Message::tool_result(
             CallId::from_wire("call-1"),
-            ToolName::new("read_file").unwrap(),
+            ToolName::new("bash").unwrap(),
             "123.45",
         ),
         Message::assistant("running"),
@@ -750,7 +750,7 @@ fn restores_041_tool_history_with_distinct_provider_call_ids() {
     let legacy = json!([
         {"role": "assistant", "id": "reply-1", "content": [
             {"id": "rs-1", "content": [{"type": "text", "content": {"text": "inspect uptime"}}]},
-            {"id": "fc-1", "call_id": "call-1", "function": {"name": "read_file", "arguments": {"path": "/proc/uptime"}}}
+                    {"id": "fc-1", "call_id": "call-1", "function": {"name": "bash", "arguments": {"command": "cat /proc/uptime"}}}
         ]},
         {"role": "user", "content": [{"type": "toolresult", "id": "fc-1", "call_id": "call-1", "content": [{"type": "text", "text": "123.45"}]}]},
         {"role": "assistant", "id": "reply-2", "content": [{"text": "running"}]}
@@ -775,6 +775,6 @@ fn restores_041_tool_history_with_distinct_provider_call_ids() {
     };
     assert!(
         matches!(&content[0], rig::message::UserContent::ToolResult(result)
-        if result.call == call.id && result.name == "read_file")
+        if result.call == call.id && result.name == "bash")
     );
 }

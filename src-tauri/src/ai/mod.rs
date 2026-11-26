@@ -493,7 +493,7 @@ where
         !dynamic_tools.is_empty(),
     )?;
     let preamble = format!(
-        "{}\n\n当前 SSH 目标为 {}@{}:{}。附件均为服务器临时文件引用；必须实际调用工具读取后才能声称看过内容。\n{}\n审批流程以当前会话策略及运行时结果为准。遵守用户限定的目标、范围和禁止事项，前文授权在同一任务内持续有效。risk_checker 只提供参考提示，不代表拒绝执行，也不是每次调用工具前的必经步骤。主动完成用户请求所需的检查、实施和验证，遇到可恢复的工具错误应自行修正并继续；动作被拒绝时解释具体原因，在现有授权范围内继续其他可完成的工作。只有确实缺少必要信息或无法继续时才向用户询问。",
+        "{}\n\n当前 SSH 目标为 {}@{}:{}。附件均为服务器临时文件引用；必须通过 Bash 工具实际读取后才能声称看过内容。\n{}\n审批流程以当前会话策略及运行时结果为准。使用唯一的 bash 工具完成检查、读取、编辑、服务管理和验证；Bash 命令可能修改远端状态，执行前评估风险并遵守用户限定的目标、范围和禁止事项。前文授权在同一任务内持续有效。主动完成用户请求所需的检查、实施和验证，遇到可恢复的工具错误应自行修正并继续；动作被拒绝时解释具体原因，在现有授权范围内继续其他可完成的工作。只有确实缺少必要信息或无法继续时才向用户询问。",
         config.system_prompt,
         server.username,
         server.host,
@@ -674,7 +674,11 @@ fn split_messages(messages: Vec<AiInputMessage>) -> Result<(Message, Vec<Message
 }
 
 fn restored_model_messages(message: &AiInputMessage) -> Option<Vec<Message>> {
-    let messages = compat::restore_messages(message.model_messages.clone()?)?;
+    let raw = message.model_messages.clone()?;
+    if contains_legacy_tool_call(&raw) {
+        return None;
+    }
+    let messages = compat::restore_messages(raw)?;
     // Older conversations have no transcript. Ignore corrupt/stale data and
     // never restore system instructions from saved assistant content.
     if !matches!(messages.first(), Some(Message::Assistant(_)))
@@ -686,6 +690,55 @@ fn restored_model_messages(message: &AiInputMessage) -> Option<Vec<Message>> {
         return None;
     }
     Some(messages)
+}
+
+fn contains_legacy_tool_call(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(contains_legacy_tool_call),
+        serde_json::Value::Object(object) => {
+            let legacy_function = object
+                .get("function")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_removed_ai_tool);
+            let legacy_response_call = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "function_call")
+                && object
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_removed_ai_tool);
+            legacy_function
+                || legacy_response_call
+                || object.values().any(contains_legacy_tool_call)
+        }
+        _ => false,
+    }
+}
+
+fn is_removed_ai_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "execute_command"
+            | "run_ssh_command"
+            | "background_task"
+            | "pty_interaction"
+            | "read_file"
+            | "write_file"
+            | "sftp_upload"
+            | "sftp_download"
+            | "list_directory"
+            | "get_system_metrics"
+            | "process_manager"
+            | "network_checker"
+            | "docker_manager"
+            | "systemd_control"
+            | "risk_checker"
+            | "snippet_library"
+            | "log_analyzer"
+    )
 }
 
 fn openai_client(config: &AiConfig, api_key: &str) -> Result<openai::OpenAI, String> {
@@ -830,5 +883,15 @@ mod tests {
         let error = parse_approval_review("{\"decision\":\"maybe\",\"reason\":\"无法确定\"}")
             .expect_err("unknown decision should fail");
         assert_eq!(error, "审批审核模型返回了未知决定");
+    }
+
+    #[test]
+    fn rejects_transcripts_for_removed_tools() {
+        assert!(super::contains_legacy_tool_call(&serde_json::json!({
+            "type": "function_call", "name": "read_file"
+        })));
+        assert!(!super::contains_legacy_tool_call(&serde_json::json!({
+            "type": "function_call", "name": "bash"
+        })));
     }
 }

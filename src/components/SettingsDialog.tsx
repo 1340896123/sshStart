@@ -1,30 +1,24 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  Activity,
   Bot,
   Check,
   CircleAlert,
   Cloud,
-  Container,
   Download,
   Eye,
   EyeOff,
-  FileCode2,
   FilePenLine,
   FolderTree,
-  Gauge,
   KeyRound,
   ListTree,
   LogIn,
   LogOut,
   MessageSquare,
-  Network,
   Play,
   RefreshCw,
   Save,
   Search,
-  ScrollText,
   ServerCog,
   ShieldCheck,
   SlidersHorizontal,
@@ -74,52 +68,16 @@ const TOOL_GROUPS: Array<{
   tools: Array<{ key: AiToolKey; label: string; description: string; icon: typeof SquareTerminal; write?: boolean }>;
 }> = [
   {
-    title: "终端与命令",
-    description: "让助手读取状态、执行命令和处理交互提示。",
+    title: "Bash 终端",
+    description: "让助手在当前 SSH 服务器上通过 Bash 执行命令和多行脚本。",
     icon: SquareTerminal,
     tools: [
-      { key: "executeCommand", label: "单条命令", description: "执行 Shell 并返回 stdout、stderr 和退出码。", icon: Play },
-      { key: "backgroundTask", label: "后台作业", description: "启动长时任务并返回后台 PID。", icon: Activity },
-      { key: "ptyInteraction", label: "交互式终端", description: "向需要输入的命令传入一次性响应。", icon: KeyRound, write: true },
-    ],
-  },
-  {
-    title: "文件与 SFTP",
-    description: "使用结构化文件工具处理远端目录和传输。",
-    icon: FolderTree,
-    tools: [
-      { key: "readFile", label: "读取文件", description: "按路径读取远端文本内容。", icon: FileCode2 },
-      { key: "writeFile", label: "写入文件", description: "覆写远端文件，默认关闭。", icon: FilePenLine, write: true },
-      { key: "sftpUpload", label: "SFTP 上传", description: "从本机上传文件到远端，默认关闭。", icon: Upload, write: true },
-      { key: "sftpDownload", label: "SFTP 下载", description: "把远端文件下载到本机。", icon: Download },
-      { key: "listDirectory", label: "目录列表", description: "读取目录树和文件元数据。", icon: ListTree },
-    ],
-  },
-  {
-    title: "诊断与服务",
-    description: "把常用运维检查封装为可控的结构化工具。",
-    icon: Gauge,
-    tools: [
-      { key: "getSystemMetrics", label: "系统指标", description: "CPU、内存、磁盘、网络和 GPU。", icon: Gauge },
-      { key: "processManager", label: "进程管理", description: "检索高占用进程并按需发信号。", icon: Activity, write: true },
-      { key: "networkChecker", label: "网络诊断", description: "端口、连接、网卡和连通性检查。", icon: Network },
-      { key: "dockerManager", label: "Docker 管理", description: "容器、镜像和容器日志。", icon: Container, write: true },
-      { key: "systemdControl", label: "systemd 服务", description: "查看服务状态、日志和生命周期。", icon: ServerCog, write: true },
-      { key: "logAnalyzer", label: "日志分析", description: "抓取错误日志交给模型归因。", icon: ScrollText },
-    ],
-  },
-  {
-    title: "安全与知识",
-    description: "在执行前评估风险，并复用经过整理的片段。",
-    icon: ShieldCheck,
-    tools: [
-      { key: "riskChecker", label: "风险提示", description: "按需分析命令风险，执行权限由会话审批策略决定。", icon: CircleAlert },
-      { key: "snippetLibrary", label: "代码片段库", description: "提供常用的只读运维命令模板。", icon: FileCode2 },
+      { key: "bash", label: "Bash 执行", description: "执行 Bash 命令或多行脚本，并返回 stdout、stderr 和退出码。", icon: Play, write: true },
     ],
   },
 ];
 
-type SettingsSection = "model" | "agent" | "tools" | "transfer" | "server-data" | "security" | "cloud-sync";
+type SettingsSection = "model" | "agent" | "tools" | "server-data" | "security" | "cloud-sync";
 type ModelPickerTarget = "agent" | "reviewer";
 
 const SETTINGS_SECTIONS: Array<{
@@ -130,8 +88,7 @@ const SETTINGS_SECTIONS: Array<{
 }> = [
   { id: "model", label: "模型提供商", description: "提供商、密钥、模型与思考强度", icon: Bot },
   { id: "agent", label: "Agent", description: "运行参数与系统提示词", icon: SlidersHorizontal },
-  { id: "tools", label: "工具能力", description: "终端、诊断与服务工具", icon: Wrench },
-  { id: "transfer", label: "文件传输", description: "文件系统与 SFTP 权限", icon: Upload },
+  { id: "tools", label: "工具能力", description: "Bash 终端与执行策略", icon: Wrench },
   { id: "server-data", label: "导入导出", description: "服务器列表与密钥策略", icon: Download },
   { id: "security", label: "安全策略", description: "风险提示与变更权限", icon: ShieldCheck },
   { id: "cloud-sync", label: "云端同步", description: "登录、加密与自动同步", icon: Cloud },
@@ -633,7 +590,7 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
             {visibleActiveSection === "tools" && (
               <>
                 <div className="settings-section-summary"><div><strong>工具权限</strong><small>只向模型暴露已启用的函数工具</small></div><span><ListTree size={14} /> {enabledToolCount}/{TOOL_GROUPS.flatMap((group) => group.tools).length}</span></div>
-                <div className="settings-tool-groups">{TOOL_GROUPS.filter((_, index) => index === 0 || index === 2).map(renderToolGroup)}</div>
+                <div className="settings-tool-groups">{TOOL_GROUPS.map(renderToolGroup)}</div>
                 <section className="settings-panel settings-policy-panel">
                   <header><strong>执行策略</strong><small>配置每次工具链的运行轮次、输出体积和命令超时</small></header>
                   <div className="tool-policy-grid">
@@ -642,13 +599,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
                     <label className="field"><span>命令超时 <small>秒</small></span><input type="number" min={5} step={1} value={value.tools.commandTimeoutSeconds} onChange={(event) => setValue({ ...value, tools: { ...value.tools, commandTimeoutSeconds: Number(event.target.value) } })} /></label>
                   </div>
                 </section>
-              </>
-            )}
-
-            {visibleActiveSection === "transfer" && (
-              <>
-                <div className="settings-section-summary"><div><strong>文件与 SFTP</strong><small>控制模型可使用的远端文件和传输能力</small></div></div>
-                <div className="settings-tool-groups">{renderToolGroup(TOOL_GROUPS[1])}</div>
               </>
             )}
 
@@ -681,7 +631,6 @@ export function SettingsDialog({ config, servers, localSyncSummary, cloudSyncAct
             {visibleActiveSection === "security" && (
               <>
                 <div className="settings-section-summary"><div><strong>安全与知识</strong><small>在执行前检查风险并复用经过整理的命令片段</small></div></div>
-                <div className="settings-tool-groups">{renderToolGroup(TOOL_GROUPS[3])}</div>
                 <section className="settings-panel">
                   <header><strong>审批审核模型</strong><small>供会话中的“替我审批”策略评估单次工具调用</small></header>
                   <label className="settings-config-row">

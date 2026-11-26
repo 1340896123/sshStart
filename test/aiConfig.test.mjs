@@ -13,11 +13,18 @@ registerHooks({
 const { DEFAULT_AI_CONFIG, normalizeAiConfig, changeAiModelSettings, createAiProviderModel, stripAiConfigSecrets } = await import(configUrl);
 
 test("custom prompts and explicit tool restrictions survive normalization", () => {
-  const result = normalizeAiConfig({ systemPrompt: "仅管理测试服务器", tools: { executeCommand: false, allowMutatingTools: false } });
+  const result = normalizeAiConfig({ systemPrompt: "仅管理测试服务器", tools: { bash: false, allowMutatingTools: false } });
   assert.equal(result.systemPrompt, "仅管理测试服务器");
-  assert.equal(result.tools.executeCommand, false);
+  assert.equal(result.tools.bash, false);
   assert.equal(result.tools.allowMutatingTools, false);
   assert.equal(normalizeAiConfig({ systemPrompt: "" }).systemPrompt, "");
+});
+
+test("normalization drops removed structured tool settings", () => {
+  const result = normalizeAiConfig({ tools: { executeCommand: false, readFile: false, bash: true } });
+  assert.equal(result.tools.bash, true);
+  assert.equal(Object.hasOwn(result.tools, "executeCommand"), false);
+  assert.equal(Object.hasOwn(result.tools, "readFile"), false);
 });
 
 test("reasoning effort preserves selections and defaults legacy or unknown values to auto", () => {

@@ -1,7 +1,7 @@
 use super::{connect_ssh, CommandResult, ServerProfile};
 use std::{collections::HashMap, sync::Mutex};
 use std::{
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -176,19 +176,29 @@ fn drain_streams(
     }
 }
 
-pub(crate) fn run(
+pub(crate) fn run_with_stdin(
     server: &ServerProfile,
     command: &str,
+    stdin: Option<&[u8]>,
     control: &CommandControl,
 ) -> Result<CommandResult, String> {
     control.check(Instant::now())?;
     let session = connect_ssh(server)?;
-    run_on_session(&session, command, control)
+    run_on_session_with_stdin(&session, command, stdin, control)
 }
 
 pub(crate) fn run_on_session(
     session: &ssh2::Session,
     command: &str,
+    control: &CommandControl,
+) -> Result<CommandResult, String> {
+    run_on_session_with_stdin(session, command, None, control)
+}
+
+pub(crate) fn run_on_session_with_stdin(
+    session: &ssh2::Session,
+    command: &str,
+    stdin: Option<&[u8]>,
     control: &CommandControl,
 ) -> Result<CommandResult, String> {
     struct RestoreBlocking<'a>(&'a ssh2::Session, bool);
@@ -203,6 +213,9 @@ pub(crate) fn run_on_session(
     let mut channel = retry(control, started, || session.channel_session())?;
     let result = (|| {
         retry(control, started, || channel.exec(command))?;
+        if let Some(input) = stdin {
+            write_stdin(&mut channel, input, control, started)?;
+        }
         retry(control, started, || channel.send_eof())?;
         let (stdout, stderr) = drain_streams(
             &mut channel.stream(0),
@@ -225,6 +238,29 @@ pub(crate) fn run_on_session(
             .ok();
     }
     result
+}
+
+fn write_stdin(
+    channel: &mut ssh2::Channel,
+    input: &[u8],
+    control: &CommandControl,
+    started: Instant,
+) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < input.len() {
+        control.check(started)?;
+        match channel.write(&input[offset..]) {
+            Ok(0) => return Err("写入命令标准输入失败：SSH 通道已关闭".to_string()),
+            Ok(count) => offset += count,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                thread::sleep(Duration::from_millis(8));
+            }
+            Err(error) => return Err(format!("写入命令标准输入失败: {error}")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -363,6 +399,15 @@ mod tests {
         assert_eq!(result.stdout, "stdout-after-stderr");
         assert_eq!(result.stderr.len(), 3 * 1024 * 1024);
         assert_eq!(result.exit_code, 0);
+        let input_result = run_on_session_with_stdin(
+            &connect(),
+            "stdin-echo",
+            Some(b"bash stdin probe\n"),
+            &CommandControl::default(),
+        )
+        .unwrap();
+        assert_eq!(input_result.stdout, "bash stdin probe\n");
+        assert_eq!(input_result.exit_code, 0);
         let limited = CommandControl::new(Duration::from_secs(5), 64 * 1024);
         assert!(run_on_session(&connect(), "large-stderr", &limited)
             .unwrap_err()
@@ -390,17 +435,24 @@ mod tests {
         let original = Path::new("/original's file");
         let temp = Path::new("/temporary file");
         sftp.create(original).unwrap().write_all(b"old").unwrap();
-        let original_snapshot = super::super::read_remote_snapshot(&sftp, original.to_str().unwrap()).unwrap();
+        let original_snapshot =
+            super::super::read_remote_snapshot(&sftp, original.to_str().unwrap()).unwrap();
         let original_revision = original_snapshot.revision;
         sftp.create(temp).unwrap().write_all(b"new").unwrap();
         super::super::rename_overwrite(&session, &sftp, temp, original).unwrap();
-        assert!(session.is_blocking(), "command fallback must restore SFTP's blocking mode");
-        let updated_snapshot = super::super::read_remote_snapshot(&sftp, original.to_str().unwrap()).unwrap();
+        assert!(
+            session.is_blocking(),
+            "command fallback must restore SFTP's blocking mode"
+        );
+        let updated_snapshot =
+            super::super::read_remote_snapshot(&sftp, original.to_str().unwrap()).unwrap();
         assert_eq!(updated_snapshot.bytes, b"new");
         let updated_revision = updated_snapshot.revision;
         assert_eq!(original_revision.size, updated_revision.size);
         assert_eq!(original_revision.modified, updated_revision.modified);
-        assert!(super::super::ensure_remote_revision(&original_revision, &updated_revision).is_err());
+        assert!(
+            super::super::ensure_remote_revision(&original_revision, &updated_revision).is_err()
+        );
         assert!(sftp.stat(temp).is_err());
     }
 }

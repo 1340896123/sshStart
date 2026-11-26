@@ -72,8 +72,8 @@ async function setup(t, initialPolicy, onInvoke = () => undefined, initialMessag
 }
 
 const approval = {
-  type: "approval_required", approvalId: "approval-1", actionId: "action-1", tool: "execute_command",
-  command: "systemctl restart app", arguments: { command: "systemctl restart app" }, reason: "变更状态",
+  type: "approval_required", approvalId: "approval-1", actionId: "action-1", tool: "bash",
+  command: "systemctl restart app", arguments: { command: "systemctl restart app" }, reason: "Bash 变更状态",
 };
 
 test("manual approval sends only the pending approval ID and decision, never executable arguments", async t => {
@@ -170,7 +170,7 @@ test("a provider without usage does not appear to have reported zero tokens", as
 test("completed transcripts survive persistence and are sent on the next turn", async (t) => {
   const harness = await setup(t, "request");
   const modelMessages = [
-    { role: "assistant", content: [{ id: "call-1", function: { name: "read_file", arguments: { path: "/etc/app" } } }] },
+    { role: "assistant", content: [{ id: "call-1", function: { name: "bash", arguments: { command: "cat /etc/app" } } }] },
     { role: "user", content: [{ type: "toolresult", id: "call-1", content: [{ type: "text", text: "配置" }] }] },
     { role: "assistant", content: [{ text: "完成" }] },
   ];

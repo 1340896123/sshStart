@@ -1,15 +1,15 @@
 {
-  "version": "0.1.6",
-  "date": "2026-11-19",
-  "url": "https://github.com/1340896123/sshStart/releases/tag/v0.1.6",
+  "version": "0.1.7",
+  "date": "2026-11-26",
+  "url": "https://github.com/1340896123/sshStart/releases/tag/v0.1.7",
   "exe": {
-    "name": "sshStar_0.1.6_x64-setup.exe",
-    "size": 10506416,
-    "sha256": "71178e371880ddd9b75b22748d70d6671a690717249df5217e51e46cb7d52bbd"
+    "name": "sshStar_0.1.7_x64-setup.exe",
+    "size": 10470675,
+    "sha256": "9f349875bf7a7789e581d8ddd7e2961b50ab0488b0e55a07aaf5b688dfe4df49"
   },
   "msi": {
-    "name": "sshStar_0.1.6_x64_en-US.msi",
-    "size": 14004224,
-    "sha256": "82e2d3b8bd97dbf554698ca214ba5b548dd21763d410fc2e1e866cd88ba94397"
+    "name": "sshStar_0.1.7_x64_en-US.msi",
+    "size": 13963264,
+    "sha256": "566204aa0f013a49639c8f3ef75625621d1c833ef887dd88cb6352b587c6ff8f"
   }
 }

@@ -534,7 +534,7 @@ mod tests {
             event: AiAgentEventKind::ApprovalRequired {
                 approval_id: "approval-1".to_string(),
                 action_id: "action-1".to_string(),
-                tool: "execute_command".to_string(),
+                tool: "bash".to_string(),
                 command: "uptime".to_string(),
                 arguments: json!({ "command": "uptime" }),
                 reason: "需要审批".to_string(),

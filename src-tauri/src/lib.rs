@@ -3188,10 +3188,6 @@ fn risk_reasons(command: &str) -> Vec<String> {
     reasons
 }
 
-fn is_high_risk_command(command: &str) -> bool {
-    !risk_reasons(command).is_empty()
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     install_diagnostic_panic_hook();

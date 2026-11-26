@@ -110,22 +110,7 @@ type AiTimelineItem =
 
 const STARTERS = ["检查磁盘与内存使用", "查看最近的错误日志", "分析当前目录的部署结构"];
 const TOOL_LABELS: Record<string, string> = {
-  execute_command: "单条命令",
-  background_task: "后台作业",
-  pty_interaction: "交互式终端",
-  read_file: "读取文件",
-  write_file: "写入文件",
-  sftp_upload: "SFTP 上传",
-  sftp_download: "SFTP 下载",
-  list_directory: "目录列表",
-  get_system_metrics: "系统指标",
-  process_manager: "进程管理",
-  network_checker: "网络诊断",
-  docker_manager: "Docker 管理",
-  systemd_control: "systemd 服务",
-  risk_checker: "高危检查",
-  snippet_library: "命令片段",
-  log_analyzer: "日志分析",
+  bash: "Bash",
 };
 const ACTION_STATUS_LABELS: Record<AiActionStatus, string> = {
   started: "开始",

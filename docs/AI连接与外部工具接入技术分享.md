@@ -312,24 +312,9 @@ const response = await invoke<AiResponse>("ai_chat", { config, server, messages,
 
 | 分类 | 工具 | 执行目标 | 可能产生副作用 |
 |---|---|---|---|
-| 命令 | `execute_command` | 远端 Shell | 是，统一按变更型处理 |
-| 命令 | `background_task` | 远端后台进程 | `start/stop` 是 |
-| 命令 | `pty_interaction` | 远端一次性交互 | 是 |
-| 文件 | `read_file` | 远端文本文件 | 否 |
-| 文件 | `write_file` | 远端文件 | 是 |
-| 文件 | `sftp_upload` | 本机到远端 | 是 |
-| 文件 | `sftp_download` | 远端到本机 | 是，本机文件系统发生写入 |
-| 文件 | `list_directory` | 远端目录 | 否 |
-| 诊断 | `get_system_metrics` | CPU/内存/磁盘/网络/GPU | 否 |
-| 诊断 | `process_manager` | 远端进程 | `terminate` 是 |
-| 诊断 | `network_checker` | 连接、网卡、Ping、端口 | 否 |
-| 服务 | `docker_manager` | Docker | 生命周期操作是 |
-| 服务 | `systemd_control` | systemd | 生命周期操作是 |
-| 安全 | `risk_checker` | 本地规则引擎 | 否 |
-| 知识 | `snippet_library` | 内置只读命令片段 | 否 |
-| 日志 | `log_analyzer` | 文件或 journal | 否 |
+| 远端 Bash | `bash` | 当前 SSH 服务器上的 `bash -lc` | 始终按变更型处理 |
 
-工具开关来自 [`src/types.ts:202`](../src/types.ts#L202)，UI 分组来自 [`src/components/SettingsDialog.tsx:42`](../src/components/SettingsDialog.tsx#L42)。
+工具开关来自 [`src/types.ts`](../src/types.ts)，UI 配置来自 [`src/components/SettingsDialog.tsx`](../src/components/SettingsDialog.tsx)。
 
 ### 6.3 Function Calling Schema
 
@@ -355,45 +340,37 @@ fn ai_function_tool(name: &str, description: &str, properties: Value, required: 
 
 源码：[`src-tauri/src/lib.rs:3829`](../src-tauri/src/lib.rs#L3829)
 
-`ai_tool_definitions` 只暴露设置中启用的工具。因此工具开关不仅影响 UI，也影响模型能否看到工具 schema。
+`tool_definitions` 只在 Bash 开关启用时暴露一个 `bash` schema。因此工具开关不仅影响 UI，也影响模型能否看到工具 schema。
+
+```json
+{
+  "command": "必填的 Bash 命令或多行脚本",
+  "stdin": "可选标准输入"
+}
+```
 
 ### 6.4 工具执行分派
 
-`execute_ai_tool` 是执行适配器。它将模型生成的结构化参数映射到三类实现：
-
-1. **Shell 适配器**：如 `execute_command`、`read_file`、`docker_manager`。
-2. **已有 Tauri/SSH 能力复用**：如 `list_processes`、`list_network_connections`。
-3. **SFTP 适配器**：如 `upload_file`、`download_file`、`list_directory`。
+`execute_tool` 只处理 `bash`。所有读取、诊断、编辑、进程、Docker、systemd 和日志操作都由模型生成的 Bash 脚本完成；应用自身的 SFTP 和文件编辑能力仍供界面功能使用。
 
 ```rust
-async fn execute_ai_tool(...) -> Result<AiToolExecution, String> {
-    let execution = match name {
-        "execute_command" => {
-            let command = required_ai_arg(arguments, "command")?.to_string();
-            let result = run_ai_command(server, command.clone(), settings).await?;
-            AiToolExecution { display_command: command, result }
-        }
-        "list_directory" => {
-            let path = optional_ai_arg(arguments, "path", "/");
-            let result = list_directory(server.clone(), path.clone()).await
-                .map(|entries| json_command_result(&entries))
-                .unwrap_or_else(ai_blocked_result);
-            AiToolExecution { display_command: format!("list_directory {path}"), result }
-        }
-        // process/network/docker/systemd/SFTP 等分支
-        _ => return Err(format!("不支持的 AI 工具: {name}")),
-    };
-    Ok(execution)
+async fn execute_tool(...) -> Result<AiToolExecution, String> {
+    let command = required_ai_arg(arguments, "command")?.to_string();
+    let stdin = optional_ai_string(arguments, "stdin")?;
+    let result = run_ai_command(server, command.clone(), stdin, settings).await?;
+    Ok(AiToolExecution { display_command: command, result })
 }
 ```
 
 源码：[`src-tauri/src/lib.rs:4224`](../src-tauri/src/lib.rs#L4224)
 
-所有远端 Shell 命令都会经过超时包装，并放入阻塞线程执行，避免阻塞 Tauri async runtime：
+所有 AI Bash 命令都会经过超时包装，并放入阻塞线程执行，避免阻塞 Tauri async runtime。命令通过 `bash -lc` 执行，远端缺少 Bash 时返回退出码 `127`。可选 stdin 通过 SSH channel 写入并在执行前发送 EOF：
 
 ```rust
 let command = bounded_ai_command(&command, settings.command_timeout_seconds);
-tauri::async_runtime::spawn_blocking(move || run_command_sync(&server, &command)).await?
+tauri::async_runtime::spawn_blocking(move || {
+    command::run_with_stdin(&server, &command, stdin.as_deref(), &control)
+}).await?
 ```
 
 源码：[`src-tauri/src/lib.rs:4009`](../src-tauri/src/lib.rs#L4009)
@@ -491,10 +468,10 @@ Responses 模式还会保存原始 `response.output_item`，在下一轮请求�
 | 层级 | 控制 | 目的 |
 |---|---|---|
 | 暴露层 | `autoExecute` 关闭时不向模型发送任何工具 | 彻底关闭 Agent 执行能力 |
-| 工具层 | 每个工具独立启用/禁用 | 最小能力集 |
+| 工具层 | Bash 开关 | 控制模型是否能看到远端执行能力 |
 | 变更层 | `allowMutatingTools` | 控制所有可能产生副作用的工具 |
 | 参数层 | 必填字段、枚举、PID、端口、服务名校验 | 限制无效或异常输入 |
-| 命令层 | `shell_quote`、命令模板 | 降低结构化工具的注入风险 |
+| 命令层 | `bash -lc`、`shell_quote`、stdin 上限 | 统一解释器并限制输入 |
 | 风险层 | `risk_reasons` 静态规则 | 识别删除、格式化、关机、防火墙等高风险动作 |
 | 审批层 | 前端批准后调用 `approve_ai_tool` | 人在回路 |
 | 路径层 | 阻止写入 `/etc`、`/boot`、`/usr` 等路径 | 保护关键系统目录 |
@@ -504,17 +481,8 @@ Responses 模式还会保存原始 `response.output_item`，在下一轮请求�
 ### 8.2 变更型工具判断
 
 ```rust
-fn ai_tool_is_mutating(name: &str, arguments: &Value) -> bool {
-    match name {
-        "execute_command" | "write_file" | "sftp_upload" | "sftp_download"
-        | "pty_interaction" => true,
-        "process_manager" => arguments.get("action").and_then(Value::as_str) == Some("terminate"),
-        "docker_manager" => matches!(
-            arguments.get("action").and_then(Value::as_str),
-            Some("pull" | "start" | "stop" | "restart" | "rm")
-        ),
-        _ => false,
-    }
+fn ai_tool_is_mutating(name: &str, _arguments: &Value) -> bool {
+    name == "bash"
 }
 ```
 
@@ -555,7 +523,7 @@ fn ai_tool_is_mutating(name: &str, arguments: &Value) -> bool {
 
 ### 9.3 附件处理
 
-附件不会作为视觉输入直接发送给模型。前端将图片或大文本通过 Tauri/SFTP 上传到远端临时目录，消息中只注入远端路径、类型和大小。模型需要再调用 `read_file` 或其他服务器工具检查内容。
+附件不会作为视觉输入直接发送给模型。前端将图片或大文本通过 Tauri/SFTP 上传到远端临时目录，消息中只注入远端路径、类型和大小。模型通过 `bash` 读取这些路径。
 
 这是一种 **文件引用式上下文**，优点是避免大文件直接占用模型上下文；限制是当前并没有真正的多模态图像上传协议，模型也不能仅凭路径看到图片。
 
@@ -731,4 +699,4 @@ sshStar 已经具备一个完整的本地 Agent 骨架：
 | 5 分钟 | 当前限制与 MCP 演进方案 |
 | 2 分钟 | 总结与问答引导 |
 
-建议演示路径：模型请求系统状态 → `get_system_metrics` → 工具状态流式展示 → 工具结果回灌 → 最终分析；随后演示一个命中风险规则的命令及人工审批流程。
+建议演示路径：模型请求系统状态 → `bash` 执行诊断脚本 → 工具状态流式展示 → 工具结果回灌 → 最终分析；随后演示一个命中风险规则的 Bash 命令及人工审批流程。

@@ -254,40 +254,10 @@ export interface AiMessage {
 }
 
 export type AiToolKey =
-  | "executeCommand"
-  | "backgroundTask"
-  | "ptyInteraction"
-  | "readFile"
-  | "writeFile"
-  | "sftpUpload"
-  | "sftpDownload"
-  | "listDirectory"
-  | "getSystemMetrics"
-  | "processManager"
-  | "networkChecker"
-  | "dockerManager"
-  | "systemdControl"
-  | "riskChecker"
-  | "snippetLibrary"
-  | "logAnalyzer";
+  | "bash";
 
 export interface AiToolSettings {
-  executeCommand: boolean;
-  backgroundTask: boolean;
-  ptyInteraction: boolean;
-  readFile: boolean;
-  writeFile: boolean;
-  sftpUpload: boolean;
-  sftpDownload: boolean;
-  listDirectory: boolean;
-  getSystemMetrics: boolean;
-  processManager: boolean;
-  networkChecker: boolean;
-  dockerManager: boolean;
-  systemdControl: boolean;
-  riskChecker: boolean;
-  snippetLibrary: boolean;
-  logAnalyzer: boolean;
+  bash: boolean;
   maxToolRounds: number;
   maxOutputChars: number;
   commandTimeoutSeconds: number;
@@ -295,22 +265,7 @@ export interface AiToolSettings {
 }
 
 export const DEFAULT_AI_TOOL_SETTINGS: AiToolSettings = {
-  executeCommand: true,
-  backgroundTask: true,
-  ptyInteraction: false,
-  readFile: true,
-  writeFile: false,
-  sftpUpload: false,
-  sftpDownload: true,
-  listDirectory: true,
-  getSystemMetrics: true,
-  processManager: true,
-  networkChecker: true,
-  dockerManager: true,
-  systemdControl: true,
-  riskChecker: true,
-  snippetLibrary: true,
-  logAnalyzer: true,
+  bash: true,
   maxToolRounds: 200,
   maxOutputChars: 128000,
   commandTimeoutSeconds: 30,
@@ -428,7 +383,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   maxOutputTokens: 384000,
   temperature: 0.2,
   systemPrompt:
-    "你是 sshStar 的 Rig 运维 Agent。主动完成用户任务，先观察再行动，优先使用结构化工具获取事实，并验证执行结果。遵守用户限定的范围与当前会话审批策略，已有授权持续有效，不要重复请求确认。遇到可恢复的错误应自行修正并继续。不要声称读取过尚未通过工具访问的文件，只有确实缺少必要信息或授权时才询问用户。",
+    "你是 sshStar 的 Rig 运维 Agent。主动完成用户任务，先观察再行动，使用唯一的 Bash 工具获取事实、读取和修改远端文件、管理服务并验证结果。Bash 命令可能修改远端状态，遵守用户限定的范围与当前会话审批策略，已有授权持续有效，不要重复请求确认。遇到可恢复的错误应自行修正并继续。不要声称读取过尚未通过 Bash 工具访问的文件，只有确实缺少必要信息或授权时才询问用户。",
   tools: DEFAULT_AI_TOOL_SETTINGS,
   serverImportExport: DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,
   cloudSync: DEFAULT_CLOUD_SYNC_SETTINGS,
@@ -466,6 +421,15 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
   const provider = providers.find((item) => item.id === (config.selectedProviderId ?? fallback.selectedProviderId)) ?? providers[0];
   const model = provider?.models.find((item) => item.id === provider.selectedModelId) ?? provider?.models[0];
   if (provider && model) provider.selectedModelId = model.id;
+  const inputTools = config.tools ?? {};
+  const fallbackTools = fallback.tools;
+  const tools: AiToolSettings = {
+    bash: inputTools.bash ?? fallbackTools.bash,
+    maxToolRounds: inputTools.maxToolRounds ?? fallbackTools.maxToolRounds,
+    maxOutputChars: inputTools.maxOutputChars ?? fallbackTools.maxOutputChars,
+    commandTimeoutSeconds: inputTools.commandTimeoutSeconds ?? fallbackTools.commandTimeoutSeconds,
+    allowMutatingTools: inputTools.allowMutatingTools ?? fallbackTools.allowMutatingTools,
+  };
   return {
     providers,
     selectedProviderId: provider?.id ?? "",
@@ -479,7 +443,7 @@ export function normalizeAiConfig(config: AiConfigInput = {}, fallback: AiConfig
     maxOutputTokens: config.maxOutputTokens ?? fallback.maxOutputTokens,
     temperature: config.temperature ?? fallback.temperature,
     systemPrompt,
-    tools: { ...DEFAULT_AI_TOOL_SETTINGS, ...fallback.tools, ...(config.tools ?? {}) },
+    tools,
     serverImportExport: {
       ...DEFAULT_SERVER_IMPORT_EXPORT_SETTINGS,
       ...fallback.serverImportExport,

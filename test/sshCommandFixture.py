@@ -86,6 +86,14 @@ class Probes(paramiko.ServerInterface):
                     channel.sendall(b"stdout-after-stderr")
                 elif command == b"stall":
                     time.sleep(10)
+                elif command == b"stdin-echo":
+                    chunks = []
+                    while True:
+                        chunk = channel.recv(4096)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    channel.sendall(b"".join(chunks))
                 elif command.startswith(b"mv -fT -- "):
                     args = shlex.split(command.decode())
                     if len(args) != 5 or args[3] not in self.files:
