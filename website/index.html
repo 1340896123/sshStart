@@ -512,11 +512,11 @@
             ><span class="latest-tag">最新版本</span
             ><time datetime="{{RELEASE_DATE}}">{{RELEASE_DATE}}</time>
           </div>
-          <h3>让 AI 运维更直接、更可控。</h3>
+          <h3>让 AI 任务在中断后继续完成。</h3>
           <ul>
-            <li>AI 内置工具统一收敛为远端 Bash 执行器。</li>
-            <li>支持 Bash 标准输入、超时、取消和输出限制。</li>
-            <li>命令审批与历史会话处理更清晰。</li>
+            <li>失败重试会恢复已保存的模型工具调用与结果。</li>
+            <li>中断后从原任务上下文继续，避免重复执行成功操作。</li>
+            <li>前后端 transcript 校验与兼容处理更稳健。</li>
           </ul>
           <a
             href="{{RELEASE_URL}}"

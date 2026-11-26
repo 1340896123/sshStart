@@ -19,7 +19,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rig::{
     catalog::Sampling,
     completion::{Effort, GenerationOptions, Reasoning, Usage},
-    message::Message,
+    message::{AssistantContent, AssistantMessage, Message, ToolResult, UserContent},
     operation::Completion,
     prelude::MultiTurnStreamItem,
     providers::openai,
@@ -252,6 +252,21 @@ pub(crate) struct AiRunResult {
     model_messages: Vec<Message>,
 }
 
+#[derive(Debug)]
+struct AiRunError {
+    message: String,
+    model_messages: Vec<Message>,
+}
+
+impl AiRunError {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            model_messages: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AiApprovalReview {
@@ -424,15 +439,16 @@ pub(crate) async fn run_ai_agent(
             sink.emit(AiAgentEventKind::RunCompleted);
             Ok(result)
         }
-        Err(error) if error == AI_RUN_CANCELLED => {
+        Err(error) if error.message == AI_RUN_CANCELLED => {
             sink.emit(AiAgentEventKind::RunCancelled);
-            Err(error)
+            Err(error.message)
         }
         Err(error) => {
             sink.emit(AiAgentEventKind::RunFailed {
-                error: error.clone(),
+                error: error.message.clone(),
+                model_messages: error.model_messages,
             });
-            Err(error)
+            Err(error.message)
         }
     }
 }
@@ -475,11 +491,12 @@ async fn run_with_model<M>(
     allow_tools: bool,
     conversation_id: Option<&str>,
     approval_policy: watch::Receiver<AiApprovalPolicy>,
-) -> Result<AiRunResult, String>
+) -> Result<AiRunResult, AiRunError>
 where
     M: Into<DynModel<Completion>>,
 {
-    let (prompt, history) = split_messages(messages)?;
+    let (prompt, history) = split_messages(messages).map_err(AiRunError::message)?;
+    let history_len = history.len();
     let dynamic_tools = if allow_tools {
         tools::build_dynamic_tools(server, &config.tools, cancellation.clone())
     } else {
@@ -491,7 +508,8 @@ where
         config.api_mode,
         config.reasoning_effort,
         !dynamic_tools.is_empty(),
-    )?;
+    )
+    .map_err(AiRunError::message)?;
     let preamble = format!(
         "{}\n\n当前 SSH 目标为 {}@{}:{}。附件均为服务器临时文件引用；必须通过 Bash 工具实际读取后才能声称看过内容。\n{}\n审批流程以当前会话策略及运行时结果为准。使用唯一的 bash 工具完成检查、读取、编辑、服务管理和验证；Bash 命令可能修改远端状态，执行前评估风险并遵守用户限定的目标、范围和禁止事项。前文授权在同一任务内持续有效。主动完成用户请求所需的检查、实施和验证，遇到可恢复的工具错误应自行修正并继续；动作被拒绝时解释具体原因，在现有授权范围内继续其他可完成的工作。只有确实缺少必要信息或无法继续时才向用户询问。",
         config.system_prompt,
@@ -532,16 +550,40 @@ where
     let mut context_tokens = 0;
     let mut final_content = None;
     let mut model_messages = Vec::new();
+    let mut partial_assistant = Vec::<AssistantContent>::new();
+    let mut partial_tool_results = Vec::<ToolResult>::new();
+    let mut partial_messages = Vec::<Message>::new();
 
     loop {
         let item = tokio::select! {
             item = futures::StreamExt::next(&mut stream) => item,
-            _ = wait_for_cancellation(&mut cancellation) => return Err(AI_RUN_CANCELLED.to_string()),
+            _ = wait_for_cancellation(&mut cancellation) => {
+                return Err(AiRunError::message(AI_RUN_CANCELLED));
+            },
         };
         let Some(item) = item else {
             break;
         };
-        match item.map_err(|error| format!("Rig Agent 运行失败: {}", error_details(&error)))? {
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                let error_message = format!("Rig Agent 运行失败: {}", error_details(&error));
+                let model_messages = continuation_from_error(&error, history_len)
+                    .filter(|messages| !messages.is_empty())
+                    .unwrap_or_else(|| {
+                        partial_messages_with_pending(
+                            partial_messages,
+                            partial_assistant,
+                            partial_tool_results,
+                        )
+                    });
+                return Err(AiRunError {
+                    message: error_message,
+                    model_messages,
+                });
+            }
+        };
+        match item {
             MultiTurnStreamItem::StreamAssistantItem(item) => match item {
                 Item::Event(StreamEvent::Text { text, .. }) => {
                     content.push_str(&text);
@@ -551,8 +593,24 @@ where
                     reasoning.push_str(&text);
                     sink.emit(AiAgentEventKind::ReasoningDelta { delta: text });
                 }
+                Item::Event(StreamEvent::End { content, .. }) => {
+                    partial_assistant.push(content);
+                }
                 _ => {}
             },
+            MultiTurnStreamItem::ToolResult { tool_result } => {
+                if !partial_assistant.is_empty() {
+                    partial_messages.push(Message::Assistant(AssistantMessage::new(
+                        std::mem::take(&mut partial_assistant),
+                    )));
+                }
+                partial_tool_results.push(tool_result);
+            }
+            MultiTurnStreamItem::CompletionCall(_) if !partial_tool_results.is_empty() => {
+                partial_messages.push(Message::tool_results(std::mem::take(
+                    &mut partial_tool_results,
+                )));
+            }
             MultiTurnStreamItem::CompletionCall(call) => {
                 context_tokens = call.usage.input_tokens.unwrap_or(0);
                 usage += call.usage;
@@ -583,7 +641,14 @@ where
 
     let content = final_content.unwrap_or(content);
     if content.trim().is_empty() {
-        return Err("Rig Agent 未返回最终文本".to_string());
+        return Err(AiRunError {
+            message: "Rig Agent 未返回最终文本".to_string(),
+            model_messages: partial_messages_with_pending(
+                partial_messages,
+                partial_assistant,
+                partial_tool_results,
+            ),
+        });
     }
     Ok(AiRunResult {
         content,
@@ -591,6 +656,38 @@ where
         usage: AiTokenUsage::from_rig(usage, requests, context_tokens),
         model_messages,
     })
+}
+
+fn continuation_from_error(
+    error: &rig::completion::PromptError,
+    history_len: usize,
+) -> Option<Vec<Message>> {
+    match error {
+        rig::completion::PromptError::Cancelled { chat_history, .. }
+        | rig::completion::PromptError::MaxTurns { chat_history, .. }
+        | rig::completion::PromptError::UnknownToolCall { chat_history, .. } => {
+            Some(chat_history.iter().skip(history_len + 1).cloned().collect())
+        }
+        rig::completion::PromptError::Memory {
+            response: Some(response),
+            ..
+        } => Some(response.messages.iter().skip(1).cloned().collect()),
+        _ => None,
+    }
+}
+
+fn partial_messages_with_pending(
+    mut messages: Vec<Message>,
+    assistant: Vec<AssistantContent>,
+    tool_results: Vec<ToolResult>,
+) -> Vec<Message> {
+    if !assistant.is_empty() {
+        messages.push(Message::Assistant(AssistantMessage::new(assistant)));
+    }
+    if !tool_results.is_empty() {
+        messages.push(Message::tool_results(tool_results));
+    }
+    messages
 }
 
 fn error_details(error: &rig::completion::PromptError) -> String {
@@ -681,8 +778,19 @@ fn restored_model_messages(message: &AiInputMessage) -> Option<Vec<Message>> {
     let messages = compat::restore_messages(raw)?;
     // Older conversations have no transcript. Ignore corrupt/stale data and
     // never restore system instructions from saved assistant content.
-    if !matches!(messages.first(), Some(Message::Assistant(_)))
-        || !matches!(messages.last(), Some(Message::Assistant(_)))
+    let starts_with_assistant = matches!(messages.first(), Some(Message::Assistant(_)));
+    let ends_with_replayable_turn = match messages.last() {
+        Some(Message::Assistant(_)) => true,
+        Some(Message::User { content }) => {
+            !content.is_empty()
+                && content
+                    .iter()
+                    .all(|item| matches!(item, UserContent::ToolResult(_)))
+        }
+        _ => false,
+    };
+    if !starts_with_assistant
+        || !ends_with_replayable_turn
         || messages
             .iter()
             .any(|message| matches!(message, Message::System { .. }))

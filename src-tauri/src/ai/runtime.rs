@@ -7,6 +7,7 @@ use rig::agent::{
     AgentHook, DispatchAction, DispatchEvent, HookContext, OutcomeAction, OutcomeEvent,
     StepEventKind,
 };
+use rig::message::Message;
 use rig::tool::{ToolExecutionError, ToolResult};
 use serde::Serialize;
 use serde_json::Value;
@@ -302,6 +303,8 @@ pub(super) enum AiAgentEventKind {
     RunCancelled,
     RunFailed {
         error: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        model_messages: Vec<Message>,
     },
 }
 

@@ -524,7 +524,7 @@ export type AiAgentEvent = AiAgentEventBase & (
     }
   | { type: "run_completed" }
   | { type: "run_cancelled" }
-  | { type: "run_failed"; error: string }
+  | { type: "run_failed"; error: string; modelMessages?: unknown[] }
 );
 
 export interface AiRunResult {

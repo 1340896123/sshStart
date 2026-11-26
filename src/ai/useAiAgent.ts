@@ -49,6 +49,7 @@ interface PendingRetry {
 }
 
 const RETRY_DELAY_MS = 5_000;
+const RETRY_CONTINUATION = "上一轮 Agent 已经执行了部分操作但在中途失败。请从已保存的工具调用和结果处继续完成原始任务，不要重复已经成功完成的操作。";
 
 const errorDetails = (reason: unknown): string => {
   if (typeof reason === "string") return reason;
@@ -465,6 +466,7 @@ export function useAiAgent({
           error: event.error,
           messageType: "error",
           status: "error",
+          modelMessages: event.modelMessages?.length ? event.modelMessages : message.modelMessages,
           updatedAt: event.timestamp,
           completedAt: event.timestamp,
         }), true);
@@ -482,6 +484,10 @@ export function useAiAgent({
       if (lastMessage?.id !== retryMessageId || lastMessage.status !== "error") return;
     }
     const { content, attachments, allowTools } = input;
+    const retryMessage = retryMessageId
+      ? messagesRef.current.find((message) => message.id === retryMessageId)
+      : undefined;
+    const retryModelMessages = retryMessage?.modelMessages;
     const now = Date.now();
     const runId = uid("ai-run");
     const userMessage: AiMessage = {
@@ -500,6 +506,7 @@ export function useAiAgent({
       role: "assistant",
       messageType: "text",
       content: "",
+      modelMessages: retryModelMessages,
       createdAt: now,
       updatedAt: now,
       status: "started",
@@ -523,7 +530,8 @@ export function useAiAgent({
       const result = await invoke<AiRunResult>("run_ai_agent", {
         config,
         server,
-        messages: pendingMessages
+        messages: (() => {
+          const next = pendingMessages
           .filter((message) => message.id !== assistantMessage.id)
           .filter((message) => message.status !== "error")
           .map((message) => ({
@@ -540,7 +548,23 @@ export function useAiAgent({
               mimeType,
               size,
             })),
-          })),
+          }));
+          if (retryMessageId && retryModelMessages?.length) {
+            next.push({
+              role: "assistant",
+              modelMessages: retryModelMessages,
+              content: retryMessage?.content ?? "",
+              attachments: undefined,
+            });
+            next.push({
+              role: "user",
+              content: RETRY_CONTINUATION,
+              modelMessages: undefined,
+              attachments: undefined,
+            });
+          }
+          return next;
+        })(),
         allowTools,
         runId,
         // The first user message survives persistence and history reloads;

@@ -265,6 +265,34 @@ test("failed requests retry after exactly five seconds with the same messages an
   assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 2);
 });
 
+test("failed requests resume from the saved model transcript instead of replaying the task", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+  const harness = await setup(t, "request", undefined, [], {
+    content: "检查并修复服务",
+    attachments: [],
+    allowTools: true,
+  });
+  const modelMessages = [
+    { role: "assistant", content: [{ id: "call-1", function: { name: "bash", arguments: { command: "systemctl status app" } } }] },
+    { role: "user", content: [{ type: "toolresult", id: "call-1", content: [{ type: "text", text: "服务已停止" }] }] },
+  ];
+  const assistantId = harness.latest().id;
+  await harness.emit({ type: "tool_started", actionId: "call-1", tool: "bash", command: "systemctl status app", arguments: { command: "systemctl status app" }, startedAt: 1 });
+  await harness.emit({ type: "run_failed", error: "连接中断", modelMessages });
+  await act(async () => { harness.run.reject("IPC channel closed"); });
+  const second = harness.nextRun();
+  await act(async () => { t.mock.timers.tick(5_000); });
+  const retried = harness.calls.filter(({ command }) => command === "run_ai_agent").at(-1).args;
+  assert.equal(harness.calls.filter(({ command }) => command === "run_ai_agent").length, 2);
+  assert.equal(retried.messages[0].content, "检查并修复服务");
+  assert.deepEqual(retried.messages[1].modelMessages, modelMessages);
+  assert.equal(retried.messages.at(-1).role, "user");
+  assert.match(retried.messages.at(-1).content, /从已保存的工具调用和结果处继续/);
+  assert.notEqual(retried.messages.at(-1).content, "检查并修复服务");
+  assert.equal(harness.latest().id, assistantId);
+  await act(async () => { second.resolve({ content: "已继续完成", usage }); });
+});
+
 test("each retry failure starts a new five-second countdown and retains structured errors", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
   const harness = await setup(t, "request");

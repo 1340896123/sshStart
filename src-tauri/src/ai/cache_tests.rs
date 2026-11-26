@@ -66,17 +66,6 @@ fn old_or_invalid_transcripts_fall_back_to_visible_text() {
             serde_json::to_value(vec![Message::system("stale"), Message::assistant("reply")])
                 .unwrap(),
         ),
-        Some(
-            serde_json::to_value(vec![
-                Message::assistant("call"),
-                Message::tool_result(
-                    CallId::from_wire("id"),
-                    ToolName::new("read_file").unwrap(),
-                    "result",
-                ),
-            ])
-            .unwrap(),
-        ),
     ] {
         let (_, history) = split_messages(vec![
             input("user", "inspect", None),
@@ -89,6 +78,37 @@ fn old_or_invalid_transcripts_fall_back_to_visible_text() {
             vec![Message::user("inspect"), Message::assistant("reply")]
         );
     }
+}
+
+#[test]
+fn restores_partial_tool_transcripts_for_retry_continuation() {
+    let transcript = vec![
+        Message::assistant("call"),
+        Message::tool_result(
+            CallId::from_wire("id"),
+            ToolName::new("bash").unwrap(),
+            "result",
+        ),
+    ];
+    let (prompt, resumed_history) = split_messages(vec![
+        input("user", "inspect", None),
+        input(
+            "assistant",
+            "partial",
+            Some(serde_json::to_value(&transcript).unwrap()),
+        ),
+        input("user", "continue from failure", None),
+    ])
+    .unwrap();
+    assert_eq!(prompt, Message::user("continue from failure"));
+    assert_eq!(
+        resumed_history,
+        vec![
+            Message::user("inspect"),
+            transcript[0].clone(),
+            transcript[1].clone()
+        ]
+    );
 }
 
 #[test]
