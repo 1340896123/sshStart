@@ -68,7 +68,7 @@ fn ai_function_tool(name: &str, description: &str, properties: Value, required: 
     })
 }
 
-fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
+pub(super) fn tool_definitions(settings: &AiToolSettings) -> Vec<Value> {
     if !ai_tool_enabled(settings, "exec_command") {
         return Vec::new();
     }

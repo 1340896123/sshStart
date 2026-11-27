@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod cache_tests;
 mod compat;
+mod context;
 pub(crate) mod import;
 mod policy;
 mod runtime;
@@ -10,6 +11,7 @@ mod transport;
 pub(crate) use runtime::AiRuntimeState;
 
 use self::{
+    context::{AiContextBreakdown, ContextEstimate},
     policy::AiApprovalPolicy,
     runtime::{AiAgentEventKind, EventSink, RunHook},
     tools::AiToolSettings,
@@ -225,6 +227,8 @@ pub(crate) struct AiTokenUsage {
     cached_tokens: u64,
     reasoning_tokens: u64,
     context_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_breakdown: Option<AiContextBreakdown>,
     requests: u32,
 }
 
@@ -238,8 +242,16 @@ impl AiTokenUsage {
             cached_tokens: usage.cached_input_tokens.unwrap_or(0),
             reasoning_tokens: usage.reasoning_tokens.unwrap_or(0),
             context_tokens,
+            context_breakdown: None,
             requests,
         }
+    }
+
+    fn with_context_breakdown(mut self, estimate: ContextEstimate) -> Self {
+        if self.available {
+            self.context_breakdown = Some(estimate.breakdown(self.context_tokens));
+        }
+        self
     }
 }
 
@@ -531,6 +543,12 @@ where
         server.port,
         approval_policy.borrow().instructions(),
     );
+    let tool_definitions = if allow_tools && config.tools.execute_command {
+        serde_json::to_string(&tools::tool_definitions(&config.tools)).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let context_estimate = ContextEstimate::new(&preamble, &tool_definitions);
     let agent = agent_builder(
         model,
         config.temperature as f64,
@@ -619,16 +637,17 @@ where
                 }
                 partial_tool_results.push(tool_result);
             }
-            MultiTurnStreamItem::CompletionCall(_) if !partial_tool_results.is_empty() => {
-                partial_messages.push(Message::tool_results(std::mem::take(
-                    &mut partial_tool_results,
-                )));
-            }
             MultiTurnStreamItem::CompletionCall(call) => {
+                if !partial_tool_results.is_empty() {
+                    partial_messages.push(Message::tool_results(std::mem::take(
+                        &mut partial_tool_results,
+                    )));
+                }
                 context_tokens = call.usage.input_tokens.unwrap_or(0);
                 usage += call.usage;
                 requests = requests.saturating_add(1);
-                let snapshot = AiTokenUsage::from_rig(usage, requests, context_tokens);
+                let snapshot = AiTokenUsage::from_rig(usage, requests, context_tokens)
+                    .with_context_breakdown(context_estimate);
                 sink.emit(AiAgentEventKind::Usage {
                     available: snapshot.available,
                     input_tokens: snapshot.input_tokens,
@@ -637,6 +656,7 @@ where
                     cached_tokens: snapshot.cached_tokens,
                     reasoning_tokens: snapshot.reasoning_tokens,
                     context_tokens: snapshot.context_tokens,
+                    context_breakdown: snapshot.context_breakdown,
                     requests: snapshot.requests,
                 });
             }
@@ -666,7 +686,8 @@ where
     Ok(AiRunResult {
         content,
         reasoning: (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_string()),
-        usage: AiTokenUsage::from_rig(usage, requests, context_tokens),
+        usage: AiTokenUsage::from_rig(usage, requests, context_tokens)
+            .with_context_breakdown(context_estimate),
         model_messages,
     })
 }

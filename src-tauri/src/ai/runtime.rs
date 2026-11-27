@@ -327,6 +327,8 @@ pub(super) enum AiAgentEventKind {
         cached_tokens: u64,
         reasoning_tokens: u64,
         context_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_breakdown: Option<super::context::AiContextBreakdown>,
         requests: u32,
     },
     RunCompleted,

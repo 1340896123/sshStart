@@ -157,6 +157,28 @@ const usage = {
   cachedTokens: 3600, reasoningTokens: 40, contextTokens: 2500, requests: 2,
 };
 
+test("first nonempty reasoning token timing is retained through tool calls and persistence", async (t) => {
+  const h = await setup(t, "request");
+  await h.emit({ type: "run_started", timestamp: 1000 });
+  await h.emit({ type: "text_delta", delta: "", timestamp: 1500 });
+  assert.equal(h.latest().firstTokenAt, undefined);
+  await h.emit({ type: "reasoning_delta", delta: "分析中", timestamp: 1800 });
+  await h.emit({ ...started, timestamp: 2000, startedAt: 2000 });
+  await h.emit({ type: "text_delta", delta: "完成", timestamp: 5500 });
+  await h.finish({ content: "完成", usage });
+  const saved = JSON.parse(JSON.stringify(h.latest()));
+  assert.equal(saved.runStartedAt, 1000);
+  assert.equal(saved.firstTokenAt, 1800);
+  assert.equal(saved.lastTokenAt, 5500);
+});
+
+test("a tool-only first response does not report a later text chunk as the first token", async (t) => {
+  const h = await setup(t, "request");
+  await h.emit(started);
+  await h.emit({ type: "text_delta", delta: "完成" });
+  assert.equal(h.latest().firstTokenAt, undefined);
+});
+
 test("usage snapshots retain cache hits and the latest context without double counting", async (t) => {
   const harness = await setup(t, "request");
   await harness.emit({ type: "usage", ...usage, inputTokens: 2000, cachedTokens: 1800, requests: 1 });
@@ -171,6 +193,16 @@ test("a provider without usage does not appear to have reported zero tokens", as
   const unavailable = Object.fromEntries(Object.keys(usage).map((key) => [key, key === "available" ? false : 0]));
   await harness.emit({ type: "usage", ...unavailable, requests: 1 });
   assert.equal(harness.latest().usage.available, false);
+});
+
+test("context breakdown follows the latest request and survives completion", async (t) => {
+  const h = await setup(t, "request");
+  await h.emit({ type: "usage", ...usage, contextBreakdown: { systemPromptTokens: 100, toolDefinitionTokens: 20, conversationTokens: 2380 } });
+  const latest = { ...usage, contextTokens: 5000, contextBreakdown: { systemPromptTokens: 100, toolDefinitionTokens: 20, conversationTokens: 4880 } };
+  await h.emit({ type: "usage", ...latest });
+  assert.deepEqual(h.latest().usage.contextBreakdown, latest.contextBreakdown);
+  await h.finish({ content: "完成", usage: latest });
+  assert.deepEqual(JSON.parse(JSON.stringify(h.latest())).usage.contextBreakdown, latest.contextBreakdown);
 });
 
 test("completed transcripts survive persistence and are sent on the next turn", async (t) => {
@@ -425,6 +457,92 @@ test("steering waits for cancellation to settle and runs before the remaining qu
   await act(async () => { correction.resolve({ content: "已检查数据库", usage }); });
   assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "稍后检查日志");
   await act(async () => { queued.resolve({ content: "完成", usage }); });
+});
+
+test("editing a pending message keeps its ID, position, attachments, and captured settings", async (t) => {
+  const h = await setup(t, "request");
+  const attachment = { id: "queued-image", name: "log.png", remotePath: "/tmp/log.png", kind: "image", mimeType: "image/png", size: 20 };
+  await act(async () => {
+    h.agent().submit({ content: "A", attachments: [], allowTools: true });
+    h.config.model = "saved-model";
+    h.agent().submit({ content: "B", attachments: [attachment], allowTools: true });
+    h.agent().submit({ content: "C", attachments: [], allowTools: true });
+  });
+  const before = h.agent().pendingMessages;
+  const id = before[1].id;
+  await act(async () => { assert.equal(h.agent().beginPendingEdit(id), true); });
+  h.config.model = "different-model";
+  await act(async () => { assert.equal(h.agent().savePendingEdit(id, "修改后的 B"), true); });
+  assert.deepEqual(h.agent().pendingMessages.map(message => message.id), before.map(message => message.id));
+  assert.deepEqual(h.agent().pendingMessages.map(message => message.content), ["A", "修改后的 B", "C"]);
+  assert.deepEqual(h.agent().pendingMessages[1].attachments, [attachment]);
+  assert.equal(h.agent().pendingMessages[1].config.model, "saved-model");
+  assert.equal(h.agent().pendingMessages[1].allowTools, true);
+  await act(async () => { h.agent().clearQueue(); });
+  await h.finish({ content: "完成", usage });
+});
+
+test("a head message being edited waits for saving and never lets later messages overtake it", async (t) => {
+  const h = await setup(t, "request");
+  await act(async () => {
+    h.agent().submit({ content: "原消息", attachments: [], allowTools: true });
+    h.agent().submit({ content: "后一项", attachments: [], allowTools: true });
+  });
+  const id = h.agent().pendingMessages[0].id;
+  await act(async () => {
+    h.agent().beginPendingEdit(id);
+    assert.equal(h.agent().savePendingEdit(id, "   "), false);
+    h.agent().steerPending(id);
+  });
+  assert.equal(h.calls.filter(call => call.command === "cancel_ai_run").length, 0);
+  await h.finish({ content: "当前任务完成", usage });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  assert.equal(h.agent().pendingMessages[0].editing, true);
+  const edited = h.nextRun();
+  await act(async () => { h.agent().savePendingEdit(id, "修改后的任务"); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "修改后的任务");
+  assert.deepEqual(h.agent().pendingMessages.map(message => message.content), ["后一项"]);
+  await act(async () => { h.agent().clearQueue(); edited.resolve({ content: "完成", usage }); });
+});
+
+test("saving an edit preserves a manual queue pause, and cancelling retains the original text", async (t) => {
+  const h = await setup(t, "request");
+  await act(async () => {
+    h.agent().submit({ content: "保留原文", attachments: [], allowTools: true });
+    h.agent().submit({ content: "修改消息", attachments: [], allowTools: true });
+  });
+  const [first, second] = h.agent().pendingMessages;
+  await act(async () => {
+    h.agent().beginPendingEdit(first.id);
+    h.agent().beginPendingEdit(second.id);
+    await h.agent().cancel();
+    h.agent().savePendingEdit(second.id, "已修改");
+  });
+  assert.equal(h.agent().queuePaused, true);
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").length, 1);
+  await act(async () => { h.agent().cancelPendingEdit(first.id); });
+  assert.equal(h.agent().pendingMessages[0].content, "保留原文");
+  assert.equal(h.agent().pendingMessages[0].editing, false);
+  assert.equal(h.agent().queuePaused, true);
+  const next = h.nextRun();
+  await act(async () => { h.agent().resumeQueue(); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "保留原文");
+  await act(async () => { h.agent().clearQueue(); next.resolve({ content: "完成", usage }); });
+});
+
+test("removing an edited head releases the remaining queue", async (t) => {
+  const h = await setup(t, "request");
+  await act(async () => {
+    h.agent().submit({ content: "编辑后移除", attachments: [], allowTools: true });
+    h.agent().submit({ content: "继续下一项", attachments: [], allowTools: true });
+  });
+  const id = h.agent().pendingMessages[0].id;
+  await act(async () => { h.agent().beginPendingEdit(id); });
+  await h.finish({ content: "完成", usage });
+  const next = h.nextRun();
+  await act(async () => { h.agent().removePending(id); });
+  assert.equal(h.calls.filter(call => call.command === "run_ai_agent").at(-1).args.messages.at(-1).content, "继续下一项");
+  await act(async () => { next.resolve({ content: "完成", usage }); });
 });
 
 test("manual stop pauses pending messages until resumed, and removing a message prevents execution", async (t) => {

@@ -35,10 +35,11 @@ interface StartAiAgentInput {
 
 export type AiSendMode = "queue" | "steer";
 
-interface PendingAiMessage extends StartAiAgentInput {
+export interface PendingAiMessage extends StartAiAgentInput {
   id: string;
   mode: AiSendMode;
   config: AiConfig;
+  editing?: boolean;
 }
 
 interface ActiveRun {
@@ -126,6 +127,7 @@ const usageFromEvent = (event: Extract<AiAgentEvent, { type: "usage" }>): AiToke
   cachedTokens: event.cachedTokens,
   reasoningTokens: event.reasoningTokens,
   contextTokens: event.contextTokens,
+  ...(event.contextBreakdown ? { contextBreakdown: event.contextBreakdown } : {}),
   requests: event.requests,
 });
 
@@ -195,7 +197,7 @@ export function useAiAgent({
   const drainQueue = () => {
     if (activeRunRef.current || queuePausedRef.current || pendingRetryRef.current) return;
     const [next, ...rest] = queueRef.current;
-    if (!next) return;
+    if (!next || next.editing) return;
     updateQueue(rest);
     void startRef.current?.(next);
   };
@@ -379,6 +381,7 @@ export function useAiAgent({
         updateAssistant(messageId, (message) => ({
           ...message,
           status: "running",
+          runStartedAt: event.timestamp,
           updatedAt: event.timestamp,
         }));
         break;
@@ -388,6 +391,8 @@ export function useAiAgent({
         updateAssistant(messageId, (message) => ({
           ...message,
           content: `${message.content}${event.delta}`,
+          firstTokenAt: message.firstTokenAt ?? (event.delta && !message.toolCalls?.length && !message.approval ? event.timestamp : undefined),
+          lastTokenAt: event.delta ? event.timestamp : message.lastTokenAt,
           textSegments: appendTextSegment(
             message.textSegments,
             activeRun.activeTextSegmentId!,
@@ -407,6 +412,8 @@ export function useAiAgent({
         updateAssistant(messageId, (message) => ({
           ...message,
           reasonings: appendReasoning(message.reasonings, reasoningId, event.delta, event.sequence),
+          firstTokenAt: message.firstTokenAt ?? (event.delta && !message.toolCalls?.length && !message.approval ? event.timestamp : undefined),
+          lastTokenAt: event.delta ? event.timestamp : message.lastTokenAt,
           status: "running",
           updatedAt: event.timestamp,
         }));
@@ -741,11 +748,32 @@ export function useAiAgent({
   const removePending = (id: string) => {
     updateQueue(queueRef.current.filter((message) => message.id !== id));
     if (!queueRef.current.length) pauseQueue(false);
+    drainQueue();
+  };
+
+  const beginPendingEdit = (id: string) => {
+    if (!queueRef.current.some((message) => message.id === id)) return false;
+    updateQueue(queueRef.current.map((message) => message.id === id ? { ...message, editing: true } : message));
+    return true;
+  };
+
+  const savePendingEdit = (id: string, content: string) => {
+    const pending = queueRef.current.find((message) => message.id === id);
+    if (!pending?.editing || (!content.trim() && !pending.attachments.length)) return false;
+    updateQueue(queueRef.current.map((message) => message.id === id
+      ? { ...message, content: content.trim(), editing: false } : message));
+    drainQueue();
+    return true;
+  };
+
+  const cancelPendingEdit = (id: string) => {
+    updateQueue(queueRef.current.map((message) => message.id === id ? { ...message, editing: false } : message));
+    drainQueue();
   };
 
   const steerPending = (id: string) => {
     const pending = queueRef.current.find((message) => message.id === id);
-    if (!pending) return;
+    if (!pending || pending.editing) return;
     updateQueue([{ ...pending, mode: "steer" }, ...queueRef.current.filter((message) => message.id !== id)]);
     pauseQueue(false);
     cancelRetry();
@@ -817,6 +845,9 @@ export function useAiAgent({
     submit,
     clearQueue,
     removePending,
+    beginPendingEdit,
+    savePendingEdit,
+    cancelPendingEdit,
     steerPending,
     resumeQueue,
     cancelRetry: () => { cancelRetry(); pauseQueue(queueRef.current.length > 0); },

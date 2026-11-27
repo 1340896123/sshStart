@@ -174,6 +174,12 @@ export interface TransferTask extends TransferRequest {
 export type MessageRole = "user" | "assistant";
 export type AiApprovalPolicy = "request" | "reviewer" | "full-access";
 
+export interface AiContextBreakdown {
+  systemPromptTokens: number;
+  toolDefinitionTokens: number;
+  conversationTokens: number;
+}
+
 export interface AiTokenUsage {
   available: boolean;
   inputTokens: number;
@@ -182,6 +188,7 @@ export interface AiTokenUsage {
   cachedTokens: number;
   reasoningTokens: number;
   contextTokens: number;
+  contextBreakdown?: AiContextBreakdown;
   requests: number;
 }
 
@@ -247,6 +254,9 @@ export interface AiMessage {
   approvalState?: "pending" | "approved" | "rejected";
   approvalNote?: string;
   usage?: AiTokenUsage;
+  runStartedAt?: number;
+  firstTokenAt?: number;
+  lastTokenAt?: number;
   /** Opaque Rig transcript for this reply, including tool calls and results. */
   modelMessages?: unknown[];
   createdAt: number;
@@ -521,6 +531,7 @@ export type AiAgentEvent = AiAgentEventBase & (
       cachedTokens: number;
       reasoningTokens: number;
       contextTokens: number;
+      contextBreakdown?: AiContextBreakdown;
       requests: number;
     }
   | { type: "run_completed" }

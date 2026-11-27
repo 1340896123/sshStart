@@ -2,13 +2,15 @@ mod ai;
 mod command;
 mod cloud_sync;
 mod crypto;
+#[cfg(test)]
+mod known_hosts_tests;
 mod server_transfer;
 mod storage;
 mod system_icons;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use ssh2::{CheckResult, KnownHostFileKind, OpenFlags, OpenType, RenameFlags, Session, Sftp};
+use ssh2::{CheckResult, HostKeyType, KnownHostFileKind, OpenFlags, OpenType, RenameFlags, Session, Sftp};
 use std::{
     collections::HashMap,
     env,
@@ -500,12 +502,29 @@ fn known_host_line_matches(line: &str, host: &str, port: u16) -> bool {
     let Some(host_field) = line.split_whitespace().next() else {
         return false;
     };
+    let bracketed = format!("[{host}]:{port}");
     let expected = if port == 22 {
         host.to_string()
     } else {
-        format!("[{host}]:{port}")
+        bracketed.clone()
     };
-    host_field.split(',').any(|candidate| candidate == expected)
+    host_field.split(',').any(|candidate| {
+        if candidate == expected || (port == 22 && candidate == bracketed) {
+            return true;
+        }
+        let Some(hashed) = candidate.strip_prefix("|1|") else {
+            return false;
+        };
+        let Some((salt, digest)) = hashed.split_once('|') else {
+            return false;
+        };
+        let (Ok(salt), Ok(digest)) = (BASE64_STANDARD.decode(salt), BASE64_STANDARD.decode(digest)) else {
+            return false;
+        };
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &salt);
+        ring::hmac::verify(&key, expected.as_bytes(), &digest).is_ok()
+            || (port == 22 && ring::hmac::verify(&key, bracketed.as_bytes(), &digest).is_ok())
+    })
 }
 
 fn remove_known_host_entries(host: &str, port: u16) -> Result<bool, String> {
@@ -517,35 +536,41 @@ fn remove_known_host_entries(host: &str, port: u16) -> Result<bool, String> {
         .lock()
         .map_err(|_| "known_hosts 状态锁已损坏".to_string())?;
     let path = known_hosts_path()?;
+    remove_known_host_entries_at_path(&path, host, port)
+}
+
+fn remove_known_host_entries_at_path(path: &Path, host: &str, port: u16) -> Result<bool, String> {
     if !path.exists() {
         return Ok(false);
     }
-    let session = Session::new().map_err(|error| format!("初始化 SSH 会话失败: {error}"))?;
-    let mut known_hosts = session
-        .known_hosts()
-        .map_err(|error| format!("初始化 known_hosts 失败: {error}"))?;
-    known_hosts
-        .read_file(&path, KnownHostFileKind::OpenSSH)
-        .map_err(|error| format!("读取 known_hosts 失败: {error}"))?;
-
+    let content =
+        fs::read_to_string(path).map_err(|error| format!("读取 known_hosts 失败: {error}"))?;
     let mut removed = false;
-    let entries = known_hosts
-        .hosts()
-        .map_err(|error| format!("读取 known_hosts 条目失败: {error}"))?;
-    for entry in entries {
-        let line = known_hosts
-            .write_string(&entry, KnownHostFileKind::OpenSSH)
-            .map_err(|error| format!("读取 known_hosts 条目内容失败: {error}"))?;
-        if known_host_line_matches(&line, host, port) {
-            known_hosts
-                .remove(&entry)
-                .map_err(|error| format!("删除 known_hosts 条目失败: {error}"))?;
-            removed = true;
+    let mut retained = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        if !known_host_line_matches(line, host, port) {
+            retained.push_str(line);
+            continue;
+        }
+        removed = true;
+        let start = line.len() - line.trim_start().len();
+        let end = start
+            + line[start..]
+                .find(char::is_whitespace)
+                .unwrap_or(line.len() - start);
+        let aliases = line[start..end]
+            .split(',')
+            .filter(|candidate| !known_host_line_matches(candidate, host, port))
+            .collect::<Vec<_>>()
+            .join(",");
+        if !aliases.is_empty() {
+            retained.push_str(&line[..start]);
+            retained.push_str(&aliases);
+            retained.push_str(&line[end..]);
         }
     }
     if removed {
-        known_hosts
-            .write_file(&path, KnownHostFileKind::OpenSSH)
+        fs::write(path, retained)
             .map_err(|error| format!("写入 known_hosts 失败: {error}"))?;
     }
     Ok(removed)
@@ -556,43 +581,66 @@ fn verify_known_host(session: &Session, server: &ServerProfile) -> Result<(), St
         .lock()
         .map_err(|_| "known_hosts 状态锁已损坏".to_string())?;
     let path = known_hosts_path()?;
-    let mut known_hosts = session
-        .known_hosts()
-        .map_err(|error| format!("初始化 known_hosts 失败: {error}"))?;
-    if path.exists() {
-        known_hosts
-            .read_file(&path, KnownHostFileKind::OpenSSH)
-            .map_err(|error| format!("读取 known_hosts 失败: {error}"))?;
-    }
     let (key, key_type) = session
         .host_key()
         .ok_or_else(|| "服务器没有提供可验证的主机密钥".to_string())?;
-    match known_hosts.check_port(&server.host, server.port, key) {
-        CheckResult::Match => Ok(()),
-        CheckResult::Mismatch => Err(format!(
-            "SSH 主机密钥不匹配：{}:{}。连接已阻止，请检查 known_hosts。",
-            server.host, server.port
-        )),
-        CheckResult::Failure => Err("SSH 主机密钥校验失败".to_string()),
-        CheckResult::NotFound => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("创建 .ssh 目录失败: {error}"))?;
+    verify_known_host_key(session, &server.host, server.port, key, key_type, &path)
+}
+
+fn verify_known_host_key(
+    session: &Session,
+    host: &str,
+    port: u16,
+    key: &[u8],
+    key_type: HostKeyType,
+    path: &Path,
+) -> Result<(), String> {
+    let host_name = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    for attempt in 0..2 {
+        let mut known_hosts = session
+            .known_hosts()
+            .map_err(|error| format!("初始化 known_hosts 失败: {error}"))?;
+        if path.exists() {
+            known_hosts
+                .read_file(path, KnownHostFileKind::OpenSSH)
+                .map_err(|error| format!("读取 known_hosts 失败: {error}"))?;
+        }
+        // A key for the default port must not interfere with a different SSH service.
+        let check = if port == 22 {
+            known_hosts.check_port(host, port, key)
+        } else {
+            known_hosts.check(&host_name, key)
+        };
+        match check {
+            CheckResult::Match => return Ok(()),
+            CheckResult::Mismatch if attempt == 0 => {
+                // The caller holds KNOWN_HOSTS_LOCK through cleanup and the single retry.
+                remove_known_host_entries_at_path(path, host, port)?;
             }
-            let host = if server.port == 22 {
-                server.host.clone()
-            } else {
-                format!("[{}]:{}", server.host, server.port)
-            };
-            known_hosts
-                .add(&host, key, "sshStar TOFU", key_type.into())
-                .map_err(|error| format!("记录 SSH 主机密钥失败: {error}"))?;
-            known_hosts
-                .write_file(&path, KnownHostFileKind::OpenSSH)
-                .map_err(|error| format!("写入 known_hosts 失败: {error}"))?;
-            Ok(())
+            CheckResult::Mismatch => break,
+            CheckResult::Failure => return Err("SSH 主机密钥校验失败".to_string()),
+            CheckResult::NotFound => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| format!("创建 .ssh 目录失败: {error}"))?;
+                }
+                known_hosts
+                    .add(&host_name, key, "sshStar TOFU", key_type.into())
+                    .map_err(|error| format!("记录 SSH 主机密钥失败: {error}"))?;
+                known_hosts
+                    .write_file(path, KnownHostFileKind::OpenSSH)
+                    .map_err(|error| format!("写入 known_hosts 失败: {error}"))?;
+                return Ok(());
+            }
         }
     }
+    Err(format!(
+        "SSH 主机密钥不匹配：{host}:{port}。自动清除旧主机密钥后重试仍然失败。"
+    ))
 }
 
 fn authenticate_session(session: &mut Session, server: &ServerProfile) -> Result<(), String> {
